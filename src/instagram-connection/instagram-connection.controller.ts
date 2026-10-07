@@ -21,4 +21,10 @@ export class InstagramConnectionController {
   syncPermissions() {
     return this.service.syncLivePermissions();
   }
+
+  @Post('sync-profile')
+  async syncProfile() {
+    await this.service.syncLiveProfile(true);
+    return this.service.getStatus();
+  }
 }

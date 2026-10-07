@@ -19,20 +19,85 @@ export class InstagramConnectionService {
     private readonly repo: Repository<InstagramConnection>,
   ) {}
 
-  private async cacheProfilePicture(metaUrl: string, filename = 'brand-avatar.jpg'): Promise<string | null> {
+  private async cacheProfilePicture(metaUrl: string, filename?: string): Promise<string | null> {
     try {
       const res = await fetch(metaUrl);
       if (!res.ok) return null;
       const arrayBuf = await res.arrayBuffer();
       const buf = Buffer.from(arrayBuf);
-      const filePath = join(UPLOAD_DIR, filename);
+      const name = filename || `avatar-${Date.now()}.jpg`;
+      const filePath = join(UPLOAD_DIR, name);
       await fs.writeFile(filePath, buf);
       this.logger.log(`Cached Instagram profile picture (${buf.length} bytes) to ${filePath}`);
-      return `/media/${filename}`;
+      return `/media/${name}`;
     } catch (e) {
       this.logger.warn(`Failed to cache profile picture locally: ${e}`);
       return null;
     }
+  }
+
+  // Live sync real Instagram profile and avatar directly from Meta
+  async syncLiveProfile(force = false): Promise<InstagramConnection | null> {
+    const connection = await this.getConnectionRow();
+    if (!connection || !connection.accessToken) return null;
+
+    let profileUrl: string | null = null;
+    let username: string | null = null;
+    let name: string | null = null;
+
+    // 1. Try querying Instagram Graph API directly
+    try {
+      const res = await fetch(`${GRAPH_BASE}/me?fields=id,username,name,profile_picture_url&access_token=${connection.accessToken}`);
+      const data = await res.json();
+      if (res.ok) {
+        if (data.username) username = data.username;
+        if (data.name) name = data.name;
+        if (data.profile_picture_url) profileUrl = data.profile_picture_url;
+      }
+    } catch (e) {
+      this.logger.debug?.(`Instagram /me live sync: ${e}`);
+    }
+
+    // 2. Fallback / Enrichment: query linked Facebook Page if connected
+    if (!profileUrl || !username) {
+      try {
+        const FB_API = 'https://graph.facebook.com/v21.0';
+        const fbConn = (await this.repo.manager.getRepository('FacebookPageConnection').findOne({ where: {} })) as any;
+        if (fbConn?.pageAccessToken && connection.igUserId) {
+          const fbRes = await fetch(`${FB_API}/${connection.igUserId}?fields=id,username,name,profile_picture_url&access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
+          const fbData = await fbRes.json();
+          if (fbRes.ok) {
+            if (fbData.username && !username) username = fbData.username;
+            if (fbData.name && !name) name = fbData.name;
+            if (fbData.profile_picture_url && !profileUrl) profileUrl = fbData.profile_picture_url;
+          }
+        }
+      } catch (e) {
+        this.logger.debug?.(`Facebook Page live sync: ${e}`);
+      }
+    }
+
+    let changed = false;
+    if (username && username !== connection.username && username !== 'creator') {
+      connection.username = username;
+      changed = true;
+    }
+
+    if (profileUrl) {
+      const avatarFilename = `avatar-${connection.igUserId || connection.username || 'brand'}.jpg`;
+      const cached = await this.cacheProfilePicture(profileUrl, avatarFilename);
+      if (cached && (cached !== connection.profilePictureUrl || force)) {
+        connection.profilePictureUrl = cached;
+        changed = true;
+      }
+    }
+
+    if (changed || force) {
+      await this.repo.save(connection);
+      this.logger.log(`Live profile synced for @${connection.username}: avatar=${connection.profilePictureUrl}`);
+    }
+
+    return connection;
   }
 
   // One-time: paste in the long-lived token you generated in the Meta dashboard.
@@ -121,7 +186,8 @@ export class InstagramConnectionService {
 
     let localAvatar: string | null = null;
     if (me.profile_picture_url) {
-      localAvatar = await this.cacheProfilePicture(me.profile_picture_url);
+      const avatarFilename = `avatar-${connection.igUserId || connection.username || 'brand'}.jpg`;
+      localAvatar = await this.cacheProfilePicture(me.profile_picture_url, avatarFilename);
     }
     connection.profilePictureUrl = localAvatar || me.profile_picture_url || null;
     connection.accessToken = accessToken;
@@ -167,36 +233,21 @@ export class InstagramConnectionService {
   }
 
   async getStatus() {
-    const connection = await this.getConnectionRow();
+    let connection = await this.getConnectionRow();
     if (!connection) {
       return { connected: false };
     }
 
-    const localAvatarPath = join(UPLOAD_DIR, 'brand-avatar.jpg');
-    const localAvatarExists = existsSync(localAvatarPath);
-
-    // Refresh & cache avatar if missing locally or if stored as an old external URL
-    if ((!localAvatarExists || !connection.profilePictureUrl || connection.profilePictureUrl.startsWith('http')) && connection.accessToken) {
-      try {
-        const info = await fetch(`${GRAPH_BASE}/me?fields=id,username,profile_picture_url&access_token=${connection.accessToken}`).then((r) => r.json());
-        if (info?.profile_picture_url) {
-          const cached = await this.cacheProfilePicture(info.profile_picture_url);
-          if (cached) {
-            connection.profilePictureUrl = cached;
-            await this.repo.save(connection);
-          }
-        }
-      } catch (err) {
-        this.logger.warn(`Could not refresh profile picture: ${err}`);
-      }
+    // Refresh & cache avatar if missing locally, external http URL, or legacy static brand-avatar
+    if ((!connection.profilePictureUrl || connection.profilePictureUrl === '/media/brand-avatar.jpg' || connection.profilePictureUrl.startsWith('http')) && connection.accessToken) {
+      const refreshed = await this.syncLiveProfile();
+      if (refreshed) connection = refreshed;
     }
-
-    const effectiveProfilePic = (existsSync(localAvatarPath) ? '/media/brand-avatar.jpg' : connection.profilePictureUrl) ?? null;
 
     return {
       connected: true,
       username: connection.username,
-      profilePictureUrl: effectiveProfilePic,
+      profilePictureUrl: connection.profilePictureUrl ?? null,
       expiresAt: connection.tokenExpiresAt,
       permissions: connection.permissions ? connection.permissions.split(',') : null,
     };

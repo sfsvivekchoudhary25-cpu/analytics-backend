@@ -74,9 +74,25 @@ export class InstagramInsightsController {
       totalsOut[metric] = typeof value === 'number' ? value : null;
     });
 
+    let finalProfile = profile;
+    if (!finalProfile || finalProfile.followers_count == null) {
+      try {
+        const igUserId = await this.connection.getIgUserId();
+        const fbRepo = (this.connection as any).repo.manager.getRepository('FacebookPageConnection');
+        const fbConn = await fbRepo.findOne({ where: {} });
+        if (fbConn?.pageAccessToken && igUserId) {
+          const fbRes = await fetch(`https://graph.facebook.com/v21.0/${igUserId}?fields=id,username,name,biography,website,followers_count,follows_count,media_count,profile_picture_url&access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
+          const fbData = await fbRes.json();
+          if (fbRes.ok && (fbData.username || fbData.name)) {
+            finalProfile = { ...(finalProfile || {}), ...fbData };
+          }
+        }
+      } catch {}
+    }
+
     return {
       days,
-      profile,
+      profile: finalProfile,
       media: media?.data ?? [],
       totals: totalsOut,
       series: { reach: toSeries(reachSeries), followers: toSeries(followerSeries) },
