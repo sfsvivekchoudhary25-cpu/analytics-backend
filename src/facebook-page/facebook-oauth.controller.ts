@@ -1,14 +1,11 @@
-import { Controller, Get, Logger, Query, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Logger, Query, Res } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { AuthGuard } from '../auth/auth.guard';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { FacebookPageService } from './facebook-page.service';
+import { User } from '../auth/user.entity';
 
-// This app only has "Facebook Login for Business" configured (not classic "Facebook Login"), which rejects
-// the plain scope-based /dialog/oauth call outright (confirmed directly against Facebook's servers: a request
-// with only `scope` came back `PLATFORM__INVALID_APP_ID`, regardless of a correct app ID). Business Login
-// requires a pre-created Login Configuration instead, referenced by `config_id` — permissions are baked into
-// that configuration in the dashboard, not requested here.
 const FB_API = 'https://graph.facebook.com/v21.0';
 
 type Redirector = { redirect(url: string): void };
@@ -21,15 +18,18 @@ export class FacebookOauthController {
     private readonly jwt: JwtService,
     private readonly connection: InstagramConnectionService,
     private readonly pages: FacebookPageService,
+    @InjectRepository(User)
+    private readonly userRepo: Repository<User>,
   ) {}
 
-  @UseGuards(AuthGuard)
   @Get('url')
   async authorizeUrl() {
-    const state = await this.jwt.signAsync({ purpose: 'fb-page-oauth' }, { expiresIn: '10m' });
+    const state = await this.jwt.signAsync({ purpose: 'fb-page-oauth' }, { expiresIn: '15m' });
     const appId = process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '';
     const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID ?? '';
-    if (!configId) throw new Error('FACEBOOK_LOGIN_CONFIG_ID is not set — add the Configuration ID from the Meta dashboard.');
+    if (!configId) {
+      throw new Error('FACEBOOK_LOGIN_CONFIG_ID is not configured in backend .env. Add the Configuration ID from the Meta dashboard.');
+    }
     const params = new URLSearchParams({
       client_id: appId,
       redirect_uri: this.redirectUri(),
@@ -37,14 +37,10 @@ export class FacebookOauthController {
       config_id: configId,
       state,
     });
-    // Unversioned path, not /v21.0/dialog/oauth — confirmed directly (curl, no browser cache involved) that the
-    // versioned path returns a misleading PLATFORM__INVALID_APP_ID for a perfectly valid app ID, while this
-    // exact same request against the unversioned endpoint redirects correctly to Facebook's login page.
     return { url: `https://www.facebook.com/dialog/oauth?${params}` };
   }
 
-  // Register this exact URL (shown in the backend startup log) as a valid OAuth Redirect URI under
-  // Facebook Login for Business in the Meta App dashboard.
+  // Register this exact URL as a valid OAuth Redirect URI under Facebook Login for Business in Meta dashboard.
   @Get('callback')
   async callback(
     @Query('code') code: string,
@@ -52,8 +48,9 @@ export class FacebookOauthController {
     @Query('error_description') providerError: string,
     @Res() res: Redirector,
   ) {
+    const frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
     const back = (q: Record<string, string>) =>
-      res.redirect(`${process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000'}/?${new URLSearchParams(q)}`);
+      res.redirect(`${frontendBase}/?${new URLSearchParams(q)}`);
 
     if (providerError || !code) return back({ error: providerError || 'Facebook login was cancelled.' });
     try {
@@ -85,7 +82,46 @@ export class FacebookOauthController {
 
       await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null);
       this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id})${matched ? ', matches your Instagram account' : ''}.`);
-      return back({ fbPageConnected: chosen.name });
+
+      // Also auto-provision or find user in app_users
+      let igUsername = (await this.connection.getStatus()).username || null;
+      if (!igUsername && chosen.instagram_business_account?.id) {
+        try {
+          const igInfo = await fetch(`https://graph.facebook.com/v21.0/${chosen.instagram_business_account.id}?fields=username&access_token=${chosen.access_token}`).then(r => r.json());
+          if (igInfo?.username) igUsername = igInfo.username;
+        } catch {}
+      }
+
+      let sessionToken = '';
+      if (igUsername) {
+        const handle = igUsername.toLowerCase();
+        let user = await this.userRepo.findOne({
+          where: [{ instagramHandle: igUsername }, { instagramHandle: handle }, { email: `${handle}@inro.social` }],
+        });
+        if (!user) {
+          user = this.userRepo.create({
+            email: `${handle}@inro.social`,
+            name: chosen.name || igUsername,
+            passwordHash: '',
+            instagramHandle: igUsername,
+            role: 'admin',
+          });
+          user = await this.userRepo.save(user);
+        }
+        sessionToken = await this.jwt.signAsync({
+          sub: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+          instagramHandle: user.instagramHandle,
+        });
+      }
+
+      return back({
+        ...(sessionToken ? { auth_token: sessionToken } : {}),
+        fbPageConnected: chosen.name,
+        ...(igUsername ? { connected: igUsername } : {}),
+      });
     } catch (err) {
       this.logger.error('Facebook Page OAuth failed', err as Error);
       return back({ error: (err as Error).message });
@@ -94,7 +130,7 @@ export class FacebookOauthController {
 
   private redirectUri(): string {
     if (process.env.FACEBOOK_REDIRECT_URI) return process.env.FACEBOOK_REDIRECT_URI;
-    const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '');
+    const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';
     return `${base}/facebook-page/oauth/callback`;
   }
 

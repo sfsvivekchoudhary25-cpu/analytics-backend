@@ -6,8 +6,10 @@ import { FacebookPageConnection } from './facebook-page.entity';
 import { FacebookPageController } from './facebook-page.controller';
 import { FacebookPageService } from './facebook-page.service';
 
+import { User } from '../auth/user.entity';
+
 @Module({
-  imports: [TypeOrmModule.forFeature([FacebookPageConnection]), InstagramConnectionModule],
+  imports: [TypeOrmModule.forFeature([FacebookPageConnection, User]), InstagramConnectionModule],
   controllers: [FacebookPageController, FacebookOauthController],
   providers: [FacebookPageService],
   exports: [FacebookPageService],
