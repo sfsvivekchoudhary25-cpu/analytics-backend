@@ -1,4 +1,4 @@
-import { Controller, Get, Header } from '@nestjs/common';
+import { Controller, Get, Header, Post } from '@nestjs/common';
 
 const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'Fabroniee';
 const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'vivek.choudhary.0022@gmail.com';
