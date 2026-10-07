@@ -104,4 +104,19 @@ export class LegalController {
 <p>Read our <a href="/privacy">Privacy Policy</a>.</p>`,
     );
   }
+
+  @Post('data-deletion')
+  dataDeletionPost() {
+    const base = process.env.PUBLIC_BASE_URL ?? 'https://analytics-backend-vxak.onrender.com';
+    return {
+      url: `${base}/data-deletion`,
+      confirmation_code: `del_${Date.now()}`,
+    };
+  }
+
+  @Get('deauthorize')
+  @Post('deauthorize')
+  deauthorize() {
+    return { success: true, message: 'Deauthorized successfully' };
+  }
 }
