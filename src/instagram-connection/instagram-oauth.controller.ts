@@ -191,6 +191,8 @@ export class InstagramOauthController {
             access_token: fbBody.access_token,
             expires_in: fbBody.expires_in ?? 5184000,
           };
+        } else {
+          this.logger.debug?.(`fb_exchange_token response: status=${fbRes.status} body=${JSON.stringify(fbBody)}`);
         }
       } catch (e) {
         this.logger.warn(`Meta fb_exchange_token error: ${e}`);
@@ -214,6 +216,8 @@ export class InstagramOauthController {
             access_token: body.access_token,
             expires_in: body.expires_in ?? 5184000,
           };
+        } else {
+          this.logger.warn(`Instagram ig_exchange_token failed: status=${res.status} body=${JSON.stringify(body)}`);
         }
       } catch (e) {
         this.logger.warn(`Instagram ig_exchange_token error: ${e}`);

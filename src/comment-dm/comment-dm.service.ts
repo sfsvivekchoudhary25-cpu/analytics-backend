@@ -312,8 +312,14 @@ export class CommentDmService {
 
   // Recent posts to choose from, for the "Check this post" step.
   async recentPosts() {
-    const media = await this.graph.get('/me/media', { fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp', limit: '30' });
-    return (media.data ?? []).map((m: any) => ({
+    let mediaData: any[] = [];
+    try {
+      const media = await this.graph.get('/me/media', { fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp', limit: '30' });
+      mediaData = media?.data ?? [];
+    } catch (err) {
+      this.logger.warn(`Failed to fetch media from Instagram for comment-dm: ${(err as Error).message}`);
+    }
+    return mediaData.map((m: any) => ({
       mediaId: m.id as string,
       permalink: (m.permalink ?? null) as string | null,
       thumb: (m.thumbnail_url ?? m.media_url ?? null) as string | null,

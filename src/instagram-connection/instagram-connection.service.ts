@@ -46,28 +46,35 @@ export class InstagramConnectionService {
     let me: { user_id: string; username: string; profile_picture_url?: string } | null = null;
     let livePermissions: string[] = permissions ?? [];
 
-    // 1. Try querying /me with Instagram Graph fields: id,username,profile_picture_url
-    for (const fields of [
-      'id,username,profile_picture_url',
-      'id,username',
-      'id,name',
-    ]) {
-      try {
-        const res = await fetch(`${GRAPH_BASE}/me?fields=${fields}&access_token=${accessToken}`);
-        const data = await res.json();
-        if (res.ok && (data.id || data.username)) {
-          me = {
-            user_id: String(data.id || fallbackIdentity?.userId || ''),
-            username: data.username || data.name || fallbackIdentity?.username || 'creator',
-            profile_picture_url: data.profile_picture_url,
-          };
-          this.logger.log(`Verified Instagram user @${me.username} (id: ${me.user_id})`);
-          break;
-        } else {
-          this.logger.warn(`Failed /me?fields=${fields}: ${JSON.stringify(data)}`);
+    // 1. Try querying /me or /{userId} with Instagram Graph fields: id,username,profile_picture_url
+    const targetPaths = ['/me'];
+    if (fallbackIdentity?.userId) {
+      targetPaths.push(`/${fallbackIdentity.userId}`);
+    }
+
+    pathLoop: for (const path of targetPaths) {
+      for (const fields of [
+        'id,username,profile_picture_url',
+        'id,username',
+        'id,name',
+      ]) {
+        try {
+          const res = await fetch(`${GRAPH_BASE}${path}?fields=${fields}&access_token=${accessToken}`);
+          const data = await res.json();
+          if (res.ok && (data.id || data.username)) {
+            me = {
+              user_id: String(data.id || fallbackIdentity?.userId || ''),
+              username: data.username || data.name || fallbackIdentity?.username || 'creator',
+              profile_picture_url: data.profile_picture_url,
+            };
+            this.logger.log(`Verified Instagram user @${me.username} (id: ${me.user_id})`);
+            break pathLoop;
+          } else {
+            this.logger.warn(`Failed ${path}?fields=${fields}: ${JSON.stringify(data)}`);
+          }
+        } catch (err) {
+          this.logger.warn(`Error querying ${path}?fields=${fields}: ${err}`);
         }
-      } catch (err) {
-        this.logger.warn(`Error querying /me?fields=${fields}: ${err}`);
       }
     }
 

@@ -62,10 +62,16 @@ export class CommentsService {
 
   // Posts that Instagram says have comments, with how many of them the API has actually shared with us.
   async postsWithComments() {
-    const media = await this.graph.get('/me/media', {
-      fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
-      limit: '30',
-    });
+    let mediaData: any[] = [];
+    try {
+      const media = await this.graph.get('/me/media', {
+        fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
+        limit: '30',
+      });
+      mediaData = media?.data ?? [];
+    } catch (err) {
+      this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
+    }
     const rows: { mid: string; n: string }[] = await this.comments
       .createQueryBuilder('c')
       .select('c.media_id', 'mid')
@@ -74,7 +80,7 @@ export class CommentsService {
       .groupBy('c.media_id')
       .getRawMany();
     const visible = new Map(rows.map((r) => [r.mid, Number(r.n)]));
-    return (media.data ?? [])
+    return mediaData
       .filter((m: any) => m.comments_count > 0)
       .map((m: any) => ({
         mediaId: m.id as string,
