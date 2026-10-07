@@ -169,15 +169,47 @@ export class InstagramOauthController {
   }
 
   private async exchangeLongLived(shortLived: string): Promise<{ access_token: string; expires_in: number }> {
-    const params = new URLSearchParams({
-      grant_type: 'ig_exchange_token',
-      client_secret: process.env.INSTAGRAM_APP_SECRET ?? '',
+    const clientSecret = process.env.INSTAGRAM_APP_SECRET ?? '';
+    try {
+      const params = new URLSearchParams({
+        grant_type: 'ig_exchange_token',
+        client_secret: clientSecret,
+        access_token: shortLived,
+      });
+
+      // 1. Try standard GET
+      let res = await fetch(`https://graph.instagram.com/access_token?${params}`);
+      let body: any = await res.json().catch(() => ({}));
+
+      // 2. If GET was rejected, try POST with form-urlencoded body
+      if (!res.ok || !body.access_token) {
+        this.logger.warn(`GET long-lived token exchange failed (${res.status}): ${JSON.stringify(body)}. Retrying with POST...`);
+        res = await fetch('https://graph.instagram.com/access_token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: params,
+        });
+        body = await res.json().catch(() => ({}));
+      }
+
+      if (res.ok && body.access_token) {
+        this.logger.log('Successfully acquired 60-day long-lived Instagram access token');
+        return {
+          access_token: body.access_token,
+          expires_in: body.expires_in ?? 5184000,
+        };
+      }
+
+      this.logger.error(`Long-lived token exchange failed: ${JSON.stringify(body)}. Falling back to short-lived token to preserve user session.`);
+    } catch (e) {
+      this.logger.error('Error during long-lived token exchange', e as Error);
+    }
+
+    // Graceful fallback: use short-lived token so user login doesn't fail
+    return {
       access_token: shortLived,
-    });
-    const res = await fetch(`https://graph.instagram.com/access_token?${params}`);
-    const body = await res.json();
-    if (!res.ok || !body.access_token) throw new Error('Could not exchange for a long-lived Instagram token.');
-    return body;
+      expires_in: 3600,
+    };
   }
 
   private async subscribeToMessages(accessToken: string) {
