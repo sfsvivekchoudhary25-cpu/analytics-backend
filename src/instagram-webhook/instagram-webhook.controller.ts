@@ -2,6 +2,7 @@ import {
   Controller,
   ForbiddenException,
   Get,
+  Header,
   HttpCode,
   Logger,
   Post,
@@ -39,18 +40,21 @@ export class InstagramWebhookController {
 
   // Meta's one-time handshake when you click "Verify and save".
   @Get()
+  @Header('Content-Type', 'text/plain')
   verify(
     @Query('hub.mode') mode: string,
     @Query('hub.verify_token') token: string,
     @Query('hub.challenge') challenge: string,
   ) {
-    const expected = process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN ?? '';
+    const expected =
+      process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN ||
+      'dfed4dff43bfe4c623eaee3cd7aafd9e493448ca3e877a3f';
     if (mode !== 'subscribe' || !expected || !safeEqual(String(token ?? ''), expected)) {
       this.logger.warn('Verification handshake REJECTED (wrong verify token or mode)');
       throw new ForbiddenException();
     }
     this.logger.log('Verification handshake OK');
-    return challenge;
+    return String(challenge ?? '');
   }
 
   // Events (messages, comments, ...). Signed with the app secret.
