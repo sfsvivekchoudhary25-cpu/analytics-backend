@@ -90,11 +90,16 @@ export class InstagramOauthController {
 
     try {
       const cleanCode = code.replace(/#_$/, '');
-      const { token: shortLived, permissions } = await this.exchangeCode(cleanCode);
+      const { token: shortLived, permissions, userId } = await this.exchangeCode(cleanCode);
       const longLived = await this.exchangeLongLived(shortLived);
 
       // Save/update connection credentials in the database (encrypted at rest)
-      const { username } = await this.connection.connect(longLived.access_token, longLived.expires_in, permissions);
+      const { username } = await this.connection.connect(
+        longLived.access_token,
+        longLived.expires_in,
+        permissions,
+        { userId },
+      );
       await this.subscribeToMessages(longLived.access_token);
 
       // Multi-account / User provisioning: Find or create User in app_users
@@ -146,7 +151,7 @@ export class InstagramOauthController {
     }
   }
 
-  private async exchangeCode(code: string): Promise<{ token: string; permissions: string[] }> {
+  private async exchangeCode(code: string): Promise<{ token: string; permissions: string[]; userId?: string }> {
     const res = await fetch('https://api.instagram.com/oauth/access_token', {
       method: 'POST',
       body: new URLSearchParams({
@@ -159,53 +164,64 @@ export class InstagramOauthController {
     });
 
     const body = await res.json();
+    this.logger.log(`Instagram exchangeCode response: ${JSON.stringify(body)}`);
     const first = body.data?.[0] ?? body;
     const token = first.access_token;
     if (!res.ok || !token) throw new Error(body.error_message ?? body.error?.message ?? 'Instagram rejected the authorization code.');
 
     const raw = first.permissions ?? body.permissions ?? [];
     const permissions: string[] = (Array.isArray(raw) ? raw : String(raw).split(',')).map((p: string) => p.trim()).filter(Boolean);
-    return { token, permissions };
+    const userId = first.user_id ? String(first.user_id) : undefined;
+    return { token, permissions, userId };
   }
 
   private async exchangeLongLived(shortLived: string): Promise<{ access_token: string; expires_in: number }> {
-    const clientSecret = process.env.INSTAGRAM_APP_SECRET ?? '';
-    try {
-      const params = new URLSearchParams({
-        grant_type: 'ig_exchange_token',
-        client_secret: clientSecret,
-        access_token: shortLived,
-      });
+    const appId = process.env.INSTAGRAM_APP_ID || process.env.FACEBOOK_APP_ID || '';
+    const clientSecret = process.env.INSTAGRAM_APP_SECRET || process.env.FACEBOOK_APP_SECRET || '';
 
-      // 1. Try standard GET
-      let res = await fetch(`https://graph.instagram.com/access_token?${params}`);
-      let body: any = await res.json().catch(() => ({}));
-
-      // 2. If GET was rejected, try POST with form-urlencoded body
-      if (!res.ok || !body.access_token) {
-        this.logger.warn(`GET long-lived token exchange failed (${res.status}): ${JSON.stringify(body)}. Retrying with POST...`);
-        res = await fetch('https://graph.instagram.com/access_token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: params,
-        });
-        body = await res.json().catch(() => ({}));
+    // 1. Try Meta Graph API exchange (fb_exchange_token)
+    if (appId && clientSecret) {
+      try {
+        const fbUrl = `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${appId}&client_secret=${clientSecret}&fb_exchange_token=${shortLived}`;
+        const fbRes = await fetch(fbUrl);
+        const fbBody = await fbRes.json();
+        if (fbRes.ok && fbBody.access_token) {
+          this.logger.log('Successfully acquired 60-day long-lived Instagram token via Meta Graph API');
+          return {
+            access_token: fbBody.access_token,
+            expires_in: fbBody.expires_in ?? 5184000,
+          };
+        }
+      } catch (e) {
+        this.logger.warn(`Meta fb_exchange_token error: ${e}`);
       }
-
-      if (res.ok && body.access_token) {
-        this.logger.log('Successfully acquired 60-day long-lived Instagram access token');
-        return {
-          access_token: body.access_token,
-          expires_in: body.expires_in ?? 5184000,
-        };
-      }
-
-      this.logger.error(`Long-lived token exchange failed: ${JSON.stringify(body)}. Falling back to short-lived token to preserve user session.`);
-    } catch (e) {
-      this.logger.error('Error during long-lived token exchange', e as Error);
     }
 
-    // Graceful fallback: use short-lived token so user login doesn't fail
+    // 2. Try Instagram Graph API exchange (ig_exchange_token)
+    if (clientSecret) {
+      try {
+        const params = new URLSearchParams({
+          grant_type: 'ig_exchange_token',
+          client_secret: clientSecret,
+          access_token: shortLived,
+        });
+
+        const res = await fetch(`https://graph.instagram.com/access_token?${params}`);
+        const body: any = await res.json().catch(() => ({}));
+        if (res.ok && body.access_token) {
+          this.logger.log('Successfully acquired 60-day long-lived Instagram access token');
+          return {
+            access_token: body.access_token,
+            expires_in: body.expires_in ?? 5184000,
+          };
+        }
+      } catch (e) {
+        this.logger.warn(`Instagram ig_exchange_token error: ${e}`);
+      }
+    }
+
+    // 3. Graceful fallback: use short-lived token so user login doesn't fail
+    this.logger.log('Proceeding with verified short-lived token to preserve seamless user session');
     return {
       access_token: shortLived,
       expires_in: 3600,

@@ -41,33 +41,67 @@ export class InstagramConnectionService {
     accessToken: string,
     expiresInSeconds = 60 * 24 * 60 * 60,
     permissions: string[] | null = null, // only known when connecting through the login flow
+    fallbackIdentity?: { userId?: string; username?: string },
   ): Promise<{ username: string }> {
     let me: { user_id: string; username: string; profile_picture_url?: string } | null = null;
     let livePermissions: string[] = permissions ?? [];
 
-    const meRes = await fetch(`${GRAPH_BASE}/me?fields=user_id,username,profile_picture_url&access_token=${accessToken}`);
-    if (meRes.ok) {
-      me = await meRes.json();
-    } else {
-      // Fallback: Check if this is a Meta / Facebook System User or Page token
-      const FB_API = 'https://graph.facebook.com/v21.0';
-      const fbAccRes = await fetch(`${FB_API}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username,profile_picture_url}&access_token=${accessToken}`);
-      const fbAccBody = await fbAccRes.json();
-      const igAcc = fbAccBody?.data?.find((p: any) => p.instagram_business_account)?.instagram_business_account;
-      if (igAcc?.id && igAcc?.username) {
-        me = {
-          user_id: igAcc.id,
-          username: igAcc.username,
-          profile_picture_url: igAcc.profile_picture_url,
-        };
-        // Automatically fetch live permissions from Meta
-        try {
-          const perms = await fetch(`${FB_API}/me/permissions?access_token=${accessToken}`).then((r) => r.json());
-          if (Array.isArray(perms?.data)) {
-            livePermissions = perms.data.filter((p: any) => p.status === 'granted').map((p: any) => p.permission);
-          }
-        } catch {}
+    // 1. Try querying /me with Instagram Graph fields: id,username,profile_picture_url
+    for (const fields of [
+      'id,username,profile_picture_url',
+      'id,username',
+      'id,name',
+    ]) {
+      try {
+        const res = await fetch(`${GRAPH_BASE}/me?fields=${fields}&access_token=${accessToken}`);
+        const data = await res.json();
+        if (res.ok && (data.id || data.username)) {
+          me = {
+            user_id: String(data.id || fallbackIdentity?.userId || ''),
+            username: data.username || data.name || fallbackIdentity?.username || 'creator',
+            profile_picture_url: data.profile_picture_url,
+          };
+          this.logger.log(`Verified Instagram user @${me.username} (id: ${me.user_id})`);
+          break;
+        } else {
+          this.logger.warn(`Failed /me?fields=${fields}: ${JSON.stringify(data)}`);
+        }
+      } catch (err) {
+        this.logger.warn(`Error querying /me?fields=${fields}: ${err}`);
       }
+    }
+
+    // 2. Fallback: Check if this is a Meta / Facebook System User or Page token
+    if (!me) {
+      try {
+        const FB_API = 'https://graph.facebook.com/v21.0';
+        const fbAccRes = await fetch(`${FB_API}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username,profile_picture_url}&access_token=${accessToken}`);
+        const fbAccBody = await fbAccRes.json();
+        const igAcc = fbAccBody?.data?.find((p: any) => p.instagram_business_account)?.instagram_business_account;
+        if (igAcc?.id && igAcc?.username) {
+          me = {
+            user_id: String(igAcc.id),
+            username: igAcc.username,
+            profile_picture_url: igAcc.profile_picture_url,
+          };
+          this.logger.log(`Verified Instagram via Facebook Page: @${me.username} (id: ${me.user_id})`);
+          try {
+            const perms = await fetch(`${FB_API}/me/permissions?access_token=${accessToken}`).then((r) => r.json());
+            if (Array.isArray(perms?.data)) {
+              livePermissions = perms.data.filter((p: any) => p.status === 'granted').map((p: any) => p.permission);
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    // 3. Fallback: if identity could not be retrieved from Graph API, use OAuth identity
+    if (!me && (fallbackIdentity?.userId || fallbackIdentity?.username)) {
+      me = {
+        user_id: String(fallbackIdentity.userId || 'ig_' + Date.now()),
+        username: fallbackIdentity.username || 'creator',
+      };
+      this.logger.log(`Using OAuth fallback identity: @${me.username} (id: ${me.user_id})`);
     }
 
     if (!me) {
