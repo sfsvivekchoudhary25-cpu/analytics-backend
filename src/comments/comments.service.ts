@@ -60,10 +60,10 @@ export class CommentsService {
 
   async list(filter: 'all' | 'unreplied', ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const whereBase: any = filter === 'unreplied' ? { parentId: IsNull(), repliedAt: IsNull(), isOwn: false } : { parentId: IsNull() };
-    const where = own ? { ...whereBase, ownerUsername: own } : whereBase;
+    if (!own) return [];
+    const whereBase: any = filter === 'unreplied' ? { parentId: IsNull(), repliedAt: IsNull(), isOwn: false, ownerUsername: own } : { parentId: IsNull(), ownerUsername: own };
     return this.comments.find({
-      where,
+      where: whereBase,
       order: { commentedAt: 'DESC' },
       take: 100,
     });
@@ -72,6 +72,7 @@ export class CommentsService {
   // Posts that Instagram says have comments, with how many of them the API has actually shared with us.
   async postsWithComments(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
+    if (!own) return [];
     let mediaData: any[] = [];
     try {
       const media = await this.graph.get('/me/media', {

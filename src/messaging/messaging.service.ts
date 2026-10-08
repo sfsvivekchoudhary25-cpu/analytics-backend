@@ -333,22 +333,18 @@ export class MessagingService implements OnModuleInit {
 
   async listConversations(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
+    if (!own) return [];
 
     const qb = this.conversations.createQueryBuilder('c')
+      .where('LOWER(c.ownerUsername) = :own', { own })
+      .andWhere('(LOWER(c.username) != :own OR c.username IS NULL)', { own })
       .orderBy('c.lastMessageAt', 'DESC')
       .take(100);
-
-    if (own) {
-      // Exclude own handle from the conversation list
-      qb.andWhere('(LOWER(c.username) != :own OR c.username IS NULL)', { own });
-      // Only return conversations belonging to this connected account (or legacy rows)
-      qb.andWhere('(c.ownerUsername = :own OR c.ownerUsername IS NULL)', { own });
-    }
 
     const rows = await qb.getMany();
     for (const c of rows) {
       if (!c.profilePic) {
-        this.fetchContactProfile(c, own ?? undefined).catch(() => {});
+        this.fetchContactProfile(c, own).catch(() => {});
       }
     }
     return rows.map((c) => this.view(c));
@@ -356,12 +352,18 @@ export class MessagingService implements OnModuleInit {
 
   async thread(igsid: string, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const c = await this.getConversation(igsid);
+    if (!own) throw new NotFoundException('Conversation not found.');
+
+    const c = await this.conversations.findOne({
+      where: { igsid, ownerUsername: own },
+    });
+    if (!c) throw new NotFoundException('Conversation not found.');
+
     if (!c.profilePic) {
-      await this.fetchContactProfile(c, own ?? undefined).catch(() => {});
+      await this.fetchContactProfile(c, own).catch(() => {});
     }
     const recent = await this.messages.find({
-      where: own ? { igsid, ownerUsername: own } : { igsid },
+      where: { igsid, ownerUsername: own },
       order: { createdAt: 'DESC' },
       take: 300,
     });

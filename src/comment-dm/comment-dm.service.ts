@@ -57,8 +57,9 @@ export class CommentDmService {
 
   async list(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
+    if (!own) return [];
     const rules = await this.rules.find({
-      where: own ? { ownerUsername: own } : {},
+      where: { ownerUsername: own },
       order: { createdAt: 'ASC' },
     });
     if (!rules.length) return [];
