@@ -373,14 +373,12 @@ export class InstagramConnectionService implements OnModuleInit {
   async getConnectionRow(account?: string): Promise<InstagramConnection | null> {
     if (account) {
       const clean = account.trim().replace(/^@/, '').toLowerCase();
-      const byUser = await this.repo
+      return this.repo
         .createQueryBuilder('c')
         .where('LOWER(c.username) = :u', { u: clean })
         .getOne();
-      if (byUser) return byUser;
     }
-    const [connection] = await this.repo.find({ order: { updatedAt: 'DESC' }, take: 1 });
-    return connection ?? null;
+    return null;
   }
 
   private async getConnectionOrThrow(account?: string): Promise<InstagramConnection> {
@@ -389,5 +387,17 @@ export class InstagramConnectionService implements OnModuleInit {
       throw new BadRequestException('No Instagram account connected yet.');
     }
     return connection;
+  }
+
+  async linkUserInstagramHandle(userId?: string, username?: string) {
+    if (!userId || userId === 'dev-admin' || !username) return;
+    try {
+      await this.repo.manager.getRepository('User').update(
+        { id: userId },
+        { instagramHandle: username },
+      );
+    } catch (err) {
+      this.logger.warn(`Could not link instagram handle to user ${userId}: ${err}`);
+    }
   }
 }

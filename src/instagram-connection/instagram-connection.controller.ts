@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { CurrentAccount } from '../common/current-account.decorator';
 import { InstagramConnectionService } from './instagram-connection.service';
@@ -9,8 +9,10 @@ export class InstagramConnectionController {
   constructor(private readonly service: InstagramConnectionService) {}
 
   @Post()
-  connect(@Body('accessToken') accessToken: string) {
-    return this.service.connect(accessToken);
+  async connect(@Body('accessToken') accessToken: string, @Req() req: any) {
+    const res = await this.service.connect(accessToken);
+    await this.service.linkUserInstagramHandle(req.user?.id, res.username);
+    return res;
   }
 
   @Get()
@@ -18,15 +20,6 @@ export class InstagramConnectionController {
     return this.service.getStatus(account);
   }
 
-  @Get('accounts')
-  accounts() {
-    return this.service.listConnectedAccounts();
-  }
-
-  @Post('switch')
-  switchAccount(@Body('username') username: string) {
-    return this.service.touchAccount(username);
-  }
 
   @Post('sync-permissions')
   syncPermissions(@CurrentAccount() account?: string) {
