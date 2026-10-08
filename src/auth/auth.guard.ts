@@ -1,14 +1,13 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource } from 'typeorm';
 import { User } from './user.entity';
 
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(
     private readonly jwt: JwtService,
-    @InjectRepository(User) private readonly userRepo: Repository<User>,
+    private readonly dataSource: DataSource,
   ) {}
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
@@ -27,7 +26,7 @@ export class AuthGuard implements CanActivate {
       req.user = payload;
       const userId = req.user.sub || req.user.id;
       if (!req.user.instagramHandle && userId) {
-        const u = await this.userRepo.findOne({ where: { id: userId }, select: { id: true, instagramHandle: true } });
+        const u = await this.dataSource.getRepository(User).findOne({ where: { id: userId }, select: { id: true, instagramHandle: true } });
         if (u?.instagramHandle) {
           req.user.instagramHandle = u.instagramHandle;
         }
