@@ -62,8 +62,9 @@ export class Message {
   @Column({ type: 'varchar', nullable: true })
   source: 'app' | 'dashboard' | 'auto' | 'system' | null;
 
-  // Instagram's message id; used to ignore duplicate webhook deliveries.
-  @Column({ type: 'varchar', unique: true, nullable: true })
+  // Instagram's message id; used to ignore duplicate webhook deliveries per tenant.
+  @Index()
+  @Column({ type: 'varchar', nullable: true })
   mid: string | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })

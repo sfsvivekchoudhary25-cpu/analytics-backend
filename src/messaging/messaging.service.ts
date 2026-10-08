@@ -44,6 +44,12 @@ export class MessagingService implements OnModuleInit {
 
   async onModuleInit() {
     try {
+      // Drop global unique constraint on mid so multiple tenants can store the same message mid without collision
+      await this.messages.query(`
+        ALTER TABLE message DROP CONSTRAINT IF EXISTS "UQ_70c82ca0811ee5dbe177c655115";
+        ALTER TABLE message DROP CONSTRAINT IF EXISTS message_mid_key;
+      `).catch(() => {});
+
       const rows = await this.conversations.find();
       let updated = 0;
       for (const c of rows) {
@@ -94,7 +100,7 @@ export class MessagingService implements OnModuleInit {
       for (const conv of list.data ?? []) {
         const other = (conv.participants?.data ?? []).find((p: any) => String(p.username ?? '').toLowerCase() !== ownHandle);
         if (!other?.id) continue;
-        const existing = await this.conversations.findOne({ where: { igsid: String(other.id) } });
+        const existing = await this.conversations.findOne({ where: { igsid: String(other.id), ownerUsername: ownHandle } });
         if (existing && existing.lastMessageAt >= new Date(conv.updated_time)) continue; // nothing new here
 
         const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle });
@@ -111,9 +117,9 @@ export class MessagingService implements OnModuleInit {
           const text = String(m.message ?? '');
           // The same message may already be stored via the webhook, possibly under a different id format.
           const dup =
-            (await this.messages.exists({ where: { mid: m.id } })) ||
+            (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) ||
             (await this.messages.exists({
-              where: { igsid: String(other.id), direction: outgoing ? 'out' : 'in', text, createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
+              where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', text, createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
             }));
           if (dup) continue;
           await this.messages.save(
@@ -198,7 +204,7 @@ export class MessagingService implements OnModuleInit {
 
     // A customer edited a message we already stored.
     if (ev.message_edit?.mid) {
-      const stored = await this.messages.findOne({ where: { mid: ev.message_edit.mid } });
+      const stored = await this.messages.findOne({ where: { mid: ev.message_edit.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (!stored) {
         this.logger.log(`Edit of a message we never stored (...${String(ev.message_edit.mid).slice(-8)}); ignored`);
         return;
@@ -251,7 +257,7 @@ export class MessagingService implements OnModuleInit {
 
     // The customer deleted a message: keep the thread, replace its content.
     if (msg.is_deleted && msg.mid) {
-      const stored = await this.messages.findOne({ where: { mid: msg.mid } });
+      const stored = await this.messages.findOne({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (stored) {
         stored.text = '[message deleted by sender]';
         stored.attachmentType = null;
@@ -264,7 +270,7 @@ export class MessagingService implements OnModuleInit {
 
     const customerId: string | undefined = echo ? ev.recipient?.id : ev.sender?.id;
     if (!customerId || customerId === ownId) return;
-    if (msg.mid && (await this.messages.exists({ where: { mid: msg.mid } }))) {
+    if (msg.mid && (await this.messages.exists({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } }))) {
       this.logger.log(`Ignored duplicate delivery of message ...${String(msg.mid).slice(-8)}`);
       return;
     }
@@ -298,21 +304,22 @@ export class MessagingService implements OnModuleInit {
   }
 
   private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date, ownerUsername?: string) {
+    const cleanOwner = ownerUsername ? ownerUsername.trim().replace(/^@/, '').toLowerCase() : null;
     let c = await this.conversations.findOne({
-      where: ownerUsername ? { igsid, ownerUsername } : { igsid },
+      where: cleanOwner ? { igsid, ownerUsername: cleanOwner } : { igsid },
     });
     if (!c) {
-      c = this.conversations.create({ igsid, ownerUsername: ownerUsername ?? null, username: null, profilePic: null, unread: 0, lastInboundAt: null });
-      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: ownerUsername }).catch(() => null);
+      c = this.conversations.create({ igsid, ownerUsername: cleanOwner, username: null, profilePic: null, unread: 0, lastInboundAt: null });
+      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: cleanOwner ?? undefined }).catch(() => null);
       if (p?.username) c.username = p.username;
       if (p?.profile_pic) c.profilePic = p.profile_pic;
       if (!c.profilePic) {
         c.profilePic = generateLetterAvatar(c.username || igsid);
       }
     } else {
-      if (ownerUsername && !c.ownerUsername) c.ownerUsername = ownerUsername;
+      if (cleanOwner && !c.ownerUsername) c.ownerUsername = cleanOwner;
       if (!c.profilePic || !c.username) {
-        const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: ownerUsername }).catch(() => null);
+        const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: cleanOwner ?? undefined }).catch(() => null);
         if (p?.username) c.username = p.username;
         if (p?.profile_pic) c.profilePic = p.profile_pic;
         if (!c.profilePic) {
@@ -568,7 +575,7 @@ export class MessagingService implements OnModuleInit {
     }
     const now = new Date();
     // Instagram echoes our own DMs back through the webhook; if that already stored this mid, don't insert twice.
-    const alreadyStored = res?.message_id && (await this.messages.exists({ where: { mid: res.message_id } }));
+    const alreadyStored = res?.message_id && (await this.messages.exists({ where: { mid: res.message_id, ...(own ? { ownerUsername: own } : {}) } }));
     if (!alreadyStored) {
       await this.messages.save(
         this.messages.create({
@@ -585,7 +592,7 @@ export class MessagingService implements OnModuleInit {
       );
     } else {
       // The webhook echo won the race and labelled it as typed in the app; set the true sender.
-      await this.messages.update({ mid: res.message_id }, { source, ...(own ? { ownerUsername: own } : {}) });
+      await this.messages.update({ mid: res.message_id, ...(own ? { ownerUsername: own } : {}) }, { source, ...(own ? { ownerUsername: own } : {}) });
     }
     const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined);
     this.logger.log(`[Messaging] DM sent (${sentFormat}) to ${c.username ? '@' + c.username : igsid}: "${text.length > 60 ? text.slice(0, 60) + '…' : text}"`);

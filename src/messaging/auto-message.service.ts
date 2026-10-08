@@ -286,7 +286,7 @@ export class AutoMessageService {
         .andWhere('NOT EXISTS (SELECT 1 FROM message_auto_log l WHERE l.message_id = CAST(m.id AS text))');
 
       if (own) {
-        qb.andWhere('(m.ownerUsername = :own OR m.ownerUsername IS NULL)', { own });
+        qb.andWhere('LOWER(m.ownerUsername) = :own', { own });
       }
 
       const pending = await qb
@@ -308,7 +308,9 @@ export class AutoMessageService {
         } catch {
           continue;
         }
-        const conv = await this.conversations.findOne({ where: { igsid: m.igsid } });
+        const conv = await this.conversations.findOne({
+          where: own ? { igsid: m.igsid, ownerUsername: own } : { igsid: m.igsid },
+        });
         let decision: Decision;
         try {
           decision = await this.decide(m, conv, s, rules, own);
@@ -355,6 +357,12 @@ export class AutoMessageService {
 
     // ---- Guards that apply to every automatic reply, whoever writes it ----
     if (own && username === own) return skip('our own account');
+    // Guard against replying to ANY connected tenant in the platform to prevent bot-to-bot loops
+    const connectedAccounts = await this.connection.listConnectedAccounts().catch(() => []);
+    const connectedUsernames = connectedAccounts.map((a) => a.username.toLowerCase());
+    if (username && connectedUsernames.includes(username)) {
+      return skip(`sender is another connected tenant account (@${username})`);
+    }
     const ignored = [...ALWAYS_IGNORED, ...(process.env.AUTO_REPLY_IGNORE_USERNAMES ?? '').split(',')]
       .map((x) => x.trim().toLowerCase())
       .filter(Boolean);
@@ -375,11 +383,15 @@ export class AutoMessageService {
     }
 
     // Someone already answered after this message: nothing left for automation to do.
-    if (await this.messages.exists({ where: { igsid: m.igsid, direction: 'out', createdAt: MoreThan(m.createdAt) } })) {
+    const answeredWhere: any = { igsid: m.igsid, direction: 'out', createdAt: MoreThan(m.createdAt) };
+    if (own) answeredWhere.ownerUsername = own;
+    if (await this.messages.exists({ where: answeredWhere })) {
       return skip('already answered');
     }
-    // Global hourly cap (rules and AI together).
-    const sentLastHour = await this.logs.count({ where: { outcome: 'sent', createdAt: MoreThan(new Date(Date.now() - HOUR)) } });
+    // Global hourly cap per tenant account (rules and AI together).
+    const capWhere: any = { outcome: 'sent', createdAt: MoreThan(new Date(Date.now() - HOUR)) };
+    if (own) capWhere.ownerUsername = own;
+    const sentLastHour = await this.logs.count({ where: capWhere });
     if (sentLastHour >= s.maxPerHour) {
       if (Date.now() - this.lastCapWarning > 10 * 60_000) {
         this.lastCapWarning = Date.now();
@@ -461,8 +473,10 @@ export class AutoMessageService {
 
   // The last few messages before this one, so the AI understands what the customer is replying to.
   private async threadContext(m: Message) {
+    const priorWhere: any = { igsid: m.igsid, createdAt: LessThan(m.createdAt) };
+    if (m.ownerUsername) priorWhere.ownerUsername = m.ownerUsername;
     const prior = await this.messages.find({
-      where: { igsid: m.igsid, createdAt: LessThan(m.createdAt) },
+      where: priorWhere,
       order: { createdAt: 'DESC' },
       take: 6,
     });

@@ -376,10 +376,14 @@ export class CommentDmService {
 
   private async getIgsidForComment(c: Comment): Promise<string | null> {
     if (c.username) {
-      const conv = await this.conversations.findOne({ where: { username: c.username } });
+      const convWhere: any = { username: c.username };
+      if (c.ownerUsername) convWhere.ownerUsername = c.ownerUsername;
+      const conv = await this.conversations.findOne({ where: convWhere });
       if (conv?.igsid) return conv.igsid;
+      const logWhere: any = { username: c.username, igsid: Not(IsNull()) };
+      if (c.ownerUsername) logWhere.ownerUsername = c.ownerUsername;
       const prevLog = await this.logs.findOne({
-        where: { username: c.username, igsid: Not(IsNull()) },
+        where: logWhere,
         order: { createdAt: 'DESC' },
       });
       if (prevLog?.igsid) return prevLog.igsid;
