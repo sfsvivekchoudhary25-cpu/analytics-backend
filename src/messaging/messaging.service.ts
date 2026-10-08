@@ -101,7 +101,8 @@ export class MessagingService implements OnModuleInit {
         const other = (conv.participants?.data ?? []).find((p: any) => String(p.username ?? '').toLowerCase() !== ownHandle);
         if (!other?.id) continue;
         const existing = await this.conversations.findOne({ where: { igsid: String(other.id), ownerUsername: ownHandle } });
-        if (existing && existing.lastMessageAt >= new Date(conv.updated_time)) continue; // nothing new here
+        const isRecent = new Date(conv.updated_time).getTime() > Date.now() - 2 * 24 * 3600_000;
+        if (!isRecent && existing && existing.lastMessageAt >= new Date(conv.updated_time)) continue; // nothing new here
 
         const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle });
         const msgs: any[] = [...(detail.messages?.data ?? [])].reverse(); // oldest first
