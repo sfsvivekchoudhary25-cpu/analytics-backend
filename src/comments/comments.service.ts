@@ -89,7 +89,7 @@ export class CommentsService {
       .addSelect('COUNT(*)', 'n')
       .where('c.parent_id IS NULL');
     if (own) {
-      qb.andWhere('(c.ownerUsername = :own OR c.ownerUsername IS NULL)', { own });
+      qb.andWhere('LOWER(c.ownerUsername) = :own', { own });
     }
     const rows: { mid: string; n: string }[] = await qb.groupBy('c.media_id').getRawMany();
     const visible = new Map(rows.map((r) => [r.mid, Number(r.n)]));
@@ -239,10 +239,14 @@ export class CommentsService {
   async getAutoReply(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
     const s = await this.getSettings(own ?? undefined);
-    const rules = await this.rulesRepo.find({
-      where: own ? { ownerUsername: own } : {},
-      order: { sortOrder: 'ASC', createdAt: 'ASC' },
-    });
+    const rules = own
+      ? await this.rulesRepo
+          .createQueryBuilder('r')
+          .where('LOWER(r.ownerUsername) = :own', { own })
+          .orderBy('r.sortOrder', 'ASC')
+          .addOrderBy('r.createdAt', 'ASC')
+          .getMany()
+      : [];
     return {
       enabled: s.enabled,
       enabledAt: s.enabledAt,
@@ -299,29 +303,33 @@ export class CommentsService {
 
   async addRule(body: { keywords?: string; replyText?: string }, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
+    if (!own) throw new BadRequestException('Connected Instagram account required to add auto-reply rules.');
     const v = this.validateRule(body.keywords, body.replyText);
-    const last = await this.rulesRepo.find({
-      where: own ? { ownerUsername: own } : {},
-      order: { sortOrder: 'DESC' },
-      take: 1,
-    });
+    const last = await this.rulesRepo
+      .createQueryBuilder('r')
+      .where('LOWER(r.ownerUsername) = :own', { own })
+      .orderBy('r.sortOrder', 'DESC')
+      .take(1)
+      .getOne();
     const rule = await this.rulesRepo.save(
       this.rulesRepo.create({
         ...v,
         ownerUsername: own,
         enabled: true,
-        sortOrder: (last[0]?.sortOrder ?? 0) + 1,
+        sortOrder: (last?.sortOrder ?? 0) + 1,
       }),
     );
-    this.logger.log(`Auto-reply rule added (${own || 'default'}): ${v.keywords ? `keywords [${v.keywords}]` : 'any comment'} -> "${preview(v.replyText, 60)}"`);
+    this.logger.log(`Auto-reply rule added (${own}): ${v.keywords ? `keywords [${v.keywords}]` : 'any comment'} -> "${preview(v.replyText, 60)}"`);
     return rule;
   }
 
   async updateRule(id: string, body: { keywords?: string; replyText?: string; enabled?: boolean }, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const rule = await this.rulesRepo.findOne({
-      where: own ? { id, ownerUsername: own } : { id },
-    });
+    if (!own) throw new NotFoundException('Rule not found.');
+    const rule = await this.rulesRepo
+      .createQueryBuilder('r')
+      .where('r.id = :id AND LOWER(r.ownerUsername) = :own', { id, own })
+      .getOne();
     if (!rule) throw new NotFoundException('Rule not found.');
     if (body.keywords !== undefined || body.replyText !== undefined) {
       const v = this.validateRule(body.keywords ?? rule.keywords, body.replyText ?? rule.replyText);
@@ -334,12 +342,14 @@ export class CommentsService {
 
   async deleteRule(id: string, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const rule = await this.rulesRepo.findOne({
-      where: own ? { id, ownerUsername: own } : { id },
-    });
+    if (!own) throw new NotFoundException('Rule not found.');
+    const rule = await this.rulesRepo
+      .createQueryBuilder('r')
+      .where('r.id = :id AND LOWER(r.ownerUsername) = :own', { id, own })
+      .getOne();
     if (!rule) throw new NotFoundException('Rule not found.');
     await this.rulesRepo.remove(rule);
-    this.logger.log(`Auto-reply rule deleted (${own || 'default'}).`);
+    this.logger.log(`Auto-reply rule deleted (${own}).`);
     return { ok: true };
   }
 

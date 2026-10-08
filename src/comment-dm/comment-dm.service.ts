@@ -47,9 +47,11 @@ export class CommentDmService {
 
   private async getOwnOrThrow(id: string, ownerUsername?: string): Promise<CommentDmRule> {
     const own = await this.resolveOwner(ownerUsername);
-    const rule = await this.rules.findOne({
-      where: own ? [{ id, ownerUsername: own }, { id, ownerUsername: IsNull() }] : { id },
-    });
+    if (!own) throw new NotFoundException('Automation not found.');
+    const rule = await this.rules
+      .createQueryBuilder('r')
+      .where('r.id = :id AND LOWER(r.ownerUsername) = :own', { id, own })
+      .getOne();
     if (!rule) throw new NotFoundException('Automation not found.');
     if (!rule.followGateText) rule.followGateText = DEFAULT_FOLLOW_GATE_TEXT;
     return rule;
@@ -419,9 +421,10 @@ export class CommentDmService {
   //     3. If not following: send followGateText with "Visit Profile" and "I'm following ✅" buttons.
   async processAuto(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
+    if (!own) return;
     const active = (
       await this.rules.find({
-        where: own ? [{ enabled: true, ownerUsername: own }, { enabled: true, ownerUsername: IsNull() }] : { enabled: true },
+        where: { enabled: true, ownerUsername: own },
         order: { createdAt: 'ASC' },
       })
     ).filter((r) => r.enabledAt);
@@ -429,12 +432,7 @@ export class CommentDmService {
 
     const earliestEnabledAt = active.reduce((min, r) => (r.enabledAt! < min ? r.enabledAt! : min), active[0].enabledAt!);
     const candidates = await this.comments.find({
-      where: own
-        ? [
-            { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt), ownerUsername: own },
-            { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt), ownerUsername: IsNull() },
-          ]
-        : { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt) },
+      where: { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt), ownerUsername: own },
       order: { commentedAt: 'ASC' },
       take: 25,
     });
@@ -1239,10 +1237,12 @@ export class CommentDmService {
 
     // 9. All Comment-DM rules (including disabled) for this post — so user can enable/control from the detail page
     const allDmRulesForPost = (
-      await this.rules.find({
-        where: own ? [{ ownerUsername: own }, { ownerUsername: IsNull() }] : {},
-        order: { createdAt: 'ASC' },
-      })
+      own
+        ? await this.rules.find({
+            where: { ownerUsername: own },
+            order: { createdAt: 'ASC' },
+          })
+        : []
     ).filter((r) => !r.mediaId || r.mediaId === mediaId);
 
     return {

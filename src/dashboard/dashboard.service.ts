@@ -114,9 +114,9 @@ export class DashboardService {
     //      those weren't sent BY this app and labelling them as if they were would be misleading.
     // Fetched wider than the 10 we'll show, so one chatty customer filling the recent window in a single
     // source doesn't crowd out everyone else once we dedupe down to one row per person below.
-    const dmLogWhere: any = own ? { ownerUsername: own } : {};
-    const autoLogWhere: any = { outcome: 'sent', ...(own ? { ownerUsername: own } : {}) };
-    const manualWhere: any = { direction: 'out', source: In(['dashboard', 'system']), ...(own ? { ownerUsername: own } : {}) };
+    const dmLogWhere: any = own ? { ownerUsername: own } : { id: '-1' };
+    const autoLogWhere: any = own ? { outcome: 'sent', ownerUsername: own } : { id: '-1' };
+    const manualWhere: any = own ? { direction: 'out', source: In(['dashboard', 'system']), ownerUsername: own } : { id: '-1' };
 
     const [recentCommentDms, recentAutoLogs, recentManual] = await Promise.all([
       this.dmLogs.find({ where: dmLogWhere, order: { createdAt: 'DESC' }, take: 40 }),

@@ -59,9 +59,6 @@ export class AutoMessageService {
         .where('LOWER(s.ownerUsername) = :own', { own })
         .getOne();
     }
-    if (!existing && !own) {
-      existing = await this.settingsRepo.findOne({ where: { id: 1 } });
-    }
 
     if (existing) {
       if (own && !existing.ownerUsername) {
@@ -103,10 +100,14 @@ export class AutoMessageService {
   async getAutoReply(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
     const s = await this.getSettings(own ?? undefined);
-    const rules = await this.rulesRepo.find({
-      where: own ? { ownerUsername: own } : {},
-      order: { sortOrder: 'ASC', createdAt: 'ASC' },
-    });
+    const rules = own
+      ? await this.rulesRepo
+          .createQueryBuilder('r')
+          .where('LOWER(r.ownerUsername) = :own', { own })
+          .orderBy('r.sortOrder', 'ASC')
+          .addOrderBy('r.createdAt', 'ASC')
+          .getMany()
+      : [];
     return {
       enabled: s.enabled,
       enabledAt: s.enabledAt,
@@ -193,29 +194,33 @@ export class AutoMessageService {
 
   async addRule(body: { keywords?: string; replyText?: string }, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
+    if (!own) throw new BadRequestException('Connected Instagram account required to add automation rules.');
     const v = this.validateRule(body.keywords, body.replyText);
-    const last = await this.rulesRepo.find({
-      where: own ? { ownerUsername: own } : {},
-      order: { sortOrder: 'DESC' },
-      take: 1,
-    });
+    const last = await this.rulesRepo
+      .createQueryBuilder('r')
+      .where('LOWER(r.ownerUsername) = :own', { own })
+      .orderBy('r.sortOrder', 'DESC')
+      .take(1)
+      .getOne();
     const rule = await this.rulesRepo.save(
       this.rulesRepo.create({
         ...v,
         ownerUsername: own,
         enabled: true,
-        sortOrder: (last[0]?.sortOrder ?? 0) + 1,
+        sortOrder: (last?.sortOrder ?? 0) + 1,
       }),
     );
-    this.logger.log(`Message rule added (${own || 'default'}): ${v.keywords ? `keywords [${v.keywords}]` : 'any message'} -> "${preview(v.replyText)}"`);
+    this.logger.log(`Message rule added (${own}): ${v.keywords ? `keywords [${v.keywords}]` : 'any message'} -> "${preview(v.replyText)}"`);
     return rule;
   }
 
   async updateRule(id: string, body: { keywords?: string; replyText?: string; enabled?: boolean }, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const rule = await this.rulesRepo.findOne({
-      where: own ? { id, ownerUsername: own } : { id },
-    });
+    if (!own) throw new NotFoundException('Rule not found.');
+    const rule = await this.rulesRepo
+      .createQueryBuilder('r')
+      .where('r.id = :id AND LOWER(r.ownerUsername) = :own', { id, own })
+      .getOne();
     if (!rule) throw new NotFoundException('Rule not found.');
     if (body.keywords !== undefined || body.replyText !== undefined) {
       const v = this.validateRule(body.keywords ?? rule.keywords, body.replyText ?? rule.replyText);
@@ -228,22 +233,26 @@ export class AutoMessageService {
 
   async deleteRule(id: string, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const rule = await this.rulesRepo.findOne({
-      where: own ? { id, ownerUsername: own } : { id },
-    });
+    if (!own) throw new NotFoundException('Rule not found.');
+    const rule = await this.rulesRepo
+      .createQueryBuilder('r')
+      .where('r.id = :id AND LOWER(r.ownerUsername) = :own', { id, own })
+      .getOne();
     if (!rule) throw new NotFoundException('Rule not found.');
     await this.rulesRepo.remove(rule);
-    this.logger.log(`Message rule deleted (${own || 'default'}).`);
+    this.logger.log(`Message rule deleted (${own}).`);
     return { ok: true };
   }
 
   async recent(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    return this.logs.find({
-      where: own ? { ownerUsername: own } : {},
-      order: { createdAt: 'DESC' },
-      take: 30,
-    });
+    if (!own) return [];
+    return this.logs
+      .createQueryBuilder('l')
+      .where('LOWER(l.ownerUsername) = :own', { own })
+      .orderBy('l.createdAt', 'DESC')
+      .take(50)
+      .getMany();
   }
 
   // ---------- doing the work ----------

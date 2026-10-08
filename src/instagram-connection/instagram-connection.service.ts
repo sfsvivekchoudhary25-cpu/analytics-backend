@@ -21,23 +21,55 @@ export class InstagramConnectionService implements OnModuleInit {
 
   async onModuleInit() {
     try {
-      const conn = await this.getConnectionRow();
-      if (conn?.username) {
-        const u = conn.username.toLowerCase();
-        await this.repo.query(`UPDATE "comment_dm_rule" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "comment_dm_log" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "auto_reply_setting" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "auto_reply_rule" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "message_auto_setting" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "message_auto_rule" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "message_auto_log" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "conversation" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "message" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "comment" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "submission" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        await this.repo.query(`UPDATE "story" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
-        this.logger.log(`Multi-account isolation backfill complete for primary account @${u}`);
+      // Reconcile legacy logs: All rows created before sfs.vivekchoudhary25 was connected (Oct 8, 2026 ~11:50 UTC)
+      // or containing Swedish error notes / fabroniee references belong to fabroniee.
+      await this.repo.query(`
+        UPDATE "message_auto_log"
+        SET "owner_username" = 'fabroniee'
+        WHERE "owner_username" = 'sfs.vivekchoudhary25'
+          AND ("created_at" < '2026-10-08 10:00:00Z' OR "note" LIKE '%anv%' OR "username" = 'fabroniee');
+      `).catch(() => {});
+
+      await this.repo.query(`
+        UPDATE "comment_dm_log"
+        SET "owner_username" = 'fabroniee'
+        WHERE "owner_username" = 'sfs.vivekchoudhary25'
+          AND "created_at" < '2026-10-08 10:00:00Z';
+      `).catch(() => {});
+
+      await this.repo.query(`
+        UPDATE "message"
+        SET "owner_username" = 'fabroniee'
+        WHERE "owner_username" = 'sfs.vivekchoudhary25'
+          AND "created_at" < '2026-10-08 10:00:00Z';
+      `).catch(() => {});
+
+      await this.repo.query(`
+        UPDATE "conversation"
+        SET "owner_username" = 'fabroniee'
+        WHERE "owner_username" = 'sfs.vivekchoudhary25'
+          AND "created_at" < '2026-10-08 10:00:00Z';
+      `).catch(() => {});
+
+      // For any unassigned legacy rows, attribute to fabroniee (the legacy initial account)
+      const legacyTables = [
+        'comment_dm_rule',
+        'comment_dm_log',
+        'auto_reply_setting',
+        'auto_reply_rule',
+        'message_auto_setting',
+        'message_auto_rule',
+        'message_auto_log',
+        'conversation',
+        'message',
+        'comment',
+        'submission',
+        'story',
+      ];
+      for (const table of legacyTables) {
+        await this.repo.query(`UPDATE "${table}" SET "owner_username" = 'fabroniee' WHERE "owner_username" IS NULL`).catch(() => {});
       }
+      this.logger.log('Multi-account isolation and legacy data reconciliation complete.');
     } catch (e) {
       this.logger.warn(`Backfill error: ${(e as Error).message}`);
     }
