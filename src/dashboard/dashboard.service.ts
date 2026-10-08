@@ -27,14 +27,16 @@ export class DashboardService {
     @InjectRepository(Submission) private readonly submissions: Repository<Submission>,
   ) {}
 
-  async overview(days: number) {
+  async overview(days: number, account?: string) {
+    const own = account ? account.trim().replace(/^@/, '').toLowerCase() : null;
     const cutoff = new Date(Date.now() - days * DAY);
     const prevCutoff = new Date(Date.now() - 2 * days * DAY);
 
     // Earliest submission per username, so "converted" only counts a photo sent AFTER our DM reply — never one
     // that happened to exist beforehand, which wouldn't really be something the DM caused.
     const earliestSubmission = new Map<string, Date>();
-    for (const s of await this.submissions.find({ select: { igUsername: true, createdAt: true } })) {
+    const subWhere: any = own ? { ownerUsername: own } : {};
+    for (const s of await this.submissions.find({ where: subWhere, select: { igUsername: true, createdAt: true } })) {
       const u = s.igUsername.toLowerCase();
       const prev = earliestSubmission.get(u);
       if (!prev || s.createdAt < prev) earliestSubmission.set(u, s.createdAt);
@@ -44,16 +46,33 @@ export class DashboardService {
       return !!sub && !!r.repliedAt && sub > r.repliedAt;
     };
 
+    const cWhereNow: any = { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(cutoff) };
+    const cWherePrev: any = { isOwn: false, parentId: IsNull(), commentedAt: Between(prevCutoff, cutoff) };
+    const dmWhereNow: any = { dmSentAt: MoreThan(cutoff) };
+    const dmWherePrev: any = { dmSentAt: Between(prevCutoff, cutoff) };
+    if (own) {
+      cWhereNow.ownerUsername = own;
+      cWherePrev.ownerUsername = own;
+      dmWhereNow.ownerUsername = own;
+      dmWherePrev.ownerUsername = own;
+    }
+
     const [commentsNow, commentsPrev, sentNow, sentPrev] = await Promise.all([
-      this.comments.count({ where: { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(cutoff) } }),
-      this.comments.count({ where: { isOwn: false, parentId: IsNull(), commentedAt: Between(prevCutoff, cutoff) } }),
-      this.dmLogs.count({ where: { dmSentAt: MoreThan(cutoff) } }),
-      this.dmLogs.count({ where: { dmSentAt: Between(prevCutoff, cutoff) } }),
+      this.comments.count({ where: cWhereNow }),
+      this.comments.count({ where: cWherePrev }),
+      this.dmLogs.count({ where: dmWhereNow }),
+      this.dmLogs.count({ where: dmWherePrev }),
     ]);
 
+    const repliedNowWhere: any = { dmSentAt: Not(IsNull()), repliedAt: MoreThan(cutoff) };
+    const repliedPrevWhere: any = { dmSentAt: Not(IsNull()), repliedAt: Between(prevCutoff, cutoff) };
+    if (own) {
+      repliedNowWhere.ownerUsername = own;
+      repliedPrevWhere.ownerUsername = own;
+    }
     const [repliedRows, repliedPrevRows] = await Promise.all([
-      this.dmLogs.find({ where: { dmSentAt: Not(IsNull()), repliedAt: MoreThan(cutoff) }, select: { username: true, repliedAt: true } }),
-      this.dmLogs.find({ where: { dmSentAt: Not(IsNull()), repliedAt: Between(prevCutoff, cutoff) }, select: { username: true, repliedAt: true } }),
+      this.dmLogs.find({ where: repliedNowWhere, select: { username: true, repliedAt: true } }),
+      this.dmLogs.find({ where: repliedPrevWhere, select: { username: true, repliedAt: true } }),
     ]);
     const repliesNow = repliedRows.length;
     const repliesPrev = repliedPrevRows.length;
@@ -70,9 +89,15 @@ export class DashboardService {
         if (b) b[key] += 1;
       }
     };
+    const cRowsWhere: any = { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(cutoff) };
+    const dmRowsWhere: any = { dmSentAt: MoreThan(cutoff) };
+    if (own) {
+      cRowsWhere.ownerUsername = own;
+      dmRowsWhere.ownerUsername = own;
+    }
     const [commentRows, dmRows] = await Promise.all([
-      this.comments.find({ where: { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(cutoff) }, select: { commentedAt: true } }),
-      this.dmLogs.find({ where: { dmSentAt: MoreThan(cutoff) }, select: { dmSentAt: true } }),
+      this.comments.find({ where: cRowsWhere, select: { commentedAt: true } }),
+      this.dmLogs.find({ where: dmRowsWhere, select: { dmSentAt: true } }),
     ]);
     bump(commentRows.map((r) => r.commentedAt), 'comments');
     bump(dmRows.map((r) => r.dmSentAt), 'dmsSent');
@@ -89,10 +114,14 @@ export class DashboardService {
     //      those weren't sent BY this app and labelling them as if they were would be misleading.
     // Fetched wider than the 10 we'll show, so one chatty customer filling the recent window in a single
     // source doesn't crowd out everyone else once we dedupe down to one row per person below.
+    const dmLogWhere: any = own ? { ownerUsername: own } : {};
+    const autoLogWhere: any = { outcome: 'sent', ...(own ? { ownerUsername: own } : {}) };
+    const manualWhere: any = { direction: 'out', source: In(['dashboard', 'system']), ...(own ? { ownerUsername: own } : {}) };
+
     const [recentCommentDms, recentAutoLogs, recentManual] = await Promise.all([
-      this.dmLogs.find({ order: { createdAt: 'DESC' }, take: 40 }),
-      this.autoLogs.find({ where: { outcome: 'sent' }, order: { createdAt: 'DESC' }, take: 40 }),
-      this.messages.find({ where: { direction: 'out', source: In(['dashboard', 'system']) }, order: { createdAt: 'DESC' }, take: 40 }),
+      this.dmLogs.find({ where: dmLogWhere, order: { createdAt: 'DESC' }, take: 40 }),
+      this.autoLogs.find({ where: autoLogWhere, order: { createdAt: 'DESC' }, take: 40 }),
+      this.messages.find({ where: manualWhere, order: { createdAt: 'DESC' }, take: 40 }),
     ]);
 
     const commentTexts = recentCommentDms.length

@@ -375,7 +375,7 @@ export class InstagramConnectionService implements OnModuleInit {
       const clean = account.trim().replace(/^@/, '').toLowerCase();
       return this.repo
         .createQueryBuilder('c')
-        .where('LOWER(c.username) = :u', { u: clean })
+        .where('LOWER(c.username) = :u OR LOWER(c.username) = :atU', { u: clean, atU: `@${clean}` })
         .getOne();
     }
     return null;

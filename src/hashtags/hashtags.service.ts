@@ -47,7 +47,7 @@ export class HashtagsService {
   ) {}
 
   // 1. Search for a hashtag's ID (Meta: GET /ig_hashtag_search)
-  async search(rawQuery: string): Promise<HashtagDetail> {
+  async search(rawQuery: string, account?: string): Promise<HashtagDetail> {
     const cleanTag = String(rawQuery || '')
       .replace(/^#+/, '')
       .trim()
@@ -62,16 +62,13 @@ export class HashtagsService {
       throw new BadRequestException('Hashtag queries cannot contain spaces or emojis.');
     }
 
-    const token = await this.connection.getValidAccessToken();
-    const igUserId = await this.connection.getIgUserId();
-
     // Check cache to avoid burning 7-day rolling quota
     const cached = this.searchCache.get(cleanTag);
     if (cached) {
       return this.formatHashtagDetail(cached.id, cached.name, true, false);
     }
 
-    const creds = await this.getGraphCredentials();
+    const creds = await this.getGraphCredentials(account);
 
     if (creds) {
       try {
@@ -105,7 +102,7 @@ export class HashtagsService {
   }
 
   // 2. Fetch Top or Recent media for a hashtag (Meta: GET /{ig-hashtag-id}/top_media or recent_media)
-  async getMedia(hashtagId: string, type: 'top' | 'recent' = 'top', limit = 20) {
+  async getMedia(hashtagId: string, type: 'top' | 'recent' = 'top', limit = 20, account?: string) {
     const isSynthetic = hashtagId.startsWith('ht_');
     const cleanTag = hashtagId.replace(/^ht_/, '').split('_')[0] || 'explore';
 
@@ -122,7 +119,7 @@ export class HashtagsService {
 
     if (!isSynthetic) {
       try {
-        const creds = await this.getGraphCredentials();
+        const creds = await this.getGraphCredentials(account);
         if (creds) {
           const edge = type === 'top' ? 'top_media' : 'recent_media';
           const fields = 'id,caption,media_type,media_url,permalink,like_count,comments_count,timestamp';
@@ -169,7 +166,7 @@ export class HashtagsService {
   }
 
   // Helper to resolve the best token (Facebook Page token for graph.facebook.com or IG user token)
-  private async getGraphCredentials(): Promise<{ token: string; igUserId: string } | null> {
+  private async getGraphCredentials(account?: string): Promise<{ token: string; igUserId: string } | null> {
     try {
       const fbStatus = await this.fbPage.getStatus();
       if (fbStatus.connected && fbStatus.igUserId) {
@@ -179,8 +176,8 @@ export class HashtagsService {
     } catch {}
 
     try {
-      const token = await this.connection.getValidAccessToken();
-      const igUserId = await this.connection.getIgUserId();
+      const token = await this.connection.getValidAccessToken(account);
+      const igUserId = await this.connection.getIgUserId(account);
       if (token && igUserId) return { token, igUserId };
     } catch {}
 
@@ -188,9 +185,9 @@ export class HashtagsService {
   }
 
   // 3. Recently searched hashtags quota tracking (Meta: GET /{ig-user-id}/recently_searched_hashtags)
-  async getRecentlySearched() {
+  async getRecentlySearched(account?: string) {
     try {
-      const creds = await this.getGraphCredentials();
+      const creds = await this.getGraphCredentials(account);
       if (creds) {
         const url = `${FB_GRAPH}/${creds.igUserId}/recently_searched_hashtags?access_token=${encodeURIComponent(creds.token)}`;
         const res = await fetch(url);

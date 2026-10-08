@@ -71,6 +71,7 @@ export class AuthService {
       email: user.email,
       name: user.name,
       role: user.role,
+      instagramHandle: user.instagramHandle,
     });
 
     return {
@@ -104,6 +105,7 @@ export class AuthService {
           email: user.email,
           name: user.name,
           role: user.role,
+          instagramHandle: user.instagramHandle,
         });
 
         return {

@@ -1,5 +1,6 @@
 import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
+import { CurrentAccount } from '../common/current-account.decorator';
 import { InstagramConnectionService } from './instagram-connection.service';
 
 import { GRAPH } from './graph-client.service';
@@ -23,12 +24,15 @@ export class InstagramInsightsController {
   constructor(private readonly connection: InstagramConnectionService) {}
 
   @Get('overview')
-  async overview(@Query('days') daysParam?: string) {
+  async overview(
+    @Query('days') daysParam?: string,
+    @CurrentAccount() account?: string,
+  ) {
     // Instagram only serves insights for windows of up to 30 days per request.
     const days = Math.min(30, Math.max(1, parseInt(daysParam ?? '30', 10) || 30));
     const until = Math.floor(Date.now() / 1000);
     const since = until - days * 86400;
-    const token = await this.connection.getValidAccessToken();
+    const token = await this.connection.getValidAccessToken(account);
 
     const call = async (path: string, params: Record<string, string>) => {
       const qs = new URLSearchParams({ ...params, access_token: token });
@@ -77,7 +81,7 @@ export class InstagramInsightsController {
     let finalProfile = profile;
     if (!finalProfile || finalProfile.followers_count == null) {
       try {
-        const igUserId = await this.connection.getIgUserId();
+        const igUserId = await this.connection.getIgUserId(account);
         const fbRepo = (this.connection as any).repo.manager.getRepository('FacebookPageConnection');
         const fbConn = await fbRepo.findOne({ where: {} });
         if (fbConn?.pageAccessToken && igUserId) {
