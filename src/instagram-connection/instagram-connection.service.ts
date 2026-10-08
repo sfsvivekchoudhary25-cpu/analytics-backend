@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -11,13 +11,37 @@ const GRAPH_BASE = 'https://graph.instagram.com';
 const REFRESH_WINDOW_DAYS = 10; // refresh once fewer than this many days remain
 
 @Injectable()
-export class InstagramConnectionService {
+export class InstagramConnectionService implements OnModuleInit {
   private readonly logger = new Logger(InstagramConnectionService.name);
 
   constructor(
     @InjectRepository(InstagramConnection)
     private readonly repo: Repository<InstagramConnection>,
   ) {}
+
+  async onModuleInit() {
+    try {
+      const conn = await this.getConnectionRow();
+      if (conn?.username) {
+        const u = conn.username.toLowerCase();
+        await this.repo.query(`UPDATE "comment_dm_rule" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "comment_dm_log" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "auto_reply_setting" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "auto_reply_rule" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "message_auto_setting" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "message_auto_rule" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "message_auto_log" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "conversation" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "message" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "comment" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "submission" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        await this.repo.query(`UPDATE "story" SET "owner_username" = $1 WHERE "owner_username" IS NULL`, [u]).catch(() => {});
+        this.logger.log(`Multi-account isolation backfill complete for primary account @${u}`);
+      }
+    } catch (e) {
+      this.logger.warn(`Backfill error: ${(e as Error).message}`);
+    }
+  }
 
   private async cacheProfilePicture(metaUrl: string, filename?: string): Promise<string | null> {
     try {
@@ -37,8 +61,8 @@ export class InstagramConnectionService {
   }
 
   // Live sync real Instagram profile and avatar directly from Meta
-  async syncLiveProfile(force = false): Promise<InstagramConnection | null> {
-    const connection = await this.getConnectionRow();
+  async syncLiveProfile(force = false, account?: string): Promise<InstagramConnection | null> {
+    const connection = await this.getConnectionRow(account);
     if (!connection || !connection.accessToken) return null;
 
     let profileUrl: string | null = null;
@@ -180,7 +204,21 @@ export class InstagramConnectionService {
       throw new BadRequestException('Could not verify that token with Instagram. Double-check it and try again.');
     }
 
-    const connection = (await this.getConnectionRow()) ?? this.repo.create();
+    const cleanNew = me.username ? me.username.trim().toLowerCase() : null;
+    let connection: InstagramConnection | null = null;
+    if (cleanNew) {
+      connection = await this.repo
+        .createQueryBuilder('c')
+        .where('LOWER(c.username) = :u', { u: cleanNew })
+        .getOne();
+    }
+    if (!connection && me.user_id) {
+      connection = await this.repo.findOne({ where: { igUserId: me.user_id } });
+    }
+    if (!connection) {
+      connection = this.repo.create();
+    }
+
     connection.igUserId = me.user_id;
     connection.username = me.username;
 
@@ -195,12 +233,13 @@ export class InstagramConnectionService {
     connection.permissions = livePermissions && livePermissions.length ? livePermissions.join(',') : connection.permissions || null;
 
     await this.repo.save(connection);
+    this.logger.log(`Instagram connected for @${connection.username} (token saved independently)`);
     return { username: connection.username };
   }
 
   // Live-syncs granted permissions directly from Meta without manual database intervention
-  async syncLivePermissions(): Promise<string[]> {
-    const connection = await this.getConnectionRow();
+  async syncLivePermissions(account?: string): Promise<string[]> {
+    const connection = await this.getConnectionRow(account);
     if (!connection) return [];
 
     const grantedSet = new Set<string>();
@@ -227,20 +266,44 @@ export class InstagramConnectionService {
     if (list.length > 0) {
       connection.permissions = list.join(',');
       await this.repo.save(connection);
-      this.logger.log(`Live synced ${list.length} permissions: ${connection.permissions}`);
+      this.logger.log(`Live synced ${list.length} permissions for @${connection.username}: ${connection.permissions}`);
     }
     return list;
   }
 
-  async getStatus() {
-    let connection = await this.getConnectionRow();
+  async listConnectedAccounts() {
+    const list = await this.repo.find({ order: { updatedAt: 'DESC' } });
+    return list.map((c) => ({
+      username: c.username,
+      igUserId: c.igUserId,
+      profilePictureUrl: c.profilePictureUrl ?? null,
+      expiresAt: c.tokenExpiresAt,
+      permissions: c.permissions ? c.permissions.split(',') : null,
+      updatedAt: c.updatedAt,
+    }));
+  }
+
+  async touchAccount(username: string) {
+    const clean = username.trim().replace(/^@/, '').toLowerCase();
+    const conn = await this.repo
+      .createQueryBuilder('c')
+      .where('LOWER(c.username) = :u', { u: clean })
+      .getOne();
+    if (!conn) throw new BadRequestException(`Account @${clean} is not connected.`);
+    conn.updatedAt = new Date();
+    await this.repo.save(conn);
+    return { success: true, username: conn.username };
+  }
+
+  async getStatus(account?: string) {
+    let connection = await this.getConnectionRow(account);
     if (!connection) {
       return { connected: false };
     }
 
     // Refresh & cache avatar if missing locally, external http URL, or legacy static brand-avatar
     if ((!connection.profilePictureUrl || connection.profilePictureUrl === '/media/brand-avatar.jpg' || connection.profilePictureUrl.startsWith('http')) && connection.accessToken) {
-      const refreshed = await this.syncLiveProfile();
+      const refreshed = await this.syncLiveProfile(false, connection.username);
       if (refreshed) connection = refreshed;
     }
 
@@ -253,60 +316,75 @@ export class InstagramConnectionService {
     };
   }
 
-  // Used by the posting/messaging modules we build next.
-  async getValidAccessToken(): Promise<string> {
-    return (await this.getConnectionOrThrow()).accessToken;
+  // Used by the posting/messaging modules. Scoped per account if provided.
+  async getValidAccessToken(account?: string): Promise<string> {
+    return (await this.getConnectionOrThrow(account)).accessToken;
   }
 
-  async getIgUserId(): Promise<string> {
-    return (await this.getConnectionOrThrow()).igUserId;
+  async getIgUserId(account?: string): Promise<string> {
+    return (await this.getConnectionOrThrow(account)).igUserId;
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_3AM)
   async refreshTokenIfNeeded() {
-    const connection = await this.getConnectionRow();
-    if (!connection) return;
+    const connections = await this.repo.find();
+    if (!connections.length) return;
 
-    const daysLeft = (connection.tokenExpiresAt.getTime() - Date.now()) / (1000 * 60 * 60 * 24);
-    if (daysLeft > REFRESH_WINDOW_DAYS) return;
+    for (const connection of connections) {
+      const daysLeft = (connection.tokenExpiresAt.getTime() - Date.now()) / (1000 * 60 * 60 * 24);
+      if (daysLeft > REFRESH_WINDOW_DAYS) continue;
 
-    try {
-      const res = await fetch(
-        `${GRAPH_BASE}/refresh_access_token?grant_type=ig_refresh_token&access_token=${connection.accessToken}`,
-      );
-      if (!res.ok) {
-        this.logger.error('Instagram token refresh failed - you will need to reconnect the account manually.');
-        return;
-      }
-      const body = await res.json();
-      connection.accessToken = body.access_token;
-      connection.tokenExpiresAt = new Date(Date.now() + body.expires_in * 1000);
-      await this.repo.save(connection);
-      this.logger.log('Instagram access token refreshed.');
-
-      // Also refresh brand profile picture
       try {
-        const me = await fetch(`${GRAPH_BASE}/me?fields=profile_picture_url&access_token=${connection.accessToken}`).then((r) => r.json());
-        if (me?.profile_picture_url) {
-          const cached = await this.cacheProfilePicture(me.profile_picture_url);
-          if (cached) {
-            connection.profilePictureUrl = cached;
-            await this.repo.save(connection);
-          }
+        const res = await fetch(
+          `${GRAPH_BASE}/refresh_access_token?grant_type=ig_refresh_token&access_token=${connection.accessToken}`,
+        );
+        if (!res.ok) {
+          this.logger.error(`Instagram token refresh failed for @${connection.username} - you will need to reconnect the account manually.`);
+          continue;
         }
-      } catch {}
-    } catch (err) {
-      this.logger.error('Instagram token refresh threw an error', err as Error);
+        const body = await res.json();
+        connection.accessToken = body.access_token;
+        connection.tokenExpiresAt = new Date(Date.now() + body.expires_in * 1000);
+        await this.repo.save(connection);
+        this.logger.log(`Instagram access token refreshed for @${connection.username}.`);
+
+        // Also refresh brand profile picture
+        try {
+          const me = await fetch(`${GRAPH_BASE}/me?fields=profile_picture_url&access_token=${connection.accessToken}`).then((r) => r.json());
+          if (me?.profile_picture_url) {
+            const cached = await this.cacheProfilePicture(me.profile_picture_url, `avatar-${connection.igUserId || connection.username}.jpg`);
+            if (cached) {
+              connection.profilePictureUrl = cached;
+              await this.repo.save(connection);
+            }
+          }
+        } catch {}
+      } catch (err) {
+        this.logger.error(`Instagram token refresh threw an error for @${connection.username}`, err as Error);
+      }
     }
   }
 
-  private async getConnectionRow(): Promise<InstagramConnection | null> {
-    const [connection] = await this.repo.find({ take: 1 });
+  async getConnectionByIgUserId(igUserId?: string): Promise<InstagramConnection | null> {
+    if (!igUserId) return null;
+    return this.repo.findOne({ where: { igUserId } });
+  }
+
+  async getConnectionRow(account?: string): Promise<InstagramConnection | null> {
+    if (account) {
+      const clean = account.trim().replace(/^@/, '').toLowerCase();
+      const byUser = await this.repo
+        .createQueryBuilder('c')
+        .where('LOWER(c.username) = :u', { u: clean })
+        .getOne();
+      if (byUser) return byUser;
+    }
+    const [connection] = await this.repo.find({ order: { updatedAt: 'DESC' }, take: 1 });
     return connection ?? null;
   }
 
-  private async getConnectionOrThrow(): Promise<InstagramConnection> {
-    const connection = await this.getConnectionRow();
+  private async getConnectionOrThrow(account?: string): Promise<InstagramConnection> {
+    const connection = await this.getConnectionRow(account);
     if (!connection) {
       throw new BadRequestException('No Instagram account connected yet.');
     }

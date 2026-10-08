@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
+import { CurrentAccount } from '../common/current-account.decorator';
 import { InstagramConnectionService } from './instagram-connection.service';
 
 @UseGuards(AuthGuard)
@@ -13,18 +14,28 @@ export class InstagramConnectionController {
   }
 
   @Get()
-  status() {
-    return this.service.getStatus();
+  status(@CurrentAccount() account?: string) {
+    return this.service.getStatus(account);
+  }
+
+  @Get('accounts')
+  accounts() {
+    return this.service.listConnectedAccounts();
+  }
+
+  @Post('switch')
+  switchAccount(@Body('username') username: string) {
+    return this.service.touchAccount(username);
   }
 
   @Post('sync-permissions')
-  syncPermissions() {
-    return this.service.syncLivePermissions();
+  syncPermissions(@CurrentAccount() account?: string) {
+    return this.service.syncLivePermissions(account);
   }
 
   @Post('sync-profile')
-  async syncProfile() {
-    await this.service.syncLiveProfile(true);
-    return this.service.getStatus();
+  async syncProfile(@CurrentAccount() account?: string) {
+    await this.service.syncLiveProfile(true, account);
+    return this.service.getStatus(account);
   }
 }

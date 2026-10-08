@@ -16,6 +16,7 @@ import { AutoMessageService } from '../messaging/auto-message.service';
 import { MessagingService } from '../messaging/messaging.service';
 import { SubmissionsService } from '../submissions/submissions.service';
 import { CommentDmService } from '../comment-dm/comment-dm.service';
+import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { commentEvents, describeEvent, messagingEvents } from './events';
 
 function safeEqual(a: string, b: string): boolean {
@@ -36,6 +37,7 @@ export class InstagramWebhookController {
     private readonly comments: CommentsService,
     private readonly autoMessages: AutoMessageService,
     private readonly commentDm: CommentDmService,
+    private readonly connection: InstagramConnectionService,
   ) {}
 
   // Meta's one-time handshake when you click "Verify and save".
@@ -112,7 +114,18 @@ export class InstagramWebhookController {
       // 1. Process comments immediately and trigger Comment-to-DM without waiting for cron
       if (comments.length > 0) {
         await this.comments.handleWebhook(payload);
-        await this.commentDm.processAuto();
+        const touchedCommentAccounts = new Set<string>();
+        for (const { ownId } of comments) {
+          const conn = await this.connection.getConnectionByIgUserId(ownId).catch(() => null);
+          if (conn?.username) touchedCommentAccounts.add(conn.username.toLowerCase());
+        }
+        if (touchedCommentAccounts.size > 0) {
+          for (const acc of touchedCommentAccounts) {
+            await this.commentDm.processAuto(acc);
+          }
+        } else {
+          await this.commentDm.processAuto();
+        }
       }
 
       // 2. Process messaging events (follow-gate confirmations, DM sync)
@@ -120,8 +133,19 @@ export class InstagramWebhookController {
         await this.messaging.handleWebhook(payload);
         await this.submissions.handleWebhook(payload);
         await this.commentDm.handleMessageWebhook(payload); // matches follow-gate clicks, sends real DM or reminder
-        // Run AI auto-messages asynchronously so it never delays comment-to-DM responses
-        void this.autoMessages.processPending().catch((err) => this.logger.error(`AutoMessage error: ${err.message}`));
+        
+        const touchedMessageAccounts = new Set<string>();
+        for (const { ownId } of events) {
+          const conn = await this.connection.getConnectionByIgUserId(ownId).catch(() => null);
+          if (conn?.username) touchedMessageAccounts.add(conn.username.toLowerCase());
+        }
+        if (touchedMessageAccounts.size > 0) {
+          for (const acc of touchedMessageAccounts) {
+            void this.autoMessages.processPending(acc).catch((err) => this.logger.error(`AutoMessage error: ${err.message}`));
+          }
+        } else {
+          void this.autoMessages.processPending().catch((err) => this.logger.error(`AutoMessage error: ${err.message}`));
+        }
       }
     })().catch((err) => this.logger.error(`Processing failed: ${err.message}`));
     return 'EVENT_RECEIVED';

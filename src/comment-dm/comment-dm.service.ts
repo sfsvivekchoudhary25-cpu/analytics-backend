@@ -39,15 +39,28 @@ export class CommentDmService {
   // ---------- the automations themselves (any number of them; the dashboard shows a list, then an editor
   // per automation). A comment can only ever be claimed by one automation — see processAuto() below. ----------
 
-  private async getOwnOrThrow(id: string): Promise<CommentDmRule> {
-    const rule = await this.rules.findOne({ where: { id } });
+  private async resolveOwner(ownerUsername?: string): Promise<string | null> {
+    if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
+    const status: any = await this.connection.getStatus().catch(() => null);
+    return status?.connected && status?.username ? String(status.username).trim().toLowerCase() : null;
+  }
+
+  private async getOwnOrThrow(id: string, ownerUsername?: string): Promise<CommentDmRule> {
+    const own = await this.resolveOwner(ownerUsername);
+    const rule = await this.rules.findOne({
+      where: own ? [{ id, ownerUsername: own }, { id, ownerUsername: IsNull() }] : { id },
+    });
     if (!rule) throw new NotFoundException('Automation not found.');
     if (!rule.followGateText) rule.followGateText = DEFAULT_FOLLOW_GATE_TEXT;
     return rule;
   }
 
-  async list() {
-    const rules = await this.rules.find({ order: { createdAt: 'ASC' } });
+  async list(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const rules = await this.rules.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { createdAt: 'ASC' },
+    });
     if (!rules.length) return [];
     const counts = await this.logs
       .createQueryBuilder('l')
@@ -64,10 +77,12 @@ export class CommentDmService {
     });
   }
 
-  async create() {
-    const count = await this.rules.count();
+  async create(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const count = await this.rules.count({ where: own ? { ownerUsername: own } : {} });
     return this.rules.save(
       this.rules.create({
+        ownerUsername: own,
         name: count ? `Comment-to-DM Automation ${count + 1}` : 'Comment-to-DM Automation',
         enabled: false,
         keywords: '',
@@ -78,23 +93,23 @@ export class CommentDmService {
     );
   }
 
-  async getOne(id: string) {
-    return this.getOwnOrThrow(id);
+  async getOne(id: string, ownerUsername?: string) {
+    return this.getOwnOrThrow(id, ownerUsername);
   }
 
-  async remove(id: string) {
-    await this.getOwnOrThrow(id);
+  async remove(id: string, ownerUsername?: string) {
+    const rule = await this.getOwnOrThrow(id, ownerUsername);
     // Its comment_dm_log rows are left alone on purpose — they're history (past invites/DMs sent), not
     // config, and deleting the automation shouldn't erase what it already did.
-    await this.rules.delete({ id });
+    await this.rules.delete({ id: rule.id });
     return { ok: true, id };
   }
 
   // Per-automation activity log: returns recent log entries enriched with the original comment text.
-  async logsForRule(id: string, limit = 50) {
-    const rule = await this.rules.findOne({ where: { id } });
+  async logsForRule(id: string, limit = 50, ownerUsername?: string) {
+    const rule = await this.getOwnOrThrow(id, ownerUsername);
     const rows = await this.logs.find({
-      where: { ruleId: id },
+      where: { ruleId: rule.id },
       order: { createdAt: 'DESC' },
       take: limit,
     });
@@ -233,8 +248,11 @@ export class CommentDmService {
       mediaPermalink?: string | null;
       mediaThumb?: string | null;
     },
+    ownerUsername?: string,
   ) {
-    const rule = await this.getOwnOrThrow(id);
+    const rule = await this.getOwnOrThrow(id, ownerUsername);
+    const own = await this.resolveOwner(ownerUsername);
+    if (own && !rule.ownerUsername) rule.ownerUsername = own;
     if (body.name !== undefined) {
       const name = String(body.name).trim();
       if (!name) throw new BadRequestException('Give the automation a name.');
@@ -311,13 +329,18 @@ export class CommentDmService {
   }
 
   // Recent posts to choose from, for the "Check this post" step.
-  async recentPosts() {
+  async recentPosts(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     let mediaData: any[] = [];
     try {
-      const media = await this.graph.get('/me/media', { fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp', limit: '30' });
+      const media = await this.graph.get(
+        '/me/media',
+        { fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp', limit: '30' },
+        { account: own ?? undefined },
+      );
       mediaData = media?.data ?? [];
     } catch (err) {
-      this.logger.warn(`Failed to fetch media from Instagram for comment-dm: ${(err as Error).message}`);
+      this.logger.warn(`Failed to fetch media from Instagram for comment-dm (${own || 'default'}): ${(err as Error).message}`);
     }
     return mediaData.map((m: any) => ({
       mediaId: m.id as string,
@@ -389,13 +412,24 @@ export class CommentDmService {
   //     1. Check if user is ALREADY following via their IGSID.
   //     2. If already following: send real DM directly (never send the follow-gate message!).
   //     3. If not following: send followGateText with "Visit Profile" and "I'm following ✅" buttons.
-  async processAuto() {
-    const active = (await this.rules.find({ where: { enabled: true }, order: { createdAt: 'ASC' } })).filter((r) => r.enabledAt);
+  async processAuto(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const active = (
+      await this.rules.find({
+        where: own ? [{ enabled: true, ownerUsername: own }, { enabled: true, ownerUsername: IsNull() }] : { enabled: true },
+        order: { createdAt: 'ASC' },
+      })
+    ).filter((r) => r.enabledAt);
     if (!active.length) return;
 
     const earliestEnabledAt = active.reduce((min, r) => (r.enabledAt! < min ? r.enabledAt! : min), active[0].enabledAt!);
     const candidates = await this.comments.find({
-      where: { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt) },
+      where: own
+        ? [
+            { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt), ownerUsername: own },
+            { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt), ownerUsername: IsNull() },
+          ]
+        : { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt) },
       order: { commentedAt: 'ASC' },
       take: 25,
     });
@@ -787,7 +821,14 @@ export class CommentDmService {
 
   @Cron('*/5 * * * * *')
   async tick() {
-    await this.processAuto().catch((err) => this.logger.error(`Processing failed: ${(err as Error).message}`));
+    const accounts = await this.connection.listConnectedAccounts().catch(() => []);
+    if (accounts.length === 0) {
+      await this.processAuto().catch((err) => this.logger.error(`Processing failed: ${(err as Error).message}`));
+    } else {
+      for (const acc of accounts) {
+        await this.processAuto(acc.username).catch((err) => this.logger.error(`Processing failed for @${acc.username}: ${(err as Error).message}`));
+      }
+    }
     await this.processPendingFollowGates().catch((err) => this.logger.error(`Follow gate processing failed: ${(err as Error).message}`));
     await this.reconcile().catch((err) => this.logger.warn(`Reconcile failed: ${(err as Error).message}`));
   }
@@ -828,17 +869,24 @@ export class CommentDmService {
     };
   }
 
-  async overallStats(days: number) {
+  async overallStats(days: number, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     const cutoff = new Date(Date.now() - days * DAY);
-    const rows = await this.logs.find({ where: { createdAt: MoreThan(cutoff) }, order: { createdAt: 'ASC' } });
+    const rows = await this.logs.find({
+      where: own ? { ownerUsername: own, createdAt: MoreThan(cutoff) } : { createdAt: MoreThan(cutoff) },
+      order: { createdAt: 'ASC' },
+    });
     return this.summarize(rows, days);
   }
 
   // Full post detail bundle: post meta + comments (with AI/auto/manual tags) + active automations + timeline analytics.
-  async postDetail(mediaId: string, days = 30) {
+  async postDetail(mediaId: string, days = 30, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     // 1. All top-level comments on this post (newest first)
+    const commentWhere: any = { mediaId, parentId: IsNull() };
+    if (own) commentWhere.ownerUsername = own;
     const commentRows = await this.comments.find({
-      where: { mediaId, parentId: IsNull() },
+      where: commentWhere,
       order: { commentedAt: 'DESC' },
       take: 200,
     });
@@ -847,7 +895,10 @@ export class CommentDmService {
     const hasHashtagComment = commentRows.some((c) => /#[a-zA-Z0-9_\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+/i.test(c.text || ''));
 
     // 2. Comment-DM rules active for this post (either targeting it specifically, or targeting any post)
-    const dmRules = await this.rules.find({ where: { enabled: true }, order: { createdAt: 'ASC' } });
+    const dmRules = await this.rules.find({
+      where: own ? { ownerUsername: own, enabled: true } : { enabled: true },
+      order: { createdAt: 'ASC' },
+    });
     const relevantDmRules = dmRules.filter((r) => !r.mediaId || r.mediaId === mediaId);
 
     // 3. DM logs for comments on this post
@@ -862,8 +913,13 @@ export class CommentDmService {
     const dmLogByCommentId = new Map(dmLogs.map((l) => [l.commentId, l]));
 
     // 4. Auto-reply setting + rules
-    const autoSetting = await this.autoSettings.findOne({ where: { id: 1 } });
-    const autoReplyRules = await this.autoRules.find({ where: { enabled: true }, order: { sortOrder: 'ASC' } });
+    const autoSetting = own
+      ? await this.autoSettings.findOne({ where: { ownerUsername: own } })
+      : await this.autoSettings.findOne({ where: { id: 1 } });
+    const autoReplyRules = await this.autoRules.find({
+      where: own ? { ownerUsername: own, enabled: true } : { enabled: true },
+      order: { sortOrder: 'ASC' },
+    });
 
     // 5. Build comment activity with tags
     const comments = commentRows
@@ -1048,9 +1104,13 @@ export class CommentDmService {
     // 8. Fetch live media metadata & detailed insights from Instagram Graph API
     let mediaMeta: any = null;
     try {
-      mediaMeta = await this.graph.get(`/${mediaId}`, {
-        fields: 'id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count',
-      });
+      mediaMeta = await this.graph.get(
+        `/${mediaId}`,
+        {
+          fields: 'id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count',
+        },
+        { account: own ?? undefined },
+      );
     } catch {
       // offline or token issue
     }
@@ -1173,9 +1233,12 @@ export class CommentDmService {
     }
 
     // 9. All Comment-DM rules (including disabled) for this post — so user can enable/control from the detail page
-    const allDmRulesForPost = (await this.rules.find({ order: { createdAt: 'ASC' } })).filter(
-      (r) => !r.mediaId || r.mediaId === mediaId,
-    );
+    const allDmRulesForPost = (
+      await this.rules.find({
+        where: own ? [{ ownerUsername: own }, { ownerUsername: IsNull() }] : {},
+        order: { createdAt: 'ASC' },
+      })
+    ).filter((r) => !r.mediaId || r.mediaId === mediaId);
 
     return {
       mediaId,

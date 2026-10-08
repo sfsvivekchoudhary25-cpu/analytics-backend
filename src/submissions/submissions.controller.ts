@@ -18,6 +18,8 @@ import { timingSafeEqual } from 'crypto';
 import { AuthGuard } from '../auth/auth.guard';
 import { SubmissionsService, UploadedImage } from './submissions.service';
 
+import { CurrentAccount } from '../common/current-account.decorator';
+
 const upload = FileInterceptor('image', { limits: { fileSize: 8 * 1024 * 1024 } });
 
 // Admin panel: review queue + Publish button.
@@ -27,20 +29,25 @@ export class SubmissionsAdminController {
   constructor(private readonly service: SubmissionsService) {}
 
   @Get()
-  list() {
-    return this.service.list();
+  list(@CurrentAccount() account?: string) {
+    return this.service.list(account);
   }
 
   @Get('search-users')
-  searchUsers(@Query('q') query?: string) {
-    return this.service.searchUsers(query);
+  searchUsers(@Query('q') query?: string, @CurrentAccount() account?: string) {
+    return this.service.searchUsers(query, account);
   }
 
   // Manual entry from the dashboard (same as the website intake, for testing).
   @Post()
   @UseInterceptors(upload)
-  create(@UploadedFile() file: UploadedImage, @Body('username') username: string, @Body('caption') caption?: string) {
-    return this.service.create(file, username, caption);
+  create(
+    @UploadedFile() file: UploadedImage,
+    @Body('username') username: string,
+    @Body('caption') caption?: string,
+    @CurrentAccount() account?: string,
+  ) {
+    return this.service.create(file, username, caption, account);
   }
 
   @Patch(':id')
@@ -51,7 +58,6 @@ export class SubmissionsAdminController {
   @Post(':id/publish')
   publish(@Param('id') id: string, @Body('caption') caption?: string) {
     return this.service.publish(id, caption);
-    return this.service.publish(id);
   }
 
   @Delete(':id')

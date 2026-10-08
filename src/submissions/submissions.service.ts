@@ -4,7 +4,7 @@ import { randomBytes, randomUUID } from 'crypto';
 import { readFile, unlink, writeFile } from 'fs/promises';
 import { join } from 'path';
 import sharp from 'sharp';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { messagingEvents } from '../instagram-webhook/events';
 import { GraphClient } from '../instagram-connection/graph-client.service';
@@ -35,8 +35,15 @@ export class SubmissionsService {
 
   // ---------- intake ----------
 
-  async create(file: UploadedImage | undefined, rawUsername: string, caption?: string) {
+  private async resolveOwner(ownerUsername?: string): Promise<string | null> {
+    if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
+    const status: any = await this.connection.getStatus().catch(() => null);
+    return status?.connected && status?.username ? String(status.username).trim().toLowerCase() : null;
+  }
+
+  async create(file: UploadedImage | undefined, rawUsername: string, caption?: string, ownerUsername?: string) {
     if (!file) throw new BadRequestException('An image file is required (field "image").');
+    const own = await this.resolveOwner(ownerUsername);
     const igUsername = String(rawUsername ?? '').trim().replace(/^@/, '').toLowerCase();
     if (!USERNAME_RE.test(igUsername)) throw new BadRequestException('That does not look like an Instagram username.');
 
@@ -46,6 +53,7 @@ export class SubmissionsService {
 
     const saved = await this.repo.save(
       this.repo.create({
+        ownerUsername: own,
         igUsername,
         imageFile,
         caption: caption?.trim().slice(0, 1500) || null,
@@ -73,16 +81,42 @@ export class SubmissionsService {
 
   // ---------- admin ----------
 
-  async list() {
-    const rows = await this.repo.find({ order: { createdAt: 'DESC' }, take: 50 });
-    const { username } = (await this.connection.getStatus()) as { username?: string };
+  async list(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const rows = await this.repo.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { createdAt: 'DESC' },
+      take: 50,
+    });
+    const status = (await this.connection.getStatus(own ?? undefined)) as { username?: string };
+    const username = status?.username ?? own ?? undefined;
     return rows.map((s) => this.toView(s, username));
   }
 
-  async searchUsers(query?: string) {
+  async searchUsers(query?: string, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     const q = String(query ?? '').trim().replace(/^@/, '').toLowerCase();
     const pattern = `%${q}%`;
-    const sql = `
+    const sql = own
+      ? `
+      SELECT
+        LOWER(username) as username,
+        MAX(source) as source,
+        MAX(last_seen) as last_seen,
+        COUNT(*)::int as count
+      FROM (
+        SELECT username, 'Commenter' as source, commented_at as last_seen FROM comment WHERE username IS NOT NULL AND (owner_username = $2 OR owner_username IS NULL)
+        UNION ALL
+        SELECT ig_username as username, 'Customer Submitter' as source, created_at as last_seen FROM submission WHERE ig_username IS NOT NULL AND (owner_username = $2 OR owner_username IS NULL)
+        UNION ALL
+        SELECT username, 'DM Lead' as source, created_at as last_seen FROM comment_dm_log WHERE username IS NOT NULL AND (owner_username = $2 OR owner_username IS NULL)
+      ) sub
+      WHERE LOWER(username) LIKE $1
+      GROUP BY LOWER(username)
+      ORDER BY count DESC, last_seen DESC
+      LIMIT 10
+    `
+      : `
       SELECT
         LOWER(username) as username,
         MAX(source) as source,
@@ -100,7 +134,7 @@ export class SubmissionsService {
       ORDER BY count DESC, last_seen DESC
       LIMIT 10
     `;
-    const rows = await this.repo.manager.query(sql, [pattern]);
+    const rows = own ? await this.repo.manager.query(sql, [pattern, own]) : await this.repo.manager.query(sql, [pattern]);
     const known = rows.map((r: any) => ({
       username: r.username,
       displayName: r.username,

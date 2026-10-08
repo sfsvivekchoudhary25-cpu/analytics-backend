@@ -6,6 +6,10 @@ export class Conversation {
   @PrimaryColumn({ type: 'varchar' })
   igsid: string;
 
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
+
   @Column({ type: 'varchar', nullable: true })
   username: string | null;
 
@@ -31,6 +35,10 @@ export class Conversation {
 export class Message {
   @PrimaryGeneratedColumn('uuid')
   id: string;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   @Index()
   @Column({ type: 'varchar' })

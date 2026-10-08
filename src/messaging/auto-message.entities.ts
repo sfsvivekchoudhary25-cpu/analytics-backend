@@ -1,10 +1,14 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
 
-// Single row (id = 1): master switch and safety limits for automatic replies to direct messages.
+// Row per account: master switch and safety limits for automatic replies to direct messages.
 @Entity('message_auto_setting')
 export class MessageAutoSetting {
   @PrimaryColumn({ type: 'int' })
   id: number;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   @Column({ type: 'boolean', default: false })
   enabled: boolean;
@@ -39,6 +43,10 @@ export class MessageAutoRule {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
+
   // Comma-separated. Empty means "any message" (a catch-all, tried last).
   @Column({ type: 'text', default: '' })
   keywords: string;
@@ -63,6 +71,10 @@ export class MessageAutoRule {
 export class MessageAutoLog {
   @PrimaryGeneratedColumn('uuid')
   id: string;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   @Index({ unique: true })
   @Column({ name: 'message_id', type: 'varchar' })

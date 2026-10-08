@@ -10,6 +10,10 @@ export class Comment {
   id: string;
 
   @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
+
+  @Index()
   @Column({ name: 'media_id', type: 'varchar' })
   mediaId: string;
 
@@ -62,11 +66,15 @@ export class Comment {
   firstSeenAt: Date;
 }
 
-// Single row (id = 1): the master switch for comment automation.
+// Master switch per account for comment automation.
 @Entity('auto_reply_setting')
 export class AutoReplySetting {
   @PrimaryColumn({ type: 'int' })
   id: number;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   @Column({ type: 'boolean', default: false })
   enabled: boolean;
@@ -90,6 +98,10 @@ export class AutoReplySetting {
 export class AutoReplyRule {
   @PrimaryGeneratedColumn('uuid')
   id: string;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   // Comma-separated. Empty means "any comment" (a catch-all, tried last).
   @Column({ type: 'text', default: '' })

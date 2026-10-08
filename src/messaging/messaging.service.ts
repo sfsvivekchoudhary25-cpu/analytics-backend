@@ -1,6 +1,6 @@
 import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, Repository } from 'typeorm';
+import { Between, IsNull, Repository } from 'typeorm';
 import { GraphClient } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { eventDate, messagingEvents } from '../instagram-webhook/events';
@@ -68,25 +68,36 @@ export class MessagingService implements OnModuleInit {
   // separate timer to wait for. This class does not schedule its own sync.
   private syncing = false;
 
+  private async resolveOwner(ownerUsername?: string): Promise<string | null> {
+    if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
+    const status: any = await this.connection.getStatus().catch(() => null);
+    return status?.connected && status?.username ? String(status.username).trim().toLowerCase() : null;
+  }
+
   // Reads conversations from Instagram and stores what we don't have yet. Safe to run repeatedly.
-  async syncFromInstagram() {
+  async syncFromInstagram(ownerUsername?: string) {
     const zero = { conversations: 0, newMessages: 0 };
     if (this.syncing) return zero;
-    const status: any = await this.connection.getStatus();
+    const own = await this.resolveOwner(ownerUsername);
+    const status: any = await this.connection.getStatus(own ?? undefined);
     if (!status.connected) return zero;
     this.syncing = true;
     try {
-      const own = String(status.username).toLowerCase();
-      const list = await this.graph.get('/me/conversations', { platform: 'instagram', fields: 'id,updated_time,participants', limit: '50' });
+      const ownHandle = String(status.username).toLowerCase();
+      const list = await this.graph.get(
+        '/me/conversations',
+        { platform: 'instagram', fields: 'id,updated_time,participants', limit: '50' },
+        { account: ownHandle },
+      );
       let conversations = 0;
       let newMessages = 0;
       for (const conv of list.data ?? []) {
-        const other = (conv.participants?.data ?? []).find((p: any) => String(p.username ?? '').toLowerCase() !== own);
+        const other = (conv.participants?.data ?? []).find((p: any) => String(p.username ?? '').toLowerCase() !== ownHandle);
         if (!other?.id) continue;
         const existing = await this.conversations.findOne({ where: { igsid: String(other.id) } });
         if (existing && existing.lastMessageAt >= new Date(conv.updated_time)) continue; // nothing new here
 
-        const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' });
+        const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle });
         const msgs: any[] = [...(detail.messages?.data ?? [])].reverse(); // oldest first
         let added = 0;
         let addedInbound = 0;
@@ -96,7 +107,7 @@ export class MessagingService implements OnModuleInit {
 
         for (const m of msgs) {
           const at = new Date(m.created_time);
-          const outgoing = String(m.from?.username ?? '').toLowerCase() === own;
+          const outgoing = String(m.from?.username ?? '').toLowerCase() === ownHandle;
           const text = String(m.message ?? '');
           // The same message may already be stored via the webhook, possibly under a different id format.
           const dup =
@@ -108,6 +119,7 @@ export class MessagingService implements OnModuleInit {
           await this.messages.save(
             this.messages.create({
               igsid: String(other.id),
+              ownerUsername: ownHandle,
               direction: outgoing ? 'out' : 'in',
               text,
               // An outgoing message we did not send ourselves through this app was typed in the Instagram app.
@@ -129,18 +141,24 @@ export class MessagingService implements OnModuleInit {
 
         if (!existing || added) {
           let username = other.username ?? existing?.username ?? null;
+          // Never import a conversation with own self
+          if (username && username.toLowerCase() === ownHandle) continue;
+
           let profilePic = existing?.profilePic ?? null;
           if (!username || !profilePic) {
-            const p = await this.graph.get(`/${other.id}`, { fields: 'username,profile_pic' }).catch(() => null);
+            const p = await this.graph.get(`/${other.id}`, { fields: 'username,profile_pic' }, { account: ownHandle }).catch(() => null);
             if (p?.username) username = p.username;
             if (p?.profile_pic) profilePic = p.profile_pic;
           }
+          if (username && username.toLowerCase() === ownHandle) continue;
+
           if (!profilePic) {
             profilePic = generateLetterAvatar(username || String(other.id));
           }
           await this.conversations.save(
             this.conversations.create({
               igsid: String(other.id),
+              ownerUsername: ownHandle,
               username,
               profilePic,
               lastText,
@@ -154,7 +172,7 @@ export class MessagingService implements OnModuleInit {
           newMessages += added;
         }
       }
-      if (newMessages) this.logger.log(`Inbox sync: ${newMessages} new message(s) in ${conversations} conversation(s)`);
+      if (newMessages) this.logger.log(`Inbox sync (@${ownHandle}): ${newMessages} new message(s) in ${conversations} conversation(s)`);
       return { conversations, newMessages };
     } finally {
       this.syncing = false;
@@ -175,6 +193,9 @@ export class MessagingService implements OnModuleInit {
 
   // Store one messaging event (customer -> us, or an echo of something we sent from the app).
   async recordEvent(ownId: string, ev: any) {
+    const conn = await this.connection.getConnectionByIgUserId(ownId).catch(() => null);
+    const ownUsername = conn?.username?.toLowerCase() ?? null;
+
     // A customer edited a message we already stored.
     if (ev.message_edit?.mid) {
       const stored = await this.messages.findOne({ where: { mid: ev.message_edit.mid } });
@@ -184,9 +205,13 @@ export class MessagingService implements OnModuleInit {
       }
       const before = stored.text;
       stored.text = String(ev.message_edit.text ?? '');
+      if (ownUsername && !stored.ownerUsername) stored.ownerUsername = ownUsername;
       await this.messages.save(stored);
       // Refresh the list preview only if this was the conversation's latest message.
-      await this.conversations.update({ igsid: stored.igsid, lastText: before }, { lastText: stored.text });
+      await this.conversations.update(
+        ownUsername ? { igsid: stored.igsid, lastText: before, ownerUsername: ownUsername } : { igsid: stored.igsid, lastText: before },
+        { lastText: stored.text },
+      );
       this.logger.log(`Updated message to "${stored.text.slice(0, 60)}" (edit #${ev.message_edit.num_edit ?? '?'})`);
       return;
     }
@@ -201,6 +226,7 @@ export class MessagingService implements OnModuleInit {
           await this.messages.save(
             this.messages.create({
               igsid: customerId,
+              ownerUsername: ownUsername,
               direction: 'in',
               text,
               source: null,
@@ -210,7 +236,7 @@ export class MessagingService implements OnModuleInit {
               createdAt: at,
             }),
           );
-          await this.touchConversation(customerId, text, undefined, 'in', at);
+          await this.touchConversation(customerId, text, undefined, 'in', at, ownUsername ?? undefined);
         }
       }
       return; // reads, reactions, etc. are only logged, not stored
@@ -255,6 +281,7 @@ export class MessagingService implements OnModuleInit {
     await this.messages.save(
       this.messages.create({
         igsid: customerId,
+        ownerUsername: ownUsername,
         direction: echo ? 'out' : 'in',
         text,
         source: echo ? 'app' : null,
@@ -264,28 +291,33 @@ export class MessagingService implements OnModuleInit {
         createdAt: at,
       }),
     );
-    const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at);
+    const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined);
     this.logger.log(
       `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId} (unread: ${c.unread})`,
     );
   }
 
-  private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date) {
-    let c = await this.conversations.findOne({ where: { igsid } });
+  private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date, ownerUsername?: string) {
+    let c = await this.conversations.findOne({
+      where: ownerUsername ? { igsid, ownerUsername } : { igsid },
+    });
     if (!c) {
-      c = this.conversations.create({ igsid, username: null, profilePic: null, unread: 0, lastInboundAt: null });
-      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }).catch(() => null);
+      c = this.conversations.create({ igsid, ownerUsername: ownerUsername ?? null, username: null, profilePic: null, unread: 0, lastInboundAt: null });
+      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: ownerUsername }).catch(() => null);
       if (p?.username) c.username = p.username;
       if (p?.profile_pic) c.profilePic = p.profile_pic;
       if (!c.profilePic) {
         c.profilePic = generateLetterAvatar(c.username || igsid);
       }
-    } else if (!c.profilePic || !c.username) {
-      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }).catch(() => null);
-      if (p?.username) c.username = p.username;
-      if (p?.profile_pic) c.profilePic = p.profile_pic;
-      if (!c.profilePic) {
-        c.profilePic = generateLetterAvatar(c.username || igsid);
+    } else {
+      if (ownerUsername && !c.ownerUsername) c.ownerUsername = ownerUsername;
+      if (!c.profilePic || !c.username) {
+        const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: ownerUsername }).catch(() => null);
+        if (p?.username) c.username = p.username;
+        if (p?.profile_pic) c.profilePic = p.profile_pic;
+        if (!c.profilePic) {
+          c.profilePic = generateLetterAvatar(c.username || igsid);
+        }
       }
     }
     c.lastText = text || (attachmentType ? `[${attachmentType}]` : '');
@@ -299,23 +331,37 @@ export class MessagingService implements OnModuleInit {
 
   // ---------- admin ----------
 
-  async listConversations() {
-    const rows = await this.conversations.find({ order: { lastMessageAt: 'DESC' }, take: 100 });
+  async listConversations(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+
+    const qb = this.conversations.createQueryBuilder('c')
+      .orderBy('c.lastMessageAt', 'DESC')
+      .take(100);
+
+    if (own) {
+      // Exclude own handle from the conversation list
+      qb.andWhere('(LOWER(c.username) != :own OR c.username IS NULL)', { own });
+      // Only return conversations belonging to this connected account (or legacy rows)
+      qb.andWhere('(c.ownerUsername = :own OR c.ownerUsername IS NULL)', { own });
+    }
+
+    const rows = await qb.getMany();
     for (const c of rows) {
       if (!c.profilePic) {
-        this.fetchContactProfile(c).catch(() => {});
+        this.fetchContactProfile(c, own ?? undefined).catch(() => {});
       }
     }
     return rows.map((c) => this.view(c));
   }
 
-  async thread(igsid: string) {
+  async thread(igsid: string, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     const c = await this.getConversation(igsid);
     if (!c.profilePic) {
-      await this.fetchContactProfile(c).catch(() => {});
+      await this.fetchContactProfile(c, own ?? undefined).catch(() => {});
     }
     const recent = await this.messages.find({
-      where: { igsid },
+      where: own ? { igsid, ownerUsername: own } : { igsid },
       order: { createdAt: 'DESC' },
       take: 300,
     });
@@ -327,9 +373,9 @@ export class MessagingService implements OnModuleInit {
     return { conversation: this.view(c), messages };
   }
 
-  private async fetchContactProfile(c: Conversation) {
+  private async fetchContactProfile(c: Conversation, account?: string) {
     try {
-      const p = await this.graph.get(`/${c.igsid}`, { fields: 'username,profile_pic' });
+      const p = await this.graph.get(`/${c.igsid}`, { fields: 'username,profile_pic' }, { account });
       let changed = false;
       if (p?.username && p.username !== c.username) {
         c.username = p.username;
@@ -356,25 +402,33 @@ export class MessagingService implements OnModuleInit {
   }
 
   // Removes the conversation and its messages from this dashboard only; nothing is deleted on Instagram.
-  async deleteConversation(igsid: string) {
-    const c = await this.getConversation(igsid);
+  async deleteConversation(igsid: string, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const c = await this.getConversation(igsid, own ?? undefined);
+    if (own) {
+      const { affected } = await this.messages.delete({ igsid, ownerUsername: own });
+      await this.conversations.delete({ igsid, ownerUsername: own });
+      this.logger.log(`Deleted conversation (@${own}) with ${c.username ? '@' + c.username : igsid} (${affected ?? 0} messages)`);
+      return { ok: true, deletedMessages: affected ?? 0 };
+    }
     const { affected } = await this.messages.delete({ igsid });
     await this.conversations.delete({ igsid });
     this.logger.log(`Deleted conversation with ${c.username ? '@' + c.username : igsid} (${affected ?? 0} messages)`);
     return { ok: true, deletedMessages: affected ?? 0 };
   }
 
-  async reply(igsid: string, rawText: string) {
+  async reply(igsid: string, rawText: string, ownerUsername?: string) {
     const text = String(rawText ?? '').trim();
     if (!text) throw new BadRequestException('Message is empty.');
     if (text.length > 1000) throw new BadRequestException('Message is too long (1000 characters max).');
-    const c = await this.getConversation(igsid);
+    const own = await this.resolveOwner(ownerUsername);
+    const c = await this.getConversation(igsid, own ?? undefined);
     if (!this.canReply(c)) {
       this.logger.warn(`Reply to ${c.username ? '@' + c.username : igsid} blocked: outside Instagram's 24-hour window`);
       throw new BadRequestException('More than 24 hours have passed since this customer last messaged you, so Instagram will not deliver a reply.');
     }
     try {
-      return await this.send(igsid, text);
+      return await this.send(igsid, text, 'dashboard', undefined, undefined, own ?? undefined);
     } catch (err) {
       this.logger.warn(`Reply to ${c.username ? '@' + c.username : igsid} FAILED: ${(err as Error).message}`);
       // Surface Instagram's own reason instead of a bare 500.
@@ -389,8 +443,10 @@ export class MessagingService implements OnModuleInit {
     source: 'dashboard' | 'auto' | 'system' = 'dashboard',
     buttons?: MessageButton[],
     card?: { title?: string; subtitle?: string; imageUrl?: string; buttons?: MessageButton[] },
+    ownerUsername?: string,
   ) {
-    const igUserId = await this.connection.getIgUserId();
+    const own = await this.resolveOwner(ownerUsername);
+    const igUserId = await this.connection.getIgUserId(own ?? undefined);
     let res: any;
 
     const sanitizeUrl = (raw?: string | null): string => {
@@ -426,18 +482,22 @@ export class MessagingService implements OnModuleInit {
         if (card.imageUrl) element.image_url = card.imageUrl;
         if (formattedButtons && formattedButtons.length > 0) element.buttons = formattedButtons;
 
-        res = await this.graph.postJson(`/${igUserId}/messages`, {
-          recipient: { id: igsid },
-          message: {
-            attachment: {
-              type: 'template',
-              payload: {
-                template_type: 'generic',
-                elements: [element],
+        res = await this.graph.postJson(
+          `/${igUserId}/messages`,
+          {
+            recipient: { id: igsid },
+            message: {
+              attachment: {
+                type: 'template',
+                payload: {
+                  template_type: 'generic',
+                  elements: [element],
+                },
               },
             },
           },
-        });
+          { account: own ?? undefined },
+        );
         if (res?.message_id) sentFormat = 'generic_card';
       } catch (err) {
         this.logger.warn(`Messaging generic card template failed: ${(err as Error).message}`);
@@ -447,19 +507,23 @@ export class MessagingService implements OnModuleInit {
     // 2. Button template (text with up to 3 action buttons)
     if (!res?.message_id && formattedButtons && formattedButtons.length > 0) {
       try {
-        res = await this.graph.postJson(`/${igUserId}/messages`, {
-          recipient: { id: igsid },
-          message: {
-            attachment: {
-              type: 'template',
-              payload: {
-                template_type: 'button',
-                text: text.slice(0, 640),
-                buttons: formattedButtons,
+        res = await this.graph.postJson(
+          `/${igUserId}/messages`,
+          {
+            recipient: { id: igsid },
+            message: {
+              attachment: {
+                type: 'template',
+                payload: {
+                  template_type: 'button',
+                  text: text.slice(0, 640),
+                  buttons: formattedButtons,
+                },
               },
             },
           },
-        });
+          { account: own ?? undefined },
+        );
         if (res?.message_id) sentFormat = 'button_template';
       } catch (err) {
         this.logger.warn(`Messaging button template failed: ${(err as Error).message}`);
@@ -467,7 +531,9 @@ export class MessagingService implements OnModuleInit {
     }
 
     if (!res?.message_id) {
-      const conv = await this.conversations.findOne({ where: { igsid } });
+      const conv = await this.conversations.findOne({
+        where: own ? { igsid, ownerUsername: own } : { igsid },
+      });
       const isPast24h = conv?.lastInboundAt && (Date.now() - conv.lastInboundAt.getTime() > WINDOW_MS);
       const isWithin7Days = conv?.lastInboundAt && (Date.now() - conv.lastInboundAt.getTime() < HUMAN_AGENT_WINDOW_MS);
 
@@ -482,13 +548,13 @@ export class MessagingService implements OnModuleInit {
       }
 
       try {
-        res = await this.graph.postJson(`/${igUserId}/messages`, payload);
+        res = await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own ?? undefined });
       } catch (err) {
         // Fallback retry with HUMAN_AGENT tag if standard 24h send was rejected
         if (!payload.tag && source === 'dashboard' && isWithin7Days) {
           try {
             payload.tag = 'HUMAN_AGENT';
-            res = await this.graph.postJson(`/${igUserId}/messages`, payload);
+            res = await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own ?? undefined });
             this.logger.log(`[Messaging] Standard send failed; recovered via HUMAN_AGENT tag for ${igsid}`);
           } catch {
             throw err;
@@ -500,22 +566,34 @@ export class MessagingService implements OnModuleInit {
     }
     const now = new Date();
     // Instagram echoes our own DMs back through the webhook; if that already stored this mid, don't insert twice.
-    const alreadyStored = res.message_id && (await this.messages.exists({ where: { mid: res.message_id } }));
+    const alreadyStored = res?.message_id && (await this.messages.exists({ where: { mid: res.message_id } }));
     if (!alreadyStored) {
       await this.messages.save(
-        this.messages.create({ igsid, direction: 'out', text, source, attachmentType: null, attachmentUrl: null, mid: res.message_id ?? null, createdAt: now }),
+        this.messages.create({
+          igsid,
+          ownerUsername: own ?? null,
+          direction: 'out',
+          text,
+          source,
+          attachmentType: null,
+          attachmentUrl: null,
+          mid: res?.message_id ?? null,
+          createdAt: now,
+        }),
       );
     } else {
       // The webhook echo won the race and labelled it as typed in the app; set the true sender.
-      await this.messages.update({ mid: res.message_id }, { source });
+      await this.messages.update({ mid: res.message_id }, { source, ...(own ? { ownerUsername: own } : {}) });
     }
-    const c = await this.touchConversation(igsid, text, undefined, 'out', now);
+    const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined);
     this.logger.log(`[Messaging] DM sent (${sentFormat}) to ${c.username ? '@' + c.username : igsid}: "${text.length > 60 ? text.slice(0, 60) + '…' : text}"`);
     return { ok: true };
   }
 
-  private async getConversation(igsid: string) {
-    const c = await this.conversations.findOne({ where: { igsid } });
+  private async getConversation(igsid: string, ownerUsername?: string) {
+    const c = await this.conversations.findOne({
+      where: ownerUsername ? { igsid, ownerUsername } : { igsid },
+    });
     if (!c) throw new NotFoundException('Conversation not found.');
     return c;
   }

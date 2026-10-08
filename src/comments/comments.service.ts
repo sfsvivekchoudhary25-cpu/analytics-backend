@@ -52,16 +52,26 @@ export class CommentsService {
 
   // ---------- reading ----------
 
-  list(filter: 'all' | 'unreplied') {
+  private async resolveOwner(ownerUsername?: string): Promise<string | null> {
+    if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
+    const status: any = await this.connection.getStatus().catch(() => null);
+    return status?.connected && status?.username ? String(status.username).trim().toLowerCase() : null;
+  }
+
+  async list(filter: 'all' | 'unreplied', ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const whereBase: any = filter === 'unreplied' ? { parentId: IsNull(), repliedAt: IsNull(), isOwn: false } : { parentId: IsNull() };
+    const where = own ? { ...whereBase, ownerUsername: own } : whereBase;
     return this.comments.find({
-      where: filter === 'unreplied' ? { parentId: IsNull(), repliedAt: IsNull(), isOwn: false } : { parentId: IsNull() },
+      where,
       order: { commentedAt: 'DESC' },
       take: 100,
     });
   }
 
   // Posts that Instagram says have comments, with how many of them the API has actually shared with us.
-  async postsWithComments() {
+  async postsWithComments(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     let mediaData: any[] = [];
     try {
       const media = await this.graph.get('/me/media', {
@@ -72,13 +82,15 @@ export class CommentsService {
     } catch (err) {
       this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
     }
-    const rows: { mid: string; n: string }[] = await this.comments
+    const qb = this.comments
       .createQueryBuilder('c')
       .select('c.media_id', 'mid')
       .addSelect('COUNT(*)', 'n')
-      .where('c.parent_id IS NULL')
-      .groupBy('c.media_id')
-      .getRawMany();
+      .where('c.parent_id IS NULL');
+    if (own) {
+      qb.andWhere('(c.ownerUsername = :own OR c.ownerUsername IS NULL)', { own });
+    }
+    const rows: { mid: string; n: string }[] = await qb.groupBy('c.media_id').getRawMany();
     const visible = new Map(rows.map((r) => [r.mid, Number(r.n)]));
     return mediaData
       .filter((m: any) => m.comments_count > 0)
@@ -183,16 +195,53 @@ export class CommentsService {
 
   // ---------- automation settings ----------
 
-  private async getSettings() {
-    return (
-      (await this.settingsRepo.findOne({ where: { id: 1 } })) ??
-      (await this.settingsRepo.save(this.settingsRepo.create({ id: 1, enabled: false, enabledAt: null, maxPerHour: 30, aiEnabled: false, aiInstructions: '' })))
+  private async getSettings(ownerUsername?: string): Promise<AutoReplySetting> {
+    const own = await this.resolveOwner(ownerUsername);
+    let existing: AutoReplySetting | null = null;
+    if (own) {
+      existing = await this.settingsRepo
+        .createQueryBuilder('s')
+        .where('LOWER(s.ownerUsername) = :own', { own })
+        .getOne();
+    }
+    if (!existing && !own) {
+      existing = await this.settingsRepo.findOne({ where: { id: 1 } });
+    }
+
+    if (existing) {
+      if (own && !existing.ownerUsername) {
+        existing.ownerUsername = own;
+        await this.settingsRepo.save(existing);
+      }
+      return existing;
+    }
+
+    const maxRow = await this.settingsRepo
+      .createQueryBuilder('s')
+      .select('MAX(s.id)', 'max')
+      .getRawOne();
+    const nextId = (Number(maxRow?.max) || 0) + 1;
+
+    return this.settingsRepo.save(
+      this.settingsRepo.create({
+        id: nextId,
+        ownerUsername: own,
+        enabled: false,
+        enabledAt: null,
+        maxPerHour: 30,
+        aiEnabled: false,
+        aiInstructions: '',
+      }),
     );
   }
 
-  async getAutoReply() {
-    const s = await this.getSettings();
-    const rules = await this.rulesRepo.find({ order: { sortOrder: 'ASC', createdAt: 'ASC' } });
+  async getAutoReply(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const s = await this.getSettings(own ?? undefined);
+    const rules = await this.rulesRepo.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { sortOrder: 'ASC', createdAt: 'ASC' },
+    });
     return {
       enabled: s.enabled,
       enabledAt: s.enabledAt,
@@ -203,8 +252,10 @@ export class CommentsService {
     };
   }
 
-  async setAutoReply(body: { enabled?: boolean; maxPerHour?: number; aiEnabled?: boolean; aiInstructions?: string }) {
-    const s = await this.getSettings();
+  async setAutoReply(body: { enabled?: boolean; maxPerHour?: number; aiEnabled?: boolean; aiInstructions?: string }, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const s = await this.getSettings(own ?? undefined);
+    if (own && !s.ownerUsername) s.ownerUsername = own;
     const wasActive = s.enabled || s.aiEnabled;
     if (body.aiInstructions !== undefined) {
       if (String(body.aiInstructions).length > 3000) throw new BadRequestException('The business info is too long (3000 characters max).');
@@ -213,7 +264,7 @@ export class CommentsService {
     if (typeof body.aiEnabled === 'boolean' && body.aiEnabled !== s.aiEnabled) {
       if (body.aiEnabled && !this.ai.available) throw new BadRequestException('AI is not set up: add OPENROUTER_API_KEY to backend/.env and restart.');
       s.aiEnabled = body.aiEnabled;
-      this.logger.log(`AI replies for comments ${body.aiEnabled ? `ENABLED (model ${this.ai.model})` : 'DISABLED'}.`);
+      this.logger.log(`AI replies for comments (${own || 'default'}) ${body.aiEnabled ? `ENABLED (model ${this.ai.model})` : 'DISABLED'}.`);
     }
     if (typeof body.maxPerHour === 'number') {
       if (!Number.isInteger(body.maxPerHour) || body.maxPerHour < 1 || body.maxPerHour > 200) {
@@ -223,17 +274,17 @@ export class CommentsService {
     }
     if (typeof body.enabled === 'boolean' && body.enabled !== s.enabled) {
       s.enabled = body.enabled;
-      this.logger.log(`Keyword rules for comments ${body.enabled ? 'ENABLED' : 'DISABLED'}.`);
+      this.logger.log(`Keyword rules for comments (${own || 'default'}) ${body.enabled ? 'ENABLED' : 'DISABLED'}.`);
     }
     // Automation is "on" if either the rules or the AI is on. Only comments made after it turned on are answered.
     if (!wasActive && (s.enabled || s.aiEnabled)) {
       s.enabledAt = new Date();
-      this.logger.log(`AUTO-REPLY ACTIVE for comments. Only comments made after ${s.enabledAt.toLocaleTimeString()} will be answered (cap ${s.maxPerHour}/hour).`);
+      this.logger.log(`AUTO-REPLY ACTIVE for comments (${own || 'default'}). Only comments made after ${s.enabledAt.toLocaleTimeString()} will be answered (cap ${s.maxPerHour}/hour).`);
     } else if (wasActive && !s.enabled && !s.aiEnabled) {
-      this.logger.log('AUTO-REPLY OFF for comments.');
+      this.logger.log(`AUTO-REPLY OFF for comments (${own || 'default'}).`);
     }
     await this.settingsRepo.save(s);
-    return this.getAutoReply();
+    return this.getAutoReply(own ?? undefined);
   }
 
   private validateRule(keywords: unknown, replyText: unknown) {
@@ -245,16 +296,31 @@ export class CommentsService {
     return { keywords: kw, replyText: text };
   }
 
-  async addRule(body: { keywords?: string; replyText?: string }) {
+  async addRule(body: { keywords?: string; replyText?: string }, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     const v = this.validateRule(body.keywords, body.replyText);
-    const last = await this.rulesRepo.find({ order: { sortOrder: 'DESC' }, take: 1 });
-    const rule = await this.rulesRepo.save(this.rulesRepo.create({ ...v, enabled: true, sortOrder: (last[0]?.sortOrder ?? 0) + 1 }));
-    this.logger.log(`Auto-reply rule added: ${v.keywords ? `keywords [${v.keywords}]` : 'any comment'} -> "${preview(v.replyText, 60)}"`);
+    const last = await this.rulesRepo.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { sortOrder: 'DESC' },
+      take: 1,
+    });
+    const rule = await this.rulesRepo.save(
+      this.rulesRepo.create({
+        ...v,
+        ownerUsername: own,
+        enabled: true,
+        sortOrder: (last[0]?.sortOrder ?? 0) + 1,
+      }),
+    );
+    this.logger.log(`Auto-reply rule added (${own || 'default'}): ${v.keywords ? `keywords [${v.keywords}]` : 'any comment'} -> "${preview(v.replyText, 60)}"`);
     return rule;
   }
 
-  async updateRule(id: string, body: { keywords?: string; replyText?: string; enabled?: boolean }) {
-    const rule = await this.rulesRepo.findOne({ where: { id } });
+  async updateRule(id: string, body: { keywords?: string; replyText?: string; enabled?: boolean }, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const rule = await this.rulesRepo.findOne({
+      where: own ? { id, ownerUsername: own } : { id },
+    });
     if (!rule) throw new NotFoundException('Rule not found.');
     if (body.keywords !== undefined || body.replyText !== undefined) {
       const v = this.validateRule(body.keywords ?? rule.keywords, body.replyText ?? rule.replyText);
@@ -265,11 +331,14 @@ export class CommentsService {
     return this.rulesRepo.save(rule);
   }
 
-  async deleteRule(id: string) {
-    const rule = await this.rulesRepo.findOne({ where: { id } });
+  async deleteRule(id: string, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const rule = await this.rulesRepo.findOne({
+      where: own ? { id, ownerUsername: own } : { id },
+    });
     if (!rule) throw new NotFoundException('Rule not found.');
     await this.rulesRepo.remove(rule);
-    this.logger.log('Auto-reply rule deleted.');
+    this.logger.log(`Auto-reply rule deleted (${own || 'default'}).`);
     return { ok: true };
   }
 
@@ -278,12 +347,16 @@ export class CommentsService {
   // Comment webhooks: entry[].changes[{ field: 'comments', value: { id, text, from: { username }, media: { id }, parent_id? } }]
   async handleWebhook(payload: any) {
     let touched = false;
+    const touchedAccounts = new Set<string>();
     // Live-stream comments are logged by the webhook controller but not stored or auto-answered.
-    for (const { field, value: v } of commentEvents(payload)) {
+    for (const { ownId, field, value: v } of commentEvents(payload)) {
       const id = commentId(v);
       if (field !== 'comments' || !id) continue;
       try {
-        const media = v.media?.id ? await this.mediaInfo(String(v.media.id)) : { permalink: null, thumb: null };
+        const conn = await this.connection.getConnectionByIgUserId(ownId).catch(() => null);
+        const ownerUsername = conn?.username?.toLowerCase();
+        if (ownerUsername) touchedAccounts.add(ownerUsername);
+        const media = v.media?.id ? await this.mediaInfo(String(v.media.id), ownerUsername) : { permalink: null, thumb: null };
         await this.ingest({
           id,
           text: String(v.text ?? ''),
@@ -295,39 +368,48 @@ export class CommentsService {
           mediaPermalink: media.permalink,
           mediaThumb: media.thumb,
           parentId: v.parent_id ? String(v.parent_id) : null,
-        });
+        }, ownerUsername);
         touched = true;
       } catch (err) {
         this.logger.error(`Could not store comment event: ${(err as Error).message}`);
       }
     }
-    if (touched) await this.processAuto();
+    if (touched) {
+      if (touchedAccounts.size > 0) {
+        for (const acc of touchedAccounts) {
+          await this.processAuto(acc);
+        }
+      } else {
+        await this.processAuto();
+      }
+    }
   }
 
-  private async mediaInfo(mediaId: string) {
+  private async mediaInfo(mediaId: string, account?: string) {
     const hit = this.mediaCache.get(mediaId);
     if (hit) return hit;
-    const m = await this.graph.get(`/${mediaId}`, { fields: 'permalink,thumbnail_url,media_url,caption' }).catch(() => null);
+    const m = await this.graph.get(`/${mediaId}`, { fields: 'permalink,thumbnail_url,media_url,caption' }, { account }).catch(() => null);
     const info = { permalink: m?.permalink ?? null, thumb: m?.thumbnail_url ?? m?.media_url ?? null, caption: String(m?.caption ?? '') };
     if (m) this.mediaCache.set(mediaId, info);
     return info;
   }
 
   // Returns true when the comment was new.
-  private async ingest(inc: Incoming): Promise<boolean> {
+  private async ingest(inc: Incoming, ownerUsername?: string): Promise<boolean> {
     const existing = await this.comments.findOne({ where: { id: inc.id } });
+    const own = await this.resolveOwner(ownerUsername);
     if (existing) {
+      if (own && !existing.ownerUsername) {
+        existing.ownerUsername = own;
+      }
       if (!existing.username && inc.username) {
-        // Backfill names that were missed before, and work out whether it is our own comment.
-        const me = ((await this.connection.getStatus()) as { username?: string }).username?.toLowerCase();
         existing.username = inc.username;
-        existing.isOwn = !!me && inc.username.toLowerCase() === me;
+        existing.isOwn = !!own && inc.username.toLowerCase() === own;
       }
       existing.text = inc.text || existing.text;
       existing.likeCount = inc.likeCount;
       existing.hidden = inc.hidden;
       if (inc.ownReplyAt && !existing.repliedAt) {
-        // Someone (us, in the Instagram app) already answered it.
         existing.repliedAt = inc.ownReplyAt;
         existing.myReply = inc.ownReplyText ?? null;
         existing.replyKind = 'external';
@@ -340,9 +422,8 @@ export class CommentsService {
       return false;
     }
 
-    const own = ((await this.connection.getStatus()) as { username?: string }).username?.toLowerCase();
     const isOwn = !!own && inc.username.toLowerCase() === own;
-    const s = await this.getSettings();
+    const s = await this.getSettings(own ?? undefined);
     let autoState: Comment['autoState'] = 'new';
     let autoNote: string | null = null;
     if (isOwn) [autoState, autoNote] = ['skipped', 'our own comment'];
@@ -354,6 +435,7 @@ export class CommentsService {
     await this.comments.save(
       this.comments.create({
         id: inc.id,
+        ownerUsername: own,
         mediaId: inc.mediaId,
         mediaPermalink: inc.mediaPermalink,
         mediaThumb: inc.mediaThumb,
@@ -372,7 +454,7 @@ export class CommentsService {
       }),
     );
     this.logger.log(
-      `NEW COMMENT by @${inc.username || 'unknown'}${inc.parentId ? ' (reply in thread)' : ''} on ${inc.mediaPermalink ?? `post ${inc.mediaId}`}: "${preview(inc.text)}"${autoState === 'new' ? ' [queued for auto-reply]' : ''}`,
+      `NEW COMMENT by @${inc.username || 'unknown'} (${own || 'default'})${inc.parentId ? ' (reply in thread)' : ''} on ${inc.mediaPermalink ?? `post ${inc.mediaId}`}: "${preview(inc.text)}"${autoState === 'new' ? ' [queued for auto-reply]' : ''}`,
     );
     return true;
   }
@@ -382,12 +464,20 @@ export class CommentsService {
   // Webhooks for comments can be missed (e.g. a dead tunnel URL), so also look regularly as a safety net.
   @Cron('*/30 * * * * *')
   async scheduledSync() {
-    await this.sync().catch((err) => this.logger.warn(`Sync failed: ${(err as Error).message}`));
+    const accounts = await this.connection.listConnectedAccounts();
+    if (!accounts.length) {
+      await this.sync().catch((err) => this.logger.warn(`Sync failed: ${(err as Error).message}`));
+    } else {
+      for (const a of accounts) {
+        await this.sync(a.username).catch((err) => this.logger.warn(`Sync failed for @${a.username}: ${(err as Error).message}`));
+      }
+    }
   }
 
-  async sync() {
+  async sync(ownerUsername?: string) {
     if (this.syncing) return { newComments: 0, reported: 0, returned: 0 };
-    const status: any = await this.connection.getStatus();
+    const own = await this.resolveOwner(ownerUsername);
+    const status: any = await this.connection.getStatus(own ?? undefined);
     if (!status.connected) return { newComments: 0, reported: 0, returned: 0 };
     this.syncing = true;
     let newComments = 0;
@@ -397,7 +487,7 @@ export class CommentsService {
       const media = await this.graph.get('/me/media', {
         fields: 'id,permalink,thumbnail_url,media_url,caption,comments_count',
         limit: '30',
-      });
+      }, { account: own ?? undefined });
       for (const m of media.data ?? []) {
         if (!m.comments_count) continue;
         reported += m.comments_count;
@@ -409,7 +499,7 @@ export class CommentsService {
             // `username` is only returned for our own comments; everyone else's name is inside `from`.
             fields: 'id,text,username,from{id,username},timestamp,like_count,hidden,replies{id,username,from{id,username},text,timestamp}',
             limit: '50',
-          });
+          }, { account: own ?? undefined });
         } catch {
           continue; // already logged by the API client
         }
@@ -430,18 +520,18 @@ export class CommentsService {
             parentId: null,
             ownReplyText: mine?.text ?? null,
             ownReplyAt: mine?.timestamp ? new Date(mine.timestamp) : mine ? new Date() : null,
-          });
+          }, own ?? undefined);
           if (isNew) newComments += 1;
         }
       }
       if (reported > returned && Date.now() - this.lastHiddenWarning > 30 * 60 * 1000) {
         this.lastHiddenWarning = Date.now();
         this.logger.warn(
-          `Instagram reports ${reported} comment(s) on recent posts but only returned ${returned}. ` +
+          `Instagram reports ${reported} comment(s) on recent posts for @${status.username} but only returned ${returned}. ` +
             'While the Meta app is in Development mode, the API only returns comments from accounts that have a role on the app. Make the app Live to see all customers\' comments.',
         );
       }
-      if (newComments) this.logger.log(`Sync: ${newComments} new comment(s) found`);
+      if (newComments) this.logger.log(`Sync (${own || 'default'}): ${newComments} new comment(s) found`);
       await this.processAuto();
     } finally {
       this.syncing = false;
@@ -479,8 +569,8 @@ export class CommentsService {
   }
 
   // "Try it" in the dashboard: what would the AI say to this comment? Nothing is posted.
-  async aiTest(text: string) {
-    const s = await this.getSettings();
+  async aiTest(text: string, ownerUsername?: string) {
+    const s = await this.getSettings(ownerUsername);
     if (!this.ai.available) throw new BadRequestException('AI is not set up: add OPENROUTER_API_KEY to backend/.env and restart.');
     const t = String(text ?? '').trim();
     if (!t) throw new BadRequestException('Type a customer comment to test.');
@@ -494,17 +584,28 @@ export class CommentsService {
     }
   }
 
-  async processAuto() {
-    const s = await this.getSettings();
-    const pending = await this.comments.find({ where: { autoState: 'new', parentId: IsNull() }, order: { commentedAt: 'ASC' }, take: 20 });
+  async processAuto(ownerUsername?: string) {
+    const where: any = { autoState: 'new', parentId: IsNull() };
+    if (ownerUsername) {
+      where.ownerUsername = ownerUsername.toLowerCase();
+    }
+    const pending = await this.comments.find({ where, order: { commentedAt: 'ASC' }, take: 20 });
     if (!pending.length) return;
-    const rules = await this.rulesRepo.find({ order: { sortOrder: 'ASC', createdAt: 'ASC' } });
-    let sentLastHour = await this.comments.count({ where: { replyKind: 'auto', repliedAt: MoreThan(new Date(Date.now() - 3600_000)) } });
 
     for (const c of pending) {
       // Claim it so the webhook and the poller can never both answer the same comment.
       const claim = await this.comments.update({ id: c.id, autoState: 'new' }, { autoState: 'processing' });
       if (!claim.affected) continue;
+
+      const own = c.ownerUsername ? c.ownerUsername.toLowerCase() : null;
+      const s = await this.getSettings(own ?? undefined);
+      const rules = await this.rulesRepo.find({
+        where: own ? { ownerUsername: own } : {},
+        order: { sortOrder: 'ASC', createdAt: 'ASC' },
+      });
+      const sentWhere: any = { replyKind: 'auto', repliedAt: MoreThan(new Date(Date.now() - 3600_000)) };
+      if (own) sentWhere.ownerUsername = own;
+      let sentLastHour = await this.comments.count({ where: sentWhere });
 
       if (!(s.enabled || s.aiEnabled)) {
         await this.comments.update({ id: c.id }, { autoState: 'skipped', autoNote: 'auto-reply was turned off' });
@@ -512,7 +613,7 @@ export class CommentsService {
       }
       if (sentLastHour >= s.maxPerHour) {
         await this.comments.update({ id: c.id }, { autoState: 'new' }); // try again once the hour rolls over
-        this.logger.warn(`Auto-reply paused: hourly cap of ${s.maxPerHour} reached`);
+        this.logger.warn(`Auto-reply paused (${own || 'default'}): hourly cap of ${s.maxPerHour} reached`);
         return;
       }
 

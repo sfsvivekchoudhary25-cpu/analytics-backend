@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Post, Put, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
+import { CurrentAccount } from '../common/current-account.decorator';
 import { AutoMessageService } from './auto-message.service';
 
 @UseGuards(AuthGuard)
@@ -8,8 +9,8 @@ export class AutoMessageController {
   constructor(private readonly service: AutoMessageService) {}
 
   @Get()
-  get() {
-    return this.service.getAutoReply();
+  get(@CurrentAccount() account?: string) {
+    return this.service.getAutoReply(account);
   }
 
   @Put()
@@ -23,8 +24,9 @@ export class AutoMessageController {
       fallbackEnabled?: boolean;
       fallbackText?: string;
     },
+    @CurrentAccount() account?: string,
   ) {
-    return this.service.setAutoReply(body);
+    return this.service.setAutoReply(body, account);
   }
 
   // Dashboard "Try it": what would the AI say to this message? Nothing is sent.
@@ -35,22 +37,26 @@ export class AutoMessageController {
 
   // What automation did recently, including what it deliberately skipped and why.
   @Get('log')
-  log() {
-    return this.service.recent();
+  log(@CurrentAccount() account?: string) {
+    return this.service.recent(account);
   }
 
   @Post('rules')
-  addRule(@Body() body: { keywords?: string; replyText?: string }) {
-    return this.service.addRule(body);
+  addRule(@Body() body: { keywords?: string; replyText?: string }, @CurrentAccount() account?: string) {
+    return this.service.addRule(body, account);
   }
 
   @Put('rules/:ruleId')
-  updateRule(@Param('ruleId') ruleId: string, @Body() body: { keywords?: string; replyText?: string; enabled?: boolean }) {
-    return this.service.updateRule(ruleId, body);
+  updateRule(
+    @Param('ruleId') ruleId: string,
+    @Body() body: { keywords?: string; replyText?: string; enabled?: boolean },
+    @CurrentAccount() account?: string,
+  ) {
+    return this.service.updateRule(ruleId, body, account);
   }
 
   @Delete('rules/:ruleId')
-  deleteRule(@Param('ruleId') ruleId: string) {
-    return this.service.deleteRule(ruleId);
+  deleteRule(@Param('ruleId') ruleId: string, @CurrentAccount() account?: string) {
+    return this.service.deleteRule(ruleId, account);
   }
 }

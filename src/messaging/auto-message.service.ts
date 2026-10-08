@@ -1,7 +1,7 @@
 import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { LessThan, MoreThan, Repository } from 'typeorm';
+import { IsNull, LessThan, MoreThan, Repository } from 'typeorm';
 import { AiService } from '../ai/ai.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { MessageAutoLog, MessageAutoRule, MessageAutoSetting } from './auto-message.entities';
@@ -44,20 +44,47 @@ export class AutoMessageService {
 
   // ---------- settings & rules ----------
 
-  private async getSettings() {
-    const existing = await this.settingsRepo.findOne({ where: { id: 1 } });
+  private async resolveOwner(ownerUsername?: string): Promise<string | null> {
+    if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
+    const status: any = await this.connection.getStatus().catch(() => null);
+    return status?.connected && status?.username ? String(status.username).trim().toLowerCase() : null;
+  }
+
+  private async getSettings(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    let existing: MessageAutoSetting | null = null;
+    if (own) {
+      existing = await this.settingsRepo
+        .createQueryBuilder('s')
+        .where('LOWER(s.ownerUsername) = :own', { own })
+        .getOne();
+    }
+    if (!existing && !own) {
+      existing = await this.settingsRepo.findOne({ where: { id: 1 } });
+    }
+
     if (existing) {
-      // Backfills the friendly default for rows that existed before `fallbackText` did (the column itself
-      // defaults to '' — see the entity comment on why the real default text isn't a DB DEFAULT clause).
+      if (own && !existing.ownerUsername) {
+        existing.ownerUsername = own;
+        await this.settingsRepo.save(existing);
+      }
       if (!existing.fallbackText.trim()) {
         existing.fallbackText = DEFAULT_FALLBACK_TEXT;
         await this.settingsRepo.save(existing);
       }
       return existing;
     }
+
+    const maxRow = await this.settingsRepo
+      .createQueryBuilder('s')
+      .select('MAX(s.id)', 'max')
+      .getRawOne();
+    const nextId = (Number(maxRow?.max) || 0) + 1;
+
     return this.settingsRepo.save(
       this.settingsRepo.create({
-        id: 1,
+        id: nextId,
+        ownerUsername: own,
         enabled: false,
         enabledAt: null,
         maxPerHour: 30,
@@ -73,9 +100,13 @@ export class AutoMessageService {
     return process.env.AUTO_REPLY_DRY_RUN === '1';
   }
 
-  async getAutoReply() {
-    const s = await this.getSettings();
-    const rules = await this.rulesRepo.find({ order: { sortOrder: 'ASC', createdAt: 'ASC' } });
+  async getAutoReply(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const s = await this.getSettings(own ?? undefined);
+    const rules = await this.rulesRepo.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { sortOrder: 'ASC', createdAt: 'ASC' },
+    });
     return {
       enabled: s.enabled,
       enabledAt: s.enabledAt,
@@ -94,15 +125,20 @@ export class AutoMessageService {
     };
   }
 
-  async setAutoReply(body: {
-    enabled?: boolean;
-    maxPerHour?: number;
-    aiEnabled?: boolean;
-    aiInstructions?: string;
-    fallbackEnabled?: boolean;
-    fallbackText?: string;
-  }) {
-    const s = await this.getSettings();
+  async setAutoReply(
+    body: {
+      enabled?: boolean;
+      maxPerHour?: number;
+      aiEnabled?: boolean;
+      aiInstructions?: string;
+      fallbackEnabled?: boolean;
+      fallbackText?: string;
+    },
+    ownerUsername?: string,
+  ) {
+    const own = await this.resolveOwner(ownerUsername);
+    const s = await this.getSettings(own ?? undefined);
+    if (own && !s.ownerUsername) s.ownerUsername = own;
     const wasActive = s.enabled || s.aiEnabled;
 
     if (body.aiInstructions !== undefined) {
@@ -119,7 +155,7 @@ export class AutoMessageService {
     if (typeof body.aiEnabled === 'boolean' && body.aiEnabled !== s.aiEnabled) {
       if (body.aiEnabled && !this.ai.available) throw new BadRequestException('AI is not set up: add OPENROUTER_API_KEY to backend/.env and restart.');
       s.aiEnabled = body.aiEnabled;
-      this.logger.log(`AI replies for messages ${body.aiEnabled ? `ENABLED (model ${this.ai.model})` : 'DISABLED'}.`);
+      this.logger.log(`AI replies for messages (${own || 'default'}) ${body.aiEnabled ? `ENABLED (model ${this.ai.model})` : 'DISABLED'}.`);
     }
     const num = (v: unknown, min: number, max: number, label: string) => {
       if (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > max) {
@@ -130,20 +166,20 @@ export class AutoMessageService {
     if (body.maxPerHour !== undefined) s.maxPerHour = num(body.maxPerHour, 1, 200, 'Max replies per hour');
     if (typeof body.enabled === 'boolean' && body.enabled !== s.enabled) {
       s.enabled = body.enabled;
-      this.logger.log(`Keyword rules for messages ${body.enabled ? 'ENABLED' : 'DISABLED'}.`);
+      this.logger.log(`Keyword rules for messages (${own || 'default'}) ${body.enabled ? 'ENABLED' : 'DISABLED'}.`);
     }
 
     // Automation is "on" if either the rules or the AI is on. Only messages after it turned on are answered.
     if (!wasActive && (s.enabled || s.aiEnabled)) {
       s.enabledAt = new Date();
       this.logger.log(
-        `AUTO-REPLY ACTIVE for messages${this.dryRun ? ' (DRY RUN: nothing will actually be sent)' : ''}. Only messages received after ${s.enabledAt.toLocaleTimeString()} will be answered.`,
+        `AUTO-REPLY ACTIVE for messages (${own || 'default'})${this.dryRun ? ' (DRY RUN: nothing will actually be sent)' : ''}. Only messages received after ${s.enabledAt.toLocaleTimeString()} will be answered.`,
       );
     } else if (wasActive && !s.enabled && !s.aiEnabled) {
-      this.logger.log('AUTO-REPLY OFF for messages.');
+      this.logger.log(`AUTO-REPLY OFF for messages (${own || 'default'}).`);
     }
     await this.settingsRepo.save(s);
-    return this.getAutoReply();
+    return this.getAutoReply(own ?? undefined);
   }
 
   private validateRule(keywords: unknown, replyText: unknown) {
@@ -155,16 +191,31 @@ export class AutoMessageService {
     return { keywords: kw, replyText: text };
   }
 
-  async addRule(body: { keywords?: string; replyText?: string }) {
+  async addRule(body: { keywords?: string; replyText?: string }, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
     const v = this.validateRule(body.keywords, body.replyText);
-    const last = await this.rulesRepo.find({ order: { sortOrder: 'DESC' }, take: 1 });
-    const rule = await this.rulesRepo.save(this.rulesRepo.create({ ...v, enabled: true, sortOrder: (last[0]?.sortOrder ?? 0) + 1 }));
-    this.logger.log(`Message rule added: ${v.keywords ? `keywords [${v.keywords}]` : 'any message'} -> "${preview(v.replyText)}"`);
+    const last = await this.rulesRepo.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { sortOrder: 'DESC' },
+      take: 1,
+    });
+    const rule = await this.rulesRepo.save(
+      this.rulesRepo.create({
+        ...v,
+        ownerUsername: own,
+        enabled: true,
+        sortOrder: (last[0]?.sortOrder ?? 0) + 1,
+      }),
+    );
+    this.logger.log(`Message rule added (${own || 'default'}): ${v.keywords ? `keywords [${v.keywords}]` : 'any message'} -> "${preview(v.replyText)}"`);
     return rule;
   }
 
-  async updateRule(id: string, body: { keywords?: string; replyText?: string; enabled?: boolean }) {
-    const rule = await this.rulesRepo.findOne({ where: { id } });
+  async updateRule(id: string, body: { keywords?: string; replyText?: string; enabled?: boolean }, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const rule = await this.rulesRepo.findOne({
+      where: own ? { id, ownerUsername: own } : { id },
+    });
     if (!rule) throw new NotFoundException('Rule not found.');
     if (body.keywords !== undefined || body.replyText !== undefined) {
       const v = this.validateRule(body.keywords ?? rule.keywords, body.replyText ?? rule.replyText);
@@ -175,16 +226,24 @@ export class AutoMessageService {
     return this.rulesRepo.save(rule);
   }
 
-  async deleteRule(id: string) {
-    const rule = await this.rulesRepo.findOne({ where: { id } });
+  async deleteRule(id: string, ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    const rule = await this.rulesRepo.findOne({
+      where: own ? { id, ownerUsername: own } : { id },
+    });
     if (!rule) throw new NotFoundException('Rule not found.');
     await this.rulesRepo.remove(rule);
-    this.logger.log('Message rule deleted.');
+    this.logger.log(`Message rule deleted (${own || 'default'}).`);
     return { ok: true };
   }
 
-  recent() {
-    return this.logs.find({ order: { createdAt: 'DESC' }, take: 30 });
+  async recent(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    return this.logs.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { createdAt: 'DESC' },
+      take: 30,
+    });
   }
 
   // ---------- doing the work ----------
@@ -194,11 +253,19 @@ export class AutoMessageService {
   // message caught by the fallback sync isn't left waiting for a separately-timed tick on top of that.
   @Cron('*/10 * * * * *')
   async tick() {
-    await this.messaging.syncFromInstagram().catch((err) => this.logger.warn(`Fallback sync failed: ${(err as Error).message}`));
-    await this.processPending().catch((err) => this.logger.error(`Processing failed: ${(err as Error).message}`));
+    const accounts = await this.connection.listConnectedAccounts().catch(() => []);
+    if (accounts.length === 0) {
+      await this.messaging.syncFromInstagram().catch((err) => this.logger.warn(`Fallback sync failed: ${(err as Error).message}`));
+      await this.processPending().catch((err) => this.logger.error(`Processing failed: ${(err as Error).message}`));
+    } else {
+      for (const acc of accounts) {
+        await this.messaging.syncFromInstagram(acc.username).catch((err) => this.logger.warn(`Fallback sync failed for @${acc.username}: ${(err as Error).message}`));
+        await this.processPending(acc.username).catch((err) => this.logger.error(`Processing failed for @${acc.username}: ${(err as Error).message}`));
+      }
+    }
   }
 
-  async processPending() {
+  async processPending(ownerUsername?: string) {
     if (this.running) return;
     this.running = true;
     try {
@@ -208,28 +275,36 @@ export class AutoMessageService {
         { outcome: 'processing', createdAt: LessThan(new Date(Date.now() - 10 * 60_000)) },
         { outcome: 'failed', note: 'interrupted while processing; not retried, to avoid replying twice' },
       );
-      const s = await this.getSettings();
+      const s = await this.getSettings(ownerUsername);
       if (!(s.enabled || s.aiEnabled) || !s.enabledAt) return;
-      const status: any = await this.connection.getStatus();
-      const own = status.connected ? String(status.username).toLowerCase() : null;
+      const own = await this.resolveOwner(ownerUsername);
 
-      const pending = await this.messages
+      const qb = this.messages
         .createQueryBuilder('m')
         .where("m.direction = 'in'")
         .andWhere('m.createdAt >= :since', { since: s.enabledAt })
-        .andWhere('NOT EXISTS (SELECT 1 FROM message_auto_log l WHERE l.message_id = CAST(m.id AS text))')
+        .andWhere('NOT EXISTS (SELECT 1 FROM message_auto_log l WHERE l.message_id = CAST(m.id AS text))');
+
+      if (own) {
+        qb.andWhere('(m.ownerUsername = :own OR m.ownerUsername IS NULL)', { own });
+      }
+
+      const pending = await qb
         .orderBy('m.createdAt', 'ASC')
         .limit(20)
         .getMany();
       if (!pending.length) return;
-      const rules = await this.rulesRepo.find({ order: { sortOrder: 'ASC', createdAt: 'ASC' } });
+      const rules = await this.rulesRepo.find({
+        where: own ? { ownerUsername: own } : {},
+        order: { sortOrder: 'ASC', createdAt: 'ASC' },
+      });
 
       const deadline = Date.now() + 90_000; // the AI can be slow; whatever is left is picked up on the next tick
       for (const m of pending) {
         if (Date.now() > deadline) break;
         // Claim the message first: the unique id means only one worker can ever answer it.
         try {
-          await this.logs.insert({ messageId: m.id, igsid: m.igsid, outcome: 'processing' });
+          await this.logs.insert({ messageId: m.id, igsid: m.igsid, ownerUsername: own, outcome: 'processing' });
         } catch {
           continue;
         }
@@ -322,7 +397,7 @@ export class AutoMessageService {
     const keywordRule = rulesOn ? this.matchKeywordRule(rules, text) : null;
     const catchAll = rulesOn ? rules.find((r) => r.enabled && !r.keywords.trim()) ?? null : null;
 
-    const viaRule = (rule: MessageAutoRule, label: string): Promise<Decision> => this.deliver(m, fill(rule.replyText), label, 'rule');
+    const viaRule = (rule: MessageAutoRule, label: string): Promise<Decision> => this.deliver(m, fill(rule.replyText), label, 'rule', own);
 
     if (keywordRule) return viaRule(keywordRule, `rule: ${keywordRule.keywords}`);
 
@@ -345,11 +420,11 @@ export class AutoMessageService {
           // just acknowledges the message so a person can follow up without the customer wondering if it
           // was even seen.
           if (s.fallbackEnabled && s.fallbackText.trim()) {
-            return this.deliver(m, fill(s.fallbackText), `AI stayed silent (${d.reason}); sent the holding reply instead`, 'fallback');
+            return this.deliver(m, fill(s.fallbackText), `AI stayed silent (${d.reason}); sent the holding reply instead`, 'fallback', own);
           }
           return skip(`AI stayed silent: ${d.reason}`);
         }
-        return this.deliver(m, d.text, `AI (${d.model}, ${(d.ms / 1000).toFixed(1)}s)`, 'ai');
+        return this.deliver(m, d.text, `AI (${d.model}, ${(d.ms / 1000).toFixed(1)}s)`, 'ai', own);
       } catch (err) {
         // The AI service is down or rate limited. Nothing has been sent, so this is safe to retry.
         if (catchAll) {
@@ -369,9 +444,9 @@ export class AutoMessageService {
   }
 
   // Sends the reply, or in dry-run mode only reports it. Throws on failure; the caller records it and does not retry.
-  private async deliver(m: Message, reply: string, note: string, kind: 'rule' | 'ai' | 'fallback'): Promise<Decision> {
+  private async deliver(m: Message, reply: string, note: string, kind: 'rule' | 'ai' | 'fallback', own?: string | null): Promise<Decision> {
     if (this.dryRun) return { outcome: 'sent', note: `dry run, not actually sent (${note})`, replyText: reply, kind };
-    await this.messaging.send(m.igsid, reply, 'auto');
+    await this.messaging.send(m.igsid, reply, 'auto', undefined, undefined, own ?? m.ownerUsername ?? undefined);
     return { outcome: 'sent', note, replyText: reply, kind };
   }
 

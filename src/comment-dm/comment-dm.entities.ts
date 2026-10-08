@@ -14,6 +14,10 @@ export class CommentDmRule {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
+
   @Column({ type: 'varchar', default: 'Comment-to-DM Automation' })
   name: string;
 
@@ -84,6 +88,10 @@ export class CommentDmRule {
 export class CommentDmLog {
   @PrimaryGeneratedColumn('uuid')
   id: string;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   @Index()
   @Column({ name: 'rule_id', type: 'uuid' })

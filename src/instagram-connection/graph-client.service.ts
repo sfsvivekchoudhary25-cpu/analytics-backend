@@ -11,23 +11,23 @@ export class GraphClient {
 
   constructor(private readonly connection: InstagramConnectionService) {}
 
-  async get(path: string, params: Record<string, string> = {}, options?: { silent?: boolean }) {
-    const qs = new URLSearchParams({ ...params, access_token: await this.connection.getValidAccessToken() });
+  async get(path: string, params: Record<string, string> = {}, options?: { silent?: boolean; account?: string }) {
+    const qs = new URLSearchParams({ ...params, access_token: await this.connection.getValidAccessToken(options?.account) });
     return this.parse(await fetch(`${GRAPH}${path}?${qs}`), `GET ${path}`, options?.silent);
   }
 
-  async post(path: string, params: Record<string, string> = {}) {
-    const body = new URLSearchParams({ ...params, access_token: await this.connection.getValidAccessToken() });
+  async post(path: string, params: Record<string, string> = {}, options?: { account?: string }) {
+    const body = new URLSearchParams({ ...params, access_token: await this.connection.getValidAccessToken(options?.account) });
     return this.parse(await fetch(`${GRAPH}${path}`, { method: 'POST', body }), `POST ${path}`);
   }
 
-  async postJson(path: string, payload: unknown) {
+  async postJson(path: string, payload: unknown, options?: { account?: string }) {
     return this.parse(
       await fetch(`${GRAPH}${path}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${await this.connection.getValidAccessToken()}`,
+          Authorization: `Bearer ${await this.connection.getValidAccessToken(options?.account)}`,
         },
         body: JSON.stringify(payload),
       }),
@@ -35,8 +35,8 @@ export class GraphClient {
     );
   }
 
-  async delete(path: string, params: Record<string, string> = {}) {
-    const qs = new URLSearchParams({ ...params, access_token: await this.connection.getValidAccessToken() });
+  async delete(path: string, params: Record<string, string> = {}, options?: { account?: string }) {
+    const qs = new URLSearchParams({ ...params, access_token: await this.connection.getValidAccessToken(options?.account) });
     return this.parse(await fetch(`${GRAPH}${path}?${qs}`, { method: 'DELETE' }), `DELETE ${path}`);
   }
 

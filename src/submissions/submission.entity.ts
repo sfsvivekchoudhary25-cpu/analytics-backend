@@ -1,4 +1,4 @@
-import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
 export type SubmissionStatus = 'pending' | 'publishing' | 'published' | 'failed';
 export type DmStatus = 'waiting' | 'sent' | 'failed';
@@ -8,6 +8,10 @@ export type DmStatus = 'waiting' | 'sent' | 'failed';
 export class Submission {
   @PrimaryGeneratedColumn('uuid')
   id: string;
+
+  @Index()
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
 
   @Column({ name: 'ig_username', type: 'varchar' })
   igUsername: string;

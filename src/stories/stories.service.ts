@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import { writeFile } from 'fs/promises';
 import { join } from 'path';
 import sharp from 'sharp';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import { GraphClient } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { CloudinaryService } from '../cloudinary/cloudinary.service';
@@ -22,14 +22,26 @@ export class StoriesService {
     private readonly cloudinary: CloudinaryService,
   ) {}
 
-  list() {
-    return this.repo.find({ order: { createdAt: 'DESC' }, take: 30 });
+  private async resolveOwner(ownerUsername?: string): Promise<string | null> {
+    if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
+    const status: any = await this.connection.getStatus().catch(() => null);
+    return status?.connected && status?.username ? String(status.username).trim().toLowerCase() : null;
+  }
+
+  async list(ownerUsername?: string) {
+    const own = await this.resolveOwner(ownerUsername);
+    return this.repo.find({
+      where: own ? { ownerUsername: own } : {},
+      order: { createdAt: 'DESC' },
+      take: 30,
+    });
   }
 
   // Uploads and publishes immediately (images take seconds, videos up to ~2 minutes).
-  async publish(file: StoryUpload | undefined) {
+  async publish(file: StoryUpload | undefined, ownerUsername?: string) {
     if (!file) throw new BadRequestException('Choose an image or video (field "media").');
 
+    const own = await this.resolveOwner(ownerUsername);
     let kind: Story['kind'];
     let name: string;
     if (file.mimetype.startsWith('image/')) {
@@ -65,16 +77,24 @@ export class StoriesService {
       throw new BadRequestException('PUBLIC_BASE_URL must be a public https URL or Cloudinary must be configured so Instagram can fetch the file.');
     }
 
-    const story = await this.repo.save(this.repo.create({ kind, file: name, status: 'publishing' }));
+    const story = await this.repo.save(this.repo.create({ kind, file: name, status: 'publishing', ownerUsername: own }));
     try {
-      const igUserId = await this.connection.getIgUserId();
-      const container = await this.graph.post(`/${igUserId}/media`, {
-        media_type: 'STORIES',
-        ...(kind === 'image' ? { image_url: mediaUrl } : { video_url: mediaUrl }),
-      });
+      const igUserId = await this.connection.getIgUserId(own ?? undefined);
+      const container = await this.graph.post(
+        `/${igUserId}/media`,
+        {
+          media_type: 'STORIES',
+          ...(kind === 'image' ? { image_url: mediaUrl } : { video_url: mediaUrl }),
+        },
+        { account: own ?? undefined },
+      );
       if (kind === 'video') await this.graph.waitForContainer(container.id, 60, 2000);
       else await this.graph.waitForContainer(container.id);
-      const published = await this.graph.post(`/${igUserId}/media_publish`, { creation_id: container.id });
+      const published = await this.graph.post(
+        `/${igUserId}/media_publish`,
+        { creation_id: container.id },
+        { account: own ?? undefined },
+      );
       story.mediaId = published.id;
       story.status = 'published';
     } catch (err) {
