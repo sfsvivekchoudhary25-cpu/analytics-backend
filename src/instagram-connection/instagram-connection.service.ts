@@ -405,12 +405,13 @@ export class InstagramConnectionService implements OnModuleInit {
   async getConnectionRow(account?: string): Promise<InstagramConnection | null> {
     if (account) {
       const clean = account.trim().replace(/^@/, '').toLowerCase();
-      return this.repo
+      const conn = await this.repo
         .createQueryBuilder('c')
         .where('LOWER(c.username) = :u OR LOWER(c.username) = :atU', { u: clean, atU: `@${clean}` })
         .getOne();
+      if (conn) return conn;
     }
-    return null;
+    return this.repo.findOne({ order: { updatedAt: 'DESC' } });
   }
 
   private async getConnectionOrThrow(account?: string): Promise<InstagramConnection> {

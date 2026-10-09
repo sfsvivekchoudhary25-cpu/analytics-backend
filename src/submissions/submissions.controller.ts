@@ -56,8 +56,12 @@ export class SubmissionsAdminController {
   }
 
   @Post(':id/publish')
-  publish(@Param('id') id: string, @Body('caption') caption?: string) {
-    return this.service.publish(id, caption);
+  publish(
+    @Param('id') id: string,
+    @Body('caption') caption?: string,
+    @CurrentAccount() account?: string,
+  ) {
+    return this.service.publish(id, caption, account);
   }
 
   @Delete(':id')

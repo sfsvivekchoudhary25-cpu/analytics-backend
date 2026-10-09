@@ -41,9 +41,9 @@ export class GraphClient {
   }
 
   // Poll a media container until Instagram has finished processing it (videos take a while).
-  async waitForContainer(id: string, tries = 10, delayMs = 1500) {
+  async waitForContainer(id: string, tries = 10, delayMs = 1500, options?: { account?: string }) {
     for (let i = 0; i < tries; i++) {
-      const { status_code } = await this.get(`/${id}`, { fields: 'status_code' });
+      const { status_code } = await this.get(`/${id}`, { fields: 'status_code' }, options);
       if (status_code === 'FINISHED') return;
       if (status_code === 'ERROR' || status_code === 'EXPIRED') {
         throw new Error('Instagram could not process the media.');
