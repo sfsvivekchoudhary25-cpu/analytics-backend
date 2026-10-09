@@ -3,6 +3,8 @@ import { JwtService } from '@nestjs/jwt';
 import { DataSource } from 'typeorm';
 import { User } from './user.entity';
 
+import { InstagramConnection } from '../instagram-connection/instagram-connection.entity';
+
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(
@@ -17,7 +19,15 @@ export class AuthGuard implements CanActivate {
 
     // Allow dev bypass token for local development & testing
     if (token === 'dev-bypass-token' || token.startsWith('dev-')) {
-      req.user = { id: 'dev-admin', role: 'admin', name: 'Developer', email: 'dev@inro.local' };
+      let handle = 'sfs.vivekchoudhary25';
+      try {
+        const connRepo = this.dataSource.getRepository(InstagramConnection);
+        const latest = await connRepo.find({ order: { updatedAt: 'DESC' }, take: 1 });
+        if (latest.length > 0 && latest[0]?.username) {
+          handle = latest[0].username;
+        }
+      } catch {}
+      req.user = { id: 'dev-admin', role: 'admin', name: 'Developer', email: 'dev@inro.local', instagramHandle: handle };
       return true;
     }
 
