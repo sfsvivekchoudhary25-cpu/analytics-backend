@@ -118,7 +118,7 @@ export class InstagramConnectionService implements OnModuleInit {
     if (!profileUrl || !username) {
       try {
         const FB_API = 'https://graph.facebook.com/v21.0';
-        const fbConn = (await this.repo.manager.getRepository('FacebookPageConnection').findOne({ where: {} })) as any;
+        const [fbConn] = (await this.repo.manager.getRepository('FacebookPageConnection').find({ take: 1 })) as any;
         if (fbConn?.pageAccessToken && connection.igUserId) {
           const fbRes = await fetch(`${FB_API}/${connection.igUserId}?fields=id,username,name,profile_picture_url&access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
           const fbData = await fbRes.json();
@@ -282,8 +282,8 @@ export class InstagramConnectionService implements OnModuleInit {
     // Try checking Meta permissions if a Facebook Page connection exists
     try {
       const FB_API = 'https://graph.facebook.com/v21.0';
-      const fbConn = (await this.repo.manager.getRepository('FacebookPageConnection').findOne({ where: {} })) as any;
-      if (fbConn?.pageAccessToken) {
+        const [fbConn] = (await this.repo.manager.getRepository('FacebookPageConnection').find({ take: 1 })) as any;
+        if (fbConn?.pageAccessToken) {
         const permsRes = await fetch(`${FB_API}/me/permissions?access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
         const permsBody = await permsRes.json();
         if (permsRes.ok && Array.isArray(permsBody.data)) {
@@ -411,7 +411,8 @@ export class InstagramConnectionService implements OnModuleInit {
         .getOne();
       if (conn) return conn;
     }
-    return this.repo.findOne({ order: { updatedAt: 'DESC' } });
+    const [connection] = await this.repo.find({ order: { updatedAt: 'DESC' }, take: 1 });
+    return connection ?? null;
   }
 
   private async getConnectionOrThrow(account?: string): Promise<InstagramConnection> {

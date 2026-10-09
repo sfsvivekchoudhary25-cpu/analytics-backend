@@ -68,7 +68,7 @@ export class FacebookPageService {
   private async syncPermissionsToInstagramConnection(granted: string[]) {
     try {
       const igRepo = this.repo.manager.getRepository('InstagramConnection');
-      const igConn = (await igRepo.findOne({ where: {} })) as any;
+      const [igConn] = (await igRepo.find({ take: 1 })) as any;
       if (igConn) {
         const existing = (igConn.permissions ? igConn.permissions.split(',') : []).map((s: string) => s.trim());
         const combined = Array.from(new Set([...existing, ...granted])).filter(Boolean);
