@@ -48,8 +48,24 @@ export class SubmissionsService {
     if (!USERNAME_RE.test(igUsername)) throw new BadRequestException('That does not look like an Instagram username.');
 
     const jpeg = await this.toFeedJpeg(file.buffer);
-    const imageFile = `${randomUUID()}.jpg`;
-    await writeFile(join(UPLOAD_DIR, imageFile), jpeg);
+    const localFileName = `${randomUUID()}.jpg`;
+    await writeFile(join(UPLOAD_DIR, localFileName), jpeg);
+
+    // Upload to Cloudinary immediately so the asset is persistent across server restarts/redeploys
+    let imageFile = localFileName;
+    try {
+      const cdnResult = await this.cloudinary.uploadBuffer(jpeg, {
+        folder: 'inro_submissions',
+        resourceType: 'image',
+        publicId: `sub_${Date.now()}_${randomUUID().slice(0, 8)}`,
+      });
+      if (cdnResult?.secure_url) {
+        imageFile = cdnResult.secure_url;
+        this.logger.log(`Photo uploaded to Cloudinary CDN on intake: ${imageFile}`);
+      }
+    } catch (cErr: any) {
+      this.logger.warn(`Cloudinary intake upload skipped/failed (${cErr?.message}); using local file.`);
+    }
 
     const saved = await this.repo.save(
       this.repo.create({
@@ -272,23 +288,28 @@ export class SubmissionsService {
     await this.repo.save(s);
 
     try {
-      const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '');
-      let imageUrl = base ? `${base}/media/${s.imageFile}` : '';
+      let imageUrl = s.imageFile.startsWith('http') ? s.imageFile : '';
+      if (!imageUrl) {
+        const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '');
+        imageUrl = base ? `${base}/media/${s.imageFile}` : '';
 
-      // Prefer Cloudinary CDN (instant public HTTPS URL accessible to Meta Graph API)
-      try {
-        const fileBuf = await readFile(join(UPLOAD_DIR, s.imageFile));
-        const cdnResult = await this.cloudinary.uploadBuffer(fileBuf, {
-          folder: 'inro_submissions',
-          resourceType: 'image',
-          publicId: s.id,
-        });
-        if (cdnResult?.secure_url) {
-          imageUrl = cdnResult.secure_url;
-          this.logger.log(`Photo uploaded to Cloudinary CDN: ${imageUrl}`);
+        // Prefer Cloudinary CDN (instant public HTTPS URL accessible to Meta Graph API)
+        try {
+          const fileBuf = await readFile(join(UPLOAD_DIR, s.imageFile));
+          const cdnResult = await this.cloudinary.uploadBuffer(fileBuf, {
+            folder: 'inro_submissions',
+            resourceType: 'image',
+            publicId: s.id,
+          });
+          if (cdnResult?.secure_url) {
+            imageUrl = cdnResult.secure_url;
+            s.imageFile = cdnResult.secure_url;
+            await this.repo.save(s);
+            this.logger.log(`Photo uploaded to Cloudinary CDN: ${imageUrl}`);
+          }
+        } catch (cErr: any) {
+          this.logger.warn(`Cloudinary upload failed/skipped (${cErr?.message}); checking fallback URL.`);
         }
-      } catch (cErr: any) {
-        this.logger.warn(`Cloudinary upload failed/skipped (${cErr?.message}); checking fallback URL.`);
       }
 
       if (!imageUrl || !imageUrl.startsWith('https://')) {
