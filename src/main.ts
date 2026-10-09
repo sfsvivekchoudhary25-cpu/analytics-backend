@@ -38,7 +38,12 @@ async function bootstrap() {
     process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000',
     ...(process.env.PUBLIC_SITE_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean),
   ];
-  app.enableCors({ origin: origins });
+  app.enableCors({
+    origin: origins.length > 0 ? origins : true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-instagram-account', 'x-requested-with'],
+    credentials: true,
+  });
 
   const port = Number(process.env.PORT ?? 4000);
 
