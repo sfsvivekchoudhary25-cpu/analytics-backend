@@ -254,10 +254,14 @@ export class SubmissionsService {
     await this.repo.save(s);
     return this.toView(s);
   }
-  async publish(id: string, customCaption?: string) {
+  async publish(id: string, customCaption?: string, adminAccount?: string) {
     const s = await this.getOrThrow(id);
     if (s.status === 'publishing' || s.status === 'published') {
       throw new BadRequestException(`This submission is already ${s.status}.`);
+    }
+    const targetAccount = s.ownerUsername || adminAccount || undefined;
+    if (!s.ownerUsername && targetAccount) {
+      s.ownerUsername = targetAccount;
     }
     if (customCaption !== undefined && customCaption.trim()) {
       s.caption = customCaption.trim();
@@ -294,7 +298,7 @@ export class SubmissionsService {
 
       let creationId: string;
       try {
-        creationId = await this.createContainer(imageUrl, caption, s.igUsername);
+        creationId = await this.createContainer(imageUrl, caption, s.igUsername, targetAccount);
       } catch (err) {
         // Tagging on the photo failed (private account or restricted tag settings).
         // Ensure their @username is guaranteed to be in the caption so they are tagged in text:
@@ -302,16 +306,19 @@ export class SubmissionsService {
           caption = `${caption ? `${caption}\n\n` : ''}Photo credit: @${s.igUsername}`;
         }
         this.logger.warn(`Photo tag failed for @${s.igUsername} (${(err as Error).message}); tagged in caption instead.`);
-        creationId = await this.createContainer(imageUrl, caption);
+        creationId = await this.createContainer(imageUrl, caption, undefined, targetAccount);
         s.note = `Tagged in caption: @${s.igUsername} (photo tag skipped due to user's Instagram privacy settings).`;
       }
-      await this.graph.waitForContainer(creationId);
+      await this.graph.waitForContainer(creationId, 10, 1500, { account: targetAccount });
 
-      const published = await this.graph.post(`/${await this.connection.getIgUserId()}/media_publish`, {
-        creation_id: creationId,
-      });
+      const igUserId = await this.connection.getIgUserId(targetAccount);
+      const published = await this.graph.post(
+        `/${igUserId}/media_publish`,
+        { creation_id: creationId },
+        { account: targetAccount },
+      );
       s.mediaId = published.id;
-      const meta = await this.graph.get(`/${published.id}`, { fields: 'permalink' }).catch(() => null);
+      const meta = await this.graph.get(`/${published.id}`, { fields: 'permalink' }, { account: targetAccount }).catch(() => null);
       s.permalink = meta?.permalink ?? null;
       s.status = 'published';
       s.publishedAt = new Date();
@@ -337,10 +344,11 @@ export class SubmissionsService {
     return [s.caption, thanks].filter(Boolean).join('\n\n');
   }
 
-  private async createContainer(imageUrl: string, caption: string, tagUsername?: string): Promise<string> {
+  private async createContainer(imageUrl: string, caption: string, tagUsername?: string, account?: string): Promise<string> {
     const params: Record<string, string> = { image_url: imageUrl, caption };
     if (tagUsername) params.user_tags = JSON.stringify([{ username: tagUsername, x: 0.5, y: 0.5 }]);
-    const res = await this.graph.post(`/${await this.connection.getIgUserId()}/media`, params);
+    const igUserId = await this.connection.getIgUserId(account);
+    const res = await this.graph.post(`/${igUserId}/media`, params, { account });
     return res.id;
   }
 
