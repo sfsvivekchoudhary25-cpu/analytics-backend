@@ -183,7 +183,7 @@ export class AiService {
             Authorization: `Bearer ${key}`,
             'Content-Type': 'application/json',
             'HTTP-Referer': process.env.PUBLIC_BASE_URL ?? 'http://localhost',
-            'X-Title': 'Instagram Hub',
+            'X-Title': 'InstaVeyra',
           },
           // With fallbacks configured, OpenRouter tries the models in order until one answers.
           body: JSON.stringify({
