@@ -83,7 +83,7 @@ export class InstagramInsightsController {
       try {
         const igUserId = await this.connection.getIgUserId(account);
         const fbRepo = (this.connection as any).repo.manager.getRepository('FacebookPageConnection');
-        const fbConn = await fbRepo.findOne({ where: {} });
+        const [fbConn] = await fbRepo.find({ take: 1 });
         if (fbConn?.pageAccessToken && igUserId) {
           const fbRes = await fetch(`https://graph.facebook.com/v21.0/${igUserId}?fields=id,username,name,biography,website,followers_count,follows_count,media_count,profile_picture_url&access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
           const fbData = await fbRes.json();
