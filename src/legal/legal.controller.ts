@@ -55,7 +55,7 @@ export class LegalController {
     return page(
       'Privacy Policy',
       `
-<p>At <strong>${n}</strong>, accessible via our web application and services, one of our main priorities is the privacy and security of our visitors and creators. This Privacy Policy outlines the types of data that are collected, processed, and safeguarded when integrating with Meta Login and Graph APIs.</p>
+<p>At <strong>${n}</strong>, accessible from <a href="https://fabroniee.store">https://fabroniee.store</a> and <a href="https://analytics-delta-sage.vercel.app">https://analytics-delta-sage.vercel.app</a>, one of our main priorities is the privacy and security of our visitors and creators. This Privacy Policy outlines the types of data that are collected, processed, and safeguarded when integrating with Meta Login and Graph APIs.</p>
 
 <h2>1. Information We Collect via Meta APIs</h2>
 <p>When you connect your Facebook Page and Instagram Professional Account to our service using Meta Login, we request and process only the necessary permissions required to provide automated engagement features:</p>
@@ -104,7 +104,7 @@ export class LegalController {
     return page(
       'User Data Deletion Instructions',
       `
-<p>In accordance with Meta Platform Terms and global privacy regulations (GDPR, CCPA), <strong>${n}</strong> provides transparent, immediate mechanisms for users to request and execute the total deletion of their personal information and Meta integration data.</p>
+<p>In accordance with Meta Platform Terms and global privacy regulations (GDPR, CCPA), <strong>${n}</strong>, accessible from <a href="https://fabroniee.store">https://fabroniee.store</a> and <a href="https://analytics-delta-sage.vercel.app">https://analytics-delta-sage.vercel.app</a>, provides transparent, immediate mechanisms for users to request and execute the total deletion of their personal information and Meta integration data.</p>
 
 <h2>How to Delete Your Data from Our Platform</h2>
 <p>You can remove your account and all associated data through any of the following methods:</p>
@@ -153,7 +153,7 @@ export class LegalController {
     return page(
       'Terms of Service',
       `
-<p>Welcome to <strong>${n}</strong>. By accessing or using our platform, connecting your Facebook Page or Instagram Business Account, or creating automated messaging workflows, you agree to comply with and be bound by these Terms of Service.</p>
+<p>Welcome to <strong>${n}</strong>. By accessing or using our platform, accessible from <a href="https://fabroniee.store">https://fabroniee.store</a> and <a href="https://analytics-delta-sage.vercel.app">https://analytics-delta-sage.vercel.app</a>, connecting your Facebook Page or Instagram Business Account, or creating automated messaging workflows, you agree to comply with and be bound by these Terms of Service.</p>
 
 <h2>1. Authorized Use &amp; Platform Compliance</h2>
 <p>Our service provides creator tools and Comment-to-DM automation software. You agree to use the service in full compliance with:</p>
