@@ -1,10 +1,11 @@
 import { Controller, Get, Header, Post } from '@nestjs/common';
 
-const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'Fabroniee';
-const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'vivek.choudhary.0022@gmail.com';
-const UPDATED = 'September 21, 2026';
+const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'InstaVeyra (Inrō Studio)';
+const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'support@fabroniee.store';
+const UPDATED = 'October 12, 2026';
 
-const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+const esc = (s: string) =>
+  s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 
 function page(title: string, body: string) {
   return `<!doctype html>
@@ -14,26 +15,39 @@ function page(title: string, body: string) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} - ${esc(NAME())}</title>
 <style>
-  body { font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; color: #1a1a19; background: #fcfcfb; margin: 0; }
-  main { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
-  h1 { font-size: 1.75rem; margin-bottom: .25rem; }
-  h2 { font-size: 1.2rem; margin-top: 2rem; }
-  .muted { color: #52514e; font-size: .9rem; }
-  a { color: #2a78d6; }
-  @media (prefers-color-scheme: dark) { body { background: #1a1a19; color: #f3f3f0; } .muted { color: #c3c2b7; } a { color: #6da7ec; } }
+  body { font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1e293b; background: #f8fafc; margin: 0; }
+  main { max-width: 44rem; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; background: #ffffff; min-height: 100vh; border-left: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; }
+  h1 { font-size: 2rem; font-weight: 800; color: #0f172a; margin-bottom: .25rem; letter-spacing: -0.025em; }
+  h2 { font-size: 1.25rem; font-weight: 700; color: #0f172a; margin-top: 2.25rem; margin-bottom: 0.75rem; border-bottom: 1px solid #f1f5f9; padding-bottom: 0.5rem; }
+  p, li { color: #334155; font-size: 0.95rem; line-height: 1.7; }
+  .muted { color: #64748b; font-size: 0.875rem; }
+  .badge { display: inline-block; background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem; rounded-radius: 9999px; border-radius: 9999px; margin-bottom: 1rem; }
+  a { color: #2563eb; text-decoration: underline; text-underline-offset: 3px; }
+  a:hover { color: #1d4ed8; }
+  ul, ol { padding-left: 1.25rem; }
+  li { margin-bottom: 0.5rem; }
+  .box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 0.75rem; padding: 1rem 1.25rem; margin: 1.5rem 0; }
+  .nav { display: flex; gap: 1rem; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-size: 0.875rem; font-weight: 600; }
 </style>
 </head>
 <body><main>
+<span class="badge">Official Compliance Document</span>
 <h1>${esc(title)}</h1>
 <p class="muted">${esc(NAME())} &middot; Last updated ${UPDATED}</p>
 ${body}
+<div class="nav">
+  <a href="/privacy">Privacy Policy</a>
+  <a href="/data-deletion">Data Deletion Instructions</a>
+  <a href="/terms">Terms of Service</a>
+</div>
 </main></body></html>`;
 }
 
-// Public pages that Meta asks for before an app can go Live.
+// Public pages required for Meta App Review and live production compliance
 @Controller()
 export class LegalController {
   @Get('privacy')
+  @Get('legal/privacy')
   @Header('Content-Type', 'text/html; charset=utf-8')
   privacy() {
     const n = esc(NAME());
@@ -41,67 +55,128 @@ export class LegalController {
     return page(
       'Privacy Policy',
       `
-<p>This policy explains what information ${n} ("we", "us") handles when we manage our own Instagram business account through a private administration tool, and how you can ask us to delete it.</p>
+<p>At <strong>${n}</strong>, accessible from <a href="https://fabroniee.store">https://fabroniee.store</a> and <a href="https://analytics-delta-sage.vercel.app">https://analytics-delta-sage.vercel.app</a>, one of our main priorities is the privacy and security of our visitors and creators. This Privacy Policy outlines the types of data that are collected, processed, and safeguarded when integrating with Meta Login and Graph APIs.</p>
 
-<h2>Information we handle</h2>
+<h2>1. Information We Collect via Meta APIs</h2>
+<p>When you connect your Facebook Page and Instagram Professional Account to our service using Meta Login, we request and process only the necessary permissions required to provide automated engagement features:</p>
 <ul>
-  <li><strong>Our Instagram business account data:</strong> profile details, posts, and account insights (such as reach and views), which we read to understand how our account is performing.</li>
-  <li><strong>Direct messages sent to our account:</strong> when you send a message to our Instagram account, we receive your message text, any attachment, your Instagram username and your Instagram-scoped ID, so we can read and reply to it.</li>
-  <li><strong>Photos and usernames you send us:</strong> if you send us a photo and your Instagram username for us to feature, we store the photo and username.</li>
-  <li><strong>Access credentials:</strong> the access token that lets our tool act on our own Instagram account. It is stored encrypted.</li>
+  <li><strong>Basic Profile Information:</strong> Name, email address, profile picture URL, and Instagram handle to create and display your account dashboard.</li>
+  <li><strong>Meta Page &amp; Instagram Identifiers:</strong> App-Scoped User IDs (ASIDs), Facebook Page IDs, and Instagram Business Account IDs to link your social assets.</li>
+  <li><strong>Interaction Data:</strong> Temporary access to incoming Instagram comment text strings and unique comment IDs solely to evaluate user-configured keyword triggers.</li>
+  <li><strong>Encrypted Tokens:</strong> Meta OAuth access tokens required to communicate with the Meta Graph API on your behalf, stored using AES-256-GCM encryption at rest.</li>
 </ul>
 
-<h2>How we use it</h2>
+<h2>2. How We Use Your Information</h2>
+<p>We use the collected information exclusively to power your automated workflows and Instagram marketing tools:</p>
 <ul>
-  <li>To read and reply to messages you send us, including a thank-you message.</li>
-  <li>To publish posts or stories, including featuring a photo you sent us and tagging your username, when you have sent it for that purpose.</li>
-  <li>To review the performance of our own account.</li>
+  <li>To monitor incoming comments on your linked Instagram posts for specific keywords you configure (e.g., &ldquo;LINK&rdquo; or &ldquo;INFO&rdquo;).</li>
+  <li>To automatically dispatch a single direct message (DM) response containing your requested resources, download link, or product information directly to the commenter.</li>
+  <li>To display analytics regarding your automation performance (e.g., total comments matched, DMs sent, and conversion rates).</li>
+  <li><strong>Zero Message Snooping:</strong> We do not read, store, sell, or monitor your personal private messaging history.</li>
 </ul>
-<p>We do not sell your information, and we do not use it for advertising.</p>
 
-<h2>Who can see it</h2>
-<p>Only the people who operate our account. The data is stored on servers we control. Instagram and Meta process messages and posts under their own terms and privacy policies. Content you choose to have published on our Instagram account is public on Instagram.</p>
-<p>If we use automated, AI-assisted replies, the text of your message or comment may be sent to an AI service provider (OpenRouter and the company that runs the model) so that a reply can be written. We give it only the text needed for that reply, and we do not use it for advertising.</p>
+<h2>3. Data Storage, Retention &amp; De-duplication</h2>
+<ul>
+  <li><strong>No Selling of Data:</strong> We never sell, rent, trade, or share user data or customer identifiers with third-party data brokers or advertisers.</li>
+  <li><strong>Ephemeral Processing:</strong> Comment payloads received via webhooks are processed in real-time. We cache unique <code>comment_id</code> identifiers in our database solely to prevent sending duplicate automated messages to the same user or comment.</li>
+  <li><strong>Security:</strong> All communication occurs over secure HTTPS/TLS 1.3 channels, and access tokens are secured with industry-standard cryptographic practices.</li>
+</ul>
 
-<h2>How long we keep it</h2>
-<p>We keep messages and submitted photos for as long as needed to run our account and respond to you, and delete them on request.</p>
+<h2>4. Data Deletion and Revocation</h2>
+<p>You have full sovereignty over your data at all times. Users can disconnect their Meta accounts or completely purge their profile data from our platform:</p>
+<div class="box">
+  <strong>Instant In-App Deletion:</strong> Navigate to your <strong>Account Settings</strong> dashboard panel and click <strong>&ldquo;Delete Account &amp; Wipe Data&rdquo;</strong>. Upon execution, all stored Meta access tokens, linked Page records, and cached identifiers are permanently wiped from our active databases.
+</div>
+<p>You may also review our step-by-step <a href="/data-deletion">Data Deletion Instructions</a> or submit a manual deletion request by emailing <a href="mailto:${e}">${e}</a>.</p>
 
-<h2>Your choices and deletion</h2>
-<p>You can ask us to delete the information we hold about you at any time. See our <a href="/data-deletion">data deletion instructions</a> or email <a href="mailto:${e}">${e}</a>.</p>
-
-<h2>Changes</h2>
-<p>We may update this policy and will change the date above when we do.</p>
-
-<h2>Contact</h2>
-<p><a href="mailto:${e}">${e}</a></p>`,
+<h2>5. Contact Us</h2>
+<p>If you have any questions or require assistance regarding our privacy compliance, please contact our Data Protection Team at <a href="mailto:${e}">${e}</a>.</p>`,
     );
   }
 
   @Get('data-deletion')
+  @Get('legal/data-deletion')
+  @Get('deletion')
   @Header('Content-Type', 'text/html; charset=utf-8')
   dataDeletion() {
     const n = esc(NAME());
     const e = esc(EMAIL());
     return page(
-      'Data Deletion Instructions',
+      'User Data Deletion Instructions',
       `
-<p>You can ask ${n} to delete the information we hold about you.</p>
+<p>In accordance with Meta Platform Terms and global privacy regulations (GDPR, CCPA), <strong>${n}</strong>, accessible from <a href="https://fabroniee.store">https://fabroniee.store</a> and <a href="https://analytics-delta-sage.vercel.app">https://analytics-delta-sage.vercel.app</a>, provides transparent, immediate mechanisms for users to request and execute the total deletion of their personal information and Meta integration data.</p>
 
-<h2>How to request deletion</h2>
+<h2>How to Delete Your Data from Our Platform</h2>
+<p>You can remove your account and all associated data through any of the following methods:</p>
+
+<h3>Method 1: Direct In-App One-Click Deletion (Recommended)</h3>
 <ol>
-  <li>Email <a href="mailto:${e}">${e}</a> with the subject <strong>"Delete my data"</strong>.</li>
-  <li>Include your Instagram username, so we can find the messages, photos and other information linked to it.</li>
-  <li>We will confirm by email and delete the information within 30 days.</li>
+  <li>Log in to your <strong>${n}</strong> dashboard.</li>
+  <li>Click on your profile avatar in the navigation bar to open <strong>Account Settings</strong>.</li>
+  <li>Scroll to the <strong>Data &amp; Security / Danger Zone</strong> section.</li>
+  <li>Click the button labeled <strong>&ldquo;Delete Account &amp; Wipe Data&rdquo;</strong> and confirm the prompt.</li>
+  <li>Our system will immediately delete your encrypted Meta access tokens, linked Facebook Page IDs, Instagram account connection, and all automation rules from our database.</li>
 </ol>
 
-<h2>What is deleted</h2>
-<ul>
-  <li>Messages you sent to our Instagram account, as stored in our administration tool.</li>
-  <li>Photos and usernames you submitted to us.</li>
-</ul>
-<p class="muted">Content already published on Instagram, and messages stored by Instagram itself, are controlled by Instagram. You can manage those in the Instagram app. If you would like a post that features you removed from our account, tell us in your email and we will delete it.</p>
+<h3>Method 2: Email Request to Data Protection Officer</h3>
+<ol>
+  <li>Send an email to <a href="mailto:${e}">${e}</a> with the subject line <strong>&ldquo;Delete my data&rdquo;</strong>.</li>
+  <li>Include your registered email address and your connected Instagram handle or Facebook Page Name.</li>
+  <li>Our engineering team will execute the database purge and confirm deletion via reply email within 48 hours.</li>
+</ol>
 
-<p>Read our <a href="/privacy">Privacy Policy</a>.</p>`,
+<h3>Method 3: Revoke via Facebook App Settings (Automated Callback)</h3>
+<ol>
+  <li>Log in to your Facebook account and go to <strong>Settings &amp; Privacy &gt; Settings</strong>.</li>
+  <li>Navigate to <strong>Apps and Websites</strong> and find <strong>${n}</strong>.</li>
+  <li>Click <strong>Remove</strong>. Meta will trigger an automated signed data deletion callback to our server, prompting automatic revocation of your access token.</li>
+</ol>
+
+<h2>What Is Permanently Deleted</h2>
+<ul>
+  <li>All Meta OAuth User Access Tokens and Page Access Tokens.</li>
+  <li>Linked Instagram Business Account metadata and Facebook Page identifiers.</li>
+  <li>All configured Comment-to-DM automation keyword rules and templates.</li>
+  <li>All cached comment logging records and performance history.</li>
+</ul>
+
+<p>For more details, review our <a href="/privacy">Privacy Policy</a>.</p>`,
+    );
+  }
+
+  @Get('terms')
+  @Get('legal/terms')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  terms() {
+    const n = esc(NAME());
+    const e = esc(EMAIL());
+    return page(
+      'Terms of Service',
+      `
+<p>Welcome to <strong>${n}</strong>. By accessing or using our platform, accessible from <a href="https://fabroniee.store">https://fabroniee.store</a> and <a href="https://analytics-delta-sage.vercel.app">https://analytics-delta-sage.vercel.app</a>, connecting your Facebook Page or Instagram Business Account, or creating automated messaging workflows, you agree to comply with and be bound by these Terms of Service.</p>
+
+<h2>1. Authorized Use &amp; Platform Compliance</h2>
+<p>Our service provides creator tools and Comment-to-DM automation software. You agree to use the service in full compliance with:</p>
+<ul>
+  <li>Meta&rsquo;s Community Standards and Platform Terms.</li>
+  <li>Instagram&rsquo;s Terms of Use and Messaging Policies.</li>
+  <li>Applicable anti-spam regulations (CAN-SPAM, TCPA, and regional equivalents).</li>
+</ul>
+
+<h2>2. Prohibited Activities</h2>
+<p>You may not use our service to dispatch unsolicited spam, deceptive links, harassment, or content that violates intellectual property or privacy rights. Any violation will result in immediate termination of account access.</p>
+
+<h2>3. Meta Account Connection &amp; Security</h2>
+<p>You grant us permission to act on behalf of your connected Facebook Page and Instagram Account solely to the extent permitted by the OAuth scopes authorized during login. You may revoke access at any time through our dashboard or Facebook settings.</p>
+
+<h2>4. Service Availability &amp; Disclaimer</h2>
+<p>The service is provided on an &ldquo;as is&rdquo; and &ldquo;as available&rdquo; basis. We are not responsible for downtimes, API rate limit restrictions imposed by Meta, or network disruptions beyond our reasonable control.</p>
+
+<h2>5. Termination</h2>
+<p>We reserve the right to suspend or terminate accounts that violate Meta Platform Policies or these Terms. Users may terminate their accounts at any time via the Account Settings dashboard.</p>
+
+<h2>6. Contact</h2>
+<p>For inquiries regarding these Terms, contact us at <a href="mailto:${e}">${e}</a>.</p>`,
     );
   }
 

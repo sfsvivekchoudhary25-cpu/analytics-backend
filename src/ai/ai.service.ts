@@ -106,9 +106,9 @@ export class AiService {
       ...(i.instructions.trim()
         ? ['BUSINESS INFORMATION (the only facts you may state):', i.instructions.trim()]
         : [
-            'BUSINESS INFORMATION: none. You know NOTHING about this business: its products, prices, stock, sizes, delivery, payment, returns, opening hours, location or contact details. Never state or guess any of them.',
-            `Greet the customer, thank them, react to compliments and chat normally. If the customer asks for a specific fact about the business itself (a price, stock, an address, a policy, etc.), reply with exactly ${NO_REPLY} and nothing else (except for public comments requesting links/details, where telling them to check DMs is permitted) — never say you don't know or will check.`,
-          ]),
+          'BUSINESS INFORMATION: none. You know NOTHING about this business: its products, prices, stock, sizes, delivery, payment, returns, opening hours, location or contact details. Never state or guess any of them.',
+          `Greet the customer, thank them, react to compliments and chat normally. If the customer asks for a specific fact about the business itself (a price, stock, an address, a policy, etc.), reply with exactly ${NO_REPLY} and nothing else (except for public comments requesting links/details, where telling them to check DMs is permitted) — never say you don't know or will check.`,
+        ]),
       '',
       'RULES',
       '- Reply in the customer\'s language AND script: if they wrote Hindi or another language in English letters (for example "kya price hai"), answer in English letters, never in another script.',
@@ -343,7 +343,7 @@ export class AiService {
           const parsed = JSON.parse(jsonMatch[0]);
           return { model: res.model, ...parsed };
         }
-      } catch {}
+      } catch { }
     }
 
     const baseShoutout = userTag
@@ -362,7 +362,7 @@ export class AiService {
   async autoTuneTriggers(payload: { comments: string[]; currentKeywords: string[] }) {
     const existing = new Set((payload.currentKeywords || []).map((k) => k.trim().toLowerCase()));
     const wordFreq = new Map<string, number>();
-    const commonStop = new Set(['the','and','is','it','to','in','of','for','a','on','with','at','by','this','that','i','you','my','we','are','was','so','but','as']);
+    const commonStop = new Set(['the', 'and', 'is', 'it', 'to', 'in', 'of', 'for', 'a', 'on', 'with', 'at', 'by', 'this', 'that', 'i', 'you', 'my', 'we', 'are', 'was', 'so', 'but', 'as']);
 
     (payload.comments || []).forEach((text) => {
       const words = (text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
@@ -410,7 +410,7 @@ export class AiService {
           const parsed = JSON.parse(jsonMatch[0]);
           return { model: res.model, ...parsed };
         }
-      } catch {}
+      } catch { }
     }
 
     return {
@@ -454,7 +454,7 @@ export class AiService {
             };
           }
         }
-      } catch {}
+      } catch { }
     }
 
     return {
@@ -486,7 +486,7 @@ export class AiService {
           const parsed = JSON.parse(jsonMatch[0]);
           return { model: res.model, ...parsed };
         }
-      } catch {}
+      } catch { }
     }
 
     return {
