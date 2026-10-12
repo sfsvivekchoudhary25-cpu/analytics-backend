@@ -65,7 +65,7 @@ export class FacebookPageService {
     return result;
   }
 
-  private async syncPermissionsToInstagramConnection(granted: string[]) {
+  async syncPermissionsToInstagramConnection(granted: string[]) {
     try {
       const igRepo = this.repo.manager.getRepository('InstagramConnection');
       const [igConn] = (await igRepo.find({ take: 1 })) as any;

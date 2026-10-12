@@ -1,4 +1,4 @@
-import { Controller, Get, Logger, Query, Res } from '@nestjs/common';
+import { Controller, Get, Logger, Query, Req, Res } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -22,21 +22,58 @@ export class FacebookOauthController {
     private readonly userRepo: Repository<User>,
   ) {}
 
+  private redirectUri(clientOrigin?: string): string {
+    const isLocal =
+      clientOrigin?.includes('localhost') ||
+      clientOrigin?.includes('127.0.0.1') ||
+      clientOrigin?.includes('192.168.') ||
+      process.env.PUBLIC_BASE_URL?.includes('localhost');
+    if (isLocal) {
+      const port = process.env.PORT || '4000';
+      return `http://localhost:${port}/facebook-page/oauth/callback`;
+    }
+    if (process.env.FACEBOOK_REDIRECT_URI) return process.env.FACEBOOK_REDIRECT_URI;
+    const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';
+    return `${base}/facebook-page/oauth/callback`;
+  }
+
   @Get('url')
-  async authorizeUrl() {
-    const state = await this.jwt.signAsync({ purpose: 'fb-page-oauth' }, { expiresIn: '15m' });
+  async authorizeUrl(@Query('origin') clientOrigin?: string, @Req() req?: any) {
+    let detectedOrigin = clientOrigin || req?.headers?.origin;
+    if (!detectedOrigin && req?.headers?.referer) {
+      try {
+        detectedOrigin = new URL(req.headers.referer).origin;
+      } catch {}
+    }
+    if (!detectedOrigin) {
+      detectedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
+    }
+
+    const redirectUri = this.redirectUri(detectedOrigin);
+
+    const state = await this.jwt.signAsync(
+      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri },
+      { expiresIn: '15m' },
+    );
     const appId = process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '';
     const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID ?? '';
-    if (!configId) {
-      throw new Error('FACEBOOK_LOGIN_CONFIG_ID is not configured in backend .env. Add the Configuration ID from the Meta dashboard.');
-    }
+
     const params = new URLSearchParams({
       client_id: appId,
-      redirect_uri: this.redirectUri(),
+      redirect_uri: redirectUri,
       response_type: 'code',
-      config_id: configId,
       state,
     });
+
+    if (configId) {
+      params.append('config_id', configId);
+    } else {
+      params.append(
+        'scope',
+        'pages_show_list,pages_read_engagement,pages_manage_metadata,instagram_basic,instagram_manage_comments,instagram_manage_messages,instagram_manage_insights,instagram_content_publish,business_management,public_profile',
+      );
+    }
+
     return { url: `https://www.facebook.com/dialog/oauth?${params}` };
   }
 
@@ -48,7 +85,9 @@ export class FacebookOauthController {
     @Query('error_description') providerError: string,
     @Res() res: Redirector,
   ) {
-    const frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
+    let frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
+    let matchedRedirectUri = this.redirectUri();
+
     const back = (q: Record<string, string>) =>
       res.redirect(`${frontendBase}/?${new URLSearchParams(q)}`);
 
@@ -56,12 +95,14 @@ export class FacebookOauthController {
     try {
       const payload = await this.jwt.verifyAsync(state ?? '');
       if (payload.purpose !== 'fb-page-oauth') throw new Error('bad state');
+      if (payload.origin) frontendBase = payload.origin.replace(/\/$/, '');
+      if (payload.redirectUri) matchedRedirectUri = payload.redirectUri;
     } catch {
       return back({ error: 'Login session expired or invalid. Please try again.' });
     }
 
     try {
-      const userToken = await this.exchangeCode(code);
+      const userToken = await this.exchangeCode(code, matchedRedirectUri);
       const longLivedUserToken = await this.exchangeLongLived(userToken);
       const pages = await this.listPages(longLivedUserToken);
       if (pages.length === 0) {
@@ -71,17 +112,50 @@ export class FacebookOauthController {
       // Prefer the Page whose linked Instagram account matches the one already connected via Instagram Login.
       const myIgUserId = await this.connection.getIgUserId().catch(() => null);
       const matched = myIgUserId ? pages.find((p) => p.instagram_business_account?.id === myIgUserId) : null;
-      const chosen = matched ?? (pages.length === 1 ? pages[0] : null);
+      // Fallback: pick any page that has a linked Instagram account, then just the first page
+      const withIg = pages.find((p) => p.instagram_business_account?.id);
+      const chosen = matched ?? (pages.length === 1 ? pages[0] : withIg ?? pages[0]);
 
       if (!chosen) {
         const names = pages.map((p) => p.name).join(', ');
         return back({
-          error: `Found ${pages.length} Pages (${names}) but none match your connected Instagram account. Make sure the right Page is linked to @${myIgUserId ? 'your Instagram account' : 'it'} in Meta Business Suite.`,
+          error: `Found ${pages.length} Pages (${names}) but none match your connected Instagram account. Make sure the right Page is linked to your Instagram account in Meta Business Suite.`,
         });
       }
 
       await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null);
       this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id})${matched ? ', matches your Instagram account' : ''}.`);
+
+      // Dynamically auto-connect Instagram connection using Page access token if not already connected
+      try {
+        await this.connection.connect(chosen.access_token);
+        this.logger.log(`Auto-connected Instagram account via Facebook Page token for page "${chosen.name}"`);
+      } catch (igErr) {
+        this.logger.warn(`Could not auto-connect Instagram from Facebook Page token: ${igErr}`);
+      }
+
+      // Sync all permissions from user token to Instagram connection
+      try {
+        const permsRes = await fetch(`${FB_API}/me/permissions?access_token=${encodeURIComponent(longLivedUserToken)}`);
+        const permsBody = await permsRes.json();
+        if (permsRes.ok && Array.isArray(permsBody.data)) {
+          const granted = permsBody.data
+            .filter((p: any) => p.status === 'granted')
+            .map((p: any) => p.permission);
+          if (granted.length > 0) {
+            await this.pages.syncPermissionsToInstagramConnection(granted);
+          }
+        }
+      } catch (err) {
+        this.logger.warn(`Could not sync permissions after Facebook OAuth: ${err}`);
+      }
+
+      // Live-sync all permissions from Meta
+      try {
+        await this.connection.syncLivePermissions();
+      } catch (syncErr) {
+        this.logger.warn(`Could not live-sync permissions: ${syncErr}`);
+      }
 
       // Also auto-provision or find user in app_users
       let igUsername = (await this.connection.getStatus()).username || null;
@@ -128,17 +202,12 @@ export class FacebookOauthController {
     }
   }
 
-  private redirectUri(): string {
-    if (process.env.FACEBOOK_REDIRECT_URI) return process.env.FACEBOOK_REDIRECT_URI;
-    const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';
-    return `${base}/facebook-page/oauth/callback`;
-  }
-
-  private async exchangeCode(code: string): Promise<string> {
+  private async exchangeCode(code: string, redirectUri?: string): Promise<string> {
+    const uri = redirectUri || this.redirectUri();
     const params = new URLSearchParams({
       client_id: process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '',
       client_secret: process.env.FACEBOOK_APP_SECRET ?? process.env.INSTAGRAM_APP_SECRET ?? '',
-      redirect_uri: this.redirectUri(),
+      redirect_uri: uri,
       code,
     });
     const res = await fetch(`${FB_API}/oauth/access_token?${params}`);
