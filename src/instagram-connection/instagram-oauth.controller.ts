@@ -39,11 +39,13 @@ export class InstagramOauthController {
     const isLocal =
       clientOrigin?.includes('localhost') ||
       clientOrigin?.includes('127.0.0.1') ||
-      clientOrigin?.includes('192.168.') ||
-      process.env.PUBLIC_BASE_URL?.includes('localhost');
+      clientOrigin?.includes('192.168.');
     if (isLocal) {
       const port = process.env.PORT || '4000';
       return `http://localhost:${port}/instagram/oauth/callback`;
+    }
+    if (clientOrigin && (clientOrigin.includes('vercel.app') || clientOrigin.includes('onrender.com'))) {
+      return 'https://analytics-backend-vxak.onrender.com/instagram/oauth/callback';
     }
     if (process.env.INSTAGRAM_REDIRECT_URI) return process.env.INSTAGRAM_REDIRECT_URI;
     const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';

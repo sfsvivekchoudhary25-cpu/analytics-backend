@@ -26,11 +26,13 @@ export class FacebookOauthController {
     const isLocal =
       clientOrigin?.includes('localhost') ||
       clientOrigin?.includes('127.0.0.1') ||
-      clientOrigin?.includes('192.168.') ||
-      process.env.PUBLIC_BASE_URL?.includes('localhost');
+      clientOrigin?.includes('192.168.');
     if (isLocal) {
       const port = process.env.PORT || '4000';
       return `http://localhost:${port}/facebook-page/oauth/callback`;
+    }
+    if (clientOrigin && (clientOrigin.includes('vercel.app') || clientOrigin.includes('onrender.com'))) {
+      return 'https://analytics-backend-vxak.onrender.com/facebook-page/oauth/callback';
     }
     if (process.env.FACEBOOK_REDIRECT_URI) return process.env.FACEBOOK_REDIRECT_URI;
     const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';
@@ -65,12 +67,13 @@ export class FacebookOauthController {
       state,
     });
 
-    if (configId) {
+    const useConfig = req?.query?.use_config === 'true' || req?.query?.use_config === '1';
+    if (useConfig && configId) {
       params.append('config_id', configId);
     } else {
       params.append(
         'scope',
-        'pages_show_list,pages_read_engagement,pages_manage_metadata,instagram_basic,instagram_manage_comments,instagram_manage_messages,instagram_manage_insights,instagram_content_publish,business_management,public_profile',
+        'pages_show_list,pages_read_engagement,pages_manage_metadata,pages_manage_posts,instagram_basic,instagram_manage_comments,instagram_manage_messages,instagram_manage_insights,instagram_content_publish,business_management,public_profile',
       );
     }
 
