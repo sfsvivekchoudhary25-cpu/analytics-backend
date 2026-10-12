@@ -279,20 +279,69 @@ export class InstagramConnectionService implements OnModuleInit {
       connection.permissions.split(',').forEach((p) => p.trim() && grantedSet.add(p.trim()));
     }
 
-    // Try checking Meta permissions if a Facebook Page connection exists
-    try {
-      const FB_API = 'https://graph.facebook.com/v21.0';
-        const [fbConn] = (await this.repo.manager.getRepository('FacebookPageConnection').find({ take: 1 })) as any;
-        if (fbConn?.pageAccessToken) {
-        const permsRes = await fetch(`${FB_API}/me/permissions?access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
+    const FB_API = 'https://graph.facebook.com/v21.0';
+    const appId = process.env.FACEBOOK_APP_ID || process.env.INSTAGRAM_APP_ID;
+    const appSecret = process.env.FACEBOOK_APP_SECRET || process.env.INSTAGRAM_APP_SECRET;
+
+    // Helper: inspect token via Meta debug_token endpoint (supported for all token types)
+    const inspectToken = async (tok: string) => {
+      if (!appId || !appSecret || !tok) return;
+      try {
+        const debugUrl = `${FB_API}/debug_token?input_token=${encodeURIComponent(tok)}&access_token=${appId}|${appSecret}`;
+        const res = await fetch(debugUrl);
+        const data = await res.json();
+        if (res.ok && Array.isArray(data?.data?.scopes)) {
+          for (const s of data.data.scopes) grantedSet.add(s);
+          this.logger.log(`Live synced permissions via debug_token: ${data.data.scopes.join(', ')}`);
+        }
+      } catch (e) {
+        this.logger.debug?.(`debug_token check failed: ${e}`);
+      }
+    };
+
+    // Helper: query /me/permissions (supported for user tokens)
+    const checkMePerms = async (tok: string, baseUrl = FB_API) => {
+      if (!tok) return;
+      try {
+        const permsRes = await fetch(`${baseUrl}/me/permissions?access_token=${encodeURIComponent(tok)}`);
         const permsBody = await permsRes.json();
         if (permsRes.ok && Array.isArray(permsBody.data)) {
           permsBody.data
             .filter((p: any) => p.status === 'granted')
             .forEach((p: any) => grantedSet.add(p.permission));
         }
+      } catch {}
+    };
+
+    // 1. Inspect Instagram connection access token
+    if (connection.accessToken) {
+      await inspectToken(connection.accessToken);
+      await checkMePerms(connection.accessToken, FB_API);
+      await checkMePerms(connection.accessToken, 'https://graph.instagram.com');
+    }
+
+    // 2. Also inspect Facebook Page access token if available
+    try {
+      const fbRepo = this.repo.manager.getRepository('FacebookPageConnection');
+      const [fbConn] = (await fbRepo.find({ take: 1 })) as any;
+      if (fbConn?.pageAccessToken) {
+        await inspectToken(fbConn.pageAccessToken);
+        await checkMePerms(fbConn.pageAccessToken, FB_API);
       }
     } catch {}
+
+    // 3. Normalize & expand aliases so frontend permissions matrix recognizes all standard capabilities
+    const aliases: [string, string][] = [
+      ['instagram_manage_messages', 'instagram_business_manage_messages'],
+      ['instagram_manage_comments', 'instagram_business_manage_comments'],
+      ['instagram_content_publish', 'instagram_business_content_publish'],
+      ['instagram_manage_insights', 'instagram_business_manage_insights'],
+      ['instagram_basic', 'instagram_business_basic'],
+    ];
+    for (const [a, b] of aliases) {
+      if (grantedSet.has(a)) grantedSet.add(b);
+      if (grantedSet.has(b)) grantedSet.add(a);
+    }
 
     const list = Array.from(grantedSet);
     if (list.length > 0) {

@@ -1,4 +1,4 @@
-import { Controller, Get, Logger, Query, Res } from '@nestjs/common';
+import { Controller, Get, Logger, Query, Req, Res } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -35,7 +35,16 @@ export class InstagramOauthController {
     private readonly userRepo: Repository<User>,
   ) {}
 
-  private redirectUri(): string {
+  private redirectUri(clientOrigin?: string): string {
+    const isLocal =
+      clientOrigin?.includes('localhost') ||
+      clientOrigin?.includes('127.0.0.1') ||
+      clientOrigin?.includes('192.168.') ||
+      process.env.PUBLIC_BASE_URL?.includes('localhost');
+    if (isLocal) {
+      const port = process.env.PORT || '4000';
+      return `http://localhost:${port}/instagram/oauth/callback`;
+    }
     if (process.env.INSTAGRAM_REDIRECT_URI) return process.env.INSTAGRAM_REDIRECT_URI;
     const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';
     return `${base}/instagram/oauth/callback`;
@@ -43,15 +52,29 @@ export class InstagramOauthController {
 
   // Public endpoint: Frontend calls this to obtain the official Instagram OAuth login dialog URL
   @Get('url')
-  async authorizeUrl() {
+  async authorizeUrl(@Query('origin') clientOrigin?: string, @Req() req?: any) {
     const appId = process.env.INSTAGRAM_APP_ID;
     if (!appId) {
       throw new Error('INSTAGRAM_APP_ID is not configured in backend .env. Please set your Meta App ID.');
     }
 
-    // `state` is a signed JWT so only flows initiated by this system can finish
-    const state = await this.jwt.signAsync({ purpose: 'ig-oauth' }, { expiresIn: '15m' });
-    const redirectUri = this.redirectUri();
+    let detectedOrigin = clientOrigin || req?.headers?.origin;
+    if (!detectedOrigin && req?.headers?.referer) {
+      try {
+        detectedOrigin = new URL(req.headers.referer).origin;
+      } catch {}
+    }
+    if (!detectedOrigin) {
+      detectedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
+    }
+
+    const redirectUri = this.redirectUri(detectedOrigin);
+
+    // `state` is a signed JWT storing the origin and matched redirectUri so only flows initiated by this system can finish
+    const state = await this.jwt.signAsync(
+      { purpose: 'ig-oauth', origin: detectedOrigin, redirectUri },
+      { expiresIn: '15m' },
+    );
 
     const params = new URLSearchParams({
       client_id: appId,
@@ -61,7 +84,7 @@ export class InstagramOauthController {
       state,
     });
 
-    this.logger.log(`Initiating Instagram OAuth with redirect URI: ${redirectUri}`);
+    this.logger.log(`Initiating Instagram OAuth with redirect URI: ${redirectUri} (origin: ${detectedOrigin})`);
     return { url: `https://www.instagram.com/oauth/authorize?${params}` };
   }
 
@@ -73,7 +96,9 @@ export class InstagramOauthController {
     @Query('error_description') providerError: string,
     @Res() res: Redirector,
   ) {
-    const frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
+    let frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
+    let matchedRedirectUri = this.redirectUri();
+
     const back = (q: Record<string, string>) =>
       res.redirect(`${frontendBase}/?${new URLSearchParams(q)}`);
 
@@ -84,13 +109,15 @@ export class InstagramOauthController {
     try {
       const payload = await this.jwt.verifyAsync(state ?? '');
       if (payload.purpose !== 'ig-oauth') throw new Error('bad state');
+      if (payload.origin) frontendBase = payload.origin.replace(/\/$/, '');
+      if (payload.redirectUri) matchedRedirectUri = payload.redirectUri;
     } catch {
       return back({ error: 'Login session expired or invalid. Please try again.' });
     }
 
     try {
       const cleanCode = code.replace(/#_$/, '');
-      const { token: shortLived, permissions, userId } = await this.exchangeCode(cleanCode);
+      const { token: shortLived, permissions, userId } = await this.exchangeCode(cleanCode, matchedRedirectUri);
       const longLived = await this.exchangeLongLived(shortLived);
 
       // Save/update connection credentials in the database (encrypted at rest)
@@ -135,6 +162,23 @@ export class InstagramOauthController {
         instagramHandle: user.instagramHandle,
       });
 
+      // Automatically live-sync all permissions from Meta
+      try {
+        await this.connection.syncLivePermissions(username);
+      } catch (syncErr) {
+        this.logger.warn(`Could not sync live permissions after login: ${syncErr}`);
+      }
+
+      // Auto-link Facebook Page if one exists in FacebookPageConnection
+      try {
+        const fbRepo = this.userRepo.manager.getRepository('FacebookPageConnection');
+        const [fbConn] = (await fbRepo.find({ take: 1 })) as any;
+        if (fbConn && !fbConn.igUserId && userId) {
+          fbConn.igUserId = userId;
+          await fbRepo.save(fbConn);
+        }
+      } catch {}
+
       const missing = SCOPES.filter((s) => !permissions.includes(s));
       this.logger.log(`Instagram OAuth login OK for @${username}. Session created for user ${user.id}`);
       if (missing.length) this.logger.warn(`Permissions requested but NOT granted: ${missing.join(', ')}`);
@@ -151,14 +195,15 @@ export class InstagramOauthController {
     }
   }
 
-  private async exchangeCode(code: string): Promise<{ token: string; permissions: string[]; userId?: string }> {
+  private async exchangeCode(code: string, redirectUri?: string): Promise<{ token: string; permissions: string[]; userId?: string }> {
+    const uri = redirectUri || this.redirectUri();
     const res = await fetch('https://api.instagram.com/oauth/access_token', {
       method: 'POST',
       body: new URLSearchParams({
         client_id: process.env.INSTAGRAM_APP_ID ?? '',
         client_secret: process.env.INSTAGRAM_APP_SECRET ?? '',
         grant_type: 'authorization_code',
-        redirect_uri: this.redirectUri(),
+        redirect_uri: uri,
         code,
       }),
     });
