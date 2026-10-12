@@ -1,7 +1,7 @@
 import { Controller, Get, Header, Post } from '@nestjs/common';
 
 const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'InstaVeyra (Inrō Studio)';
-const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'vivek.choudhary.0022@gmail.com';
+const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'support@fabroniee.store';
 const UPDATED = 'October 12, 2026';
 
 const esc = (s: string) =>
