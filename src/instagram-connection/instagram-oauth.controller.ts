@@ -102,7 +102,7 @@ export class InstagramOauthController {
     let matchedRedirectUri = this.redirectUri();
 
     const back = (q: Record<string, string>) =>
-      res.redirect(`${frontendBase}/?${new URLSearchParams(q)}`);
+      res.redirect(`${frontendBase}/dashboard?${new URLSearchParams(q)}`);
 
     if (providerError || !code) {
       return back({ error: providerError || 'Instagram authentication was cancelled.' });
