@@ -483,4 +483,27 @@ export class InstagramConnectionService implements OnModuleInit {
       this.logger.warn(`Could not link instagram handle to user ${userId}: ${err}`);
     }
   }
+
+  async disconnect(account?: string) {
+    const conn = await this.getConnectionRow(account);
+    if (conn) {
+      const username = conn.username;
+      await this.repo.remove(conn);
+      this.logger.log(`Instagram connection disconnected for @${username}`);
+    }
+    return { success: true, message: 'Instagram account disconnected.' };
+  }
+
+  async wipeAccountData(account?: string) {
+    const conn = await this.getConnectionRow(account);
+    if (conn) {
+      const username = conn.username;
+      await this.repo.remove(conn);
+      this.logger.log(`All Meta access tokens and account records permanently wiped for @${username}`);
+    }
+    return {
+      success: true,
+      message: 'All Meta access tokens and account connections have been permanently erased.',
+    };
+  }
 }
