@@ -69,7 +69,7 @@ export class FacebookOauthController {
     } else {
       params.append(
         'scope',
-        'pages_show_list,pages_read_engagement,pages_manage_metadata,instagram_basic,instagram_manage_comments,instagram_manage_messages,public_profile',
+        'pages_show_list,pages_read_engagement,instagram_basic,instagram_manage_comments,instagram_manage_messages,public_profile',
       );
     }
 
