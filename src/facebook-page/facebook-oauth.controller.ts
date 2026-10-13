@@ -23,24 +23,17 @@ export class FacebookOauthController {
   ) {}
 
   private redirectUri(clientOrigin?: string): string {
-    const isLocal =
-      clientOrigin?.includes('localhost') ||
-      clientOrigin?.includes('127.0.0.1') ||
-      clientOrigin?.includes('192.168.');
-    if (isLocal) {
-      const port = process.env.PORT || '4000';
-      return `http://localhost:${port}/facebook-page/oauth/callback`;
+    // If an explicit HTTPS override is provided in env, use it
+    if (process.env.FACEBOOK_REDIRECT_URI && process.env.FACEBOOK_REDIRECT_URI.startsWith('https://')) {
+      return process.env.FACEBOOK_REDIRECT_URI;
     }
-    if (clientOrigin && (clientOrigin.includes('vercel.app') || clientOrigin.includes('onrender.com'))) {
-      return 'https://analytics-backend-vxak.onrender.com/facebook-page/oauth/callback';
-    }
-    if (process.env.FACEBOOK_REDIRECT_URI) return process.env.FACEBOOK_REDIRECT_URI;
-    const base = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '') || 'http://localhost:4000';
-    return `${base}/facebook-page/oauth/callback`;
+    // Meta strictly enforces HTTPS for Facebook Login for Business with Configurations.
+    // Use the registered production HTTPS callback so Meta's OAuth dialog never rejects plain http://
+    return 'https://analytics-backend-vxak.onrender.com/facebook-page/oauth/callback';
   }
 
   @Get('url')
-  async authorizeUrl(@Query('origin') clientOrigin?: string, @Req() req?: any) {
+  async authorizeUrl(@Query('origin') clientOrigin?: string, @Query('return_path') queryReturnPath?: string, @Req() req?: any) {
     let detectedOrigin = clientOrigin || req?.headers?.origin;
     if (!detectedOrigin && req?.headers?.referer) {
       try {
@@ -51,14 +44,15 @@ export class FacebookOauthController {
       detectedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
     }
 
+    const returnPath = queryReturnPath || '/account';
     const redirectUri = this.redirectUri(detectedOrigin);
 
     const state = await this.jwt.signAsync(
-      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri },
+      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri, returnPath },
       { expiresIn: '15m' },
     );
     const appId = process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '';
-    const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID ?? '';
+    const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID ?? '921623610716684';
 
     const params = new URLSearchParams({
       client_id: appId,
@@ -92,15 +86,17 @@ export class FacebookOauthController {
   ) {
     let frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
     let matchedRedirectUri = this.redirectUri();
+    let returnPath = '/account';
 
     const back = (q: Record<string, string>) =>
-      res.redirect(`${frontendBase}/dashboard?${new URLSearchParams(q)}`);
+      res.redirect(`${frontendBase}${returnPath}?${new URLSearchParams(q)}`);
 
     if (providerError || !code) return back({ error: providerError || 'Facebook login was cancelled.' });
     try {
       const payload = await this.jwt.verifyAsync(state ?? '');
       if (payload.purpose !== 'fb-page-oauth') throw new Error('bad state');
       if (payload.origin) frontendBase = payload.origin.replace(/\/$/, '');
+      if (payload.returnPath) returnPath = payload.returnPath;
       if (payload.redirectUri) matchedRedirectUri = payload.redirectUri;
     } catch {
       return back({ error: 'Login session expired or invalid. Please try again.' });
