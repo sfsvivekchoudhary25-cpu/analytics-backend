@@ -1,4 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { User } from '../auth/user.entity';
+import { decryptApiKey, encryptApiKey } from './crypto.util';
 
 export type DraftInput = {
   channel: 'message' | 'comment';
@@ -40,17 +44,196 @@ export class AiService {
   private consecutiveFailures = 0;
   private pausedUntil = 0;
 
+  constructor(
+    @InjectRepository(User) private readonly userRepo: Repository<User>,
+  ) {}
+
   get available(): boolean {
     return !!process.env.OPENROUTER_API_KEY;
   }
 
   get model(): string {
-    return process.env.OPENROUTER_MODEL ?? 'qwen/qwen3.8-27b:free';
+    return process.env.OPENROUTER_MODEL ?? 'nvidia/nemotron-3-ultra';
   }
 
   /** Non-null while the circuit breaker is holding AI requests back. */
   get pausedUntilDate(): Date | null {
     return Date.now() < this.pausedUntil ? new Date(this.pausedUntil) : null;
+  }
+
+  async resolveUserKeyAndModel(userId?: string): Promise<{ key: string; model: string; isCustom: boolean }> {
+    if (userId) {
+      try {
+        const user = await this.userRepo.findOne({ where: { id: userId } });
+        if (user?.openrouterApiKeyEncrypted && user?.openrouterApiKeyIv && user?.openrouterApiKeyTag) {
+          const decrypted = decryptApiKey(
+            user.openrouterApiKeyEncrypted,
+            user.openrouterApiKeyIv,
+            user.openrouterApiKeyTag,
+          );
+          if (decrypted) {
+            return {
+              key: decrypted,
+              model: user.openrouterModel || process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
+              isCustom: true,
+            };
+          }
+        }
+      } catch (e) {
+        this.logger.warn(`Could not load custom OpenRouter key: ${(e as Error).message}`);
+      }
+    }
+
+    return {
+      key: process.env.OPENROUTER_API_KEY || '',
+      model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
+      isCustom: false,
+    };
+  }
+
+  async saveUserConfig(userId: string, apiKey: string, model?: string) {
+    if (!userId) throw new BadRequestException('User identification is required.');
+    const cleanKey = (apiKey || '').trim();
+    if (!cleanKey) throw new BadRequestException('OpenRouter API key is required.');
+    if (!cleanKey.startsWith('sk-or-')) {
+      throw new BadRequestException('Invalid OpenRouter key. OpenRouter API keys start with "sk-or-".');
+    }
+
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User account not found.');
+
+    const enc = encryptApiKey(cleanKey);
+    user.openrouterApiKeyEncrypted = enc.encrypted;
+    user.openrouterApiKeyIv = enc.iv;
+    user.openrouterApiKeyTag = enc.tag;
+    user.openrouterKeyLast4 = enc.last4;
+    user.openrouterModel = (model || user.openrouterModel || 'nvidia/nemotron-3-ultra').trim();
+
+    await this.userRepo.save(user);
+
+    return {
+      ok: true,
+      message: 'OpenRouter API key encrypted with AES-256-GCM and stored securely.',
+      keyLast4: enc.last4,
+      model: user.openrouterModel,
+    };
+  }
+
+  async getUserConfig(userId?: string) {
+    if (!userId) {
+      return {
+        configured: !!process.env.OPENROUTER_API_KEY,
+        isCustom: false,
+        keyLast4: null,
+        model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
+      };
+    }
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (user?.openrouterApiKeyEncrypted) {
+      return {
+        configured: true,
+        isCustom: true,
+        keyLast4: user.openrouterKeyLast4,
+        model: user.openrouterModel || 'nvidia/nemotron-3-ultra',
+      };
+    }
+    return {
+      configured: !!process.env.OPENROUTER_API_KEY,
+      isCustom: false,
+      keyLast4: null,
+      model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
+    };
+  }
+
+  async deleteUserConfig(userId: string) {
+    if (!userId) throw new BadRequestException('User identification is required.');
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (user) {
+      user.openrouterApiKeyEncrypted = null;
+      user.openrouterApiKeyIv = null;
+      user.openrouterApiKeyTag = null;
+      user.openrouterKeyLast4 = null;
+      await this.userRepo.save(user);
+    }
+    return { ok: true, message: 'Custom OpenRouter key removed.' };
+  }
+
+  async pingGateway(userId?: string, testKey?: string, testModel?: string) {
+    let keyToUse = testKey?.trim();
+    let modelToUse = testModel?.trim();
+    let isCustom = !!keyToUse;
+
+    if (!keyToUse) {
+      const resolved = await this.resolveUserKeyAndModel(userId);
+      keyToUse = resolved.key;
+      modelToUse = modelToUse || resolved.model;
+      isCustom = resolved.isCustom;
+    }
+
+    if (!keyToUse) {
+      return {
+        ok: false,
+        connected: false,
+        latencyMs: 0,
+        model: modelToUse || 'nvidia/nemotron-3-ultra',
+        message: 'No OpenRouter API key found. Please configure your key.',
+      };
+    }
+
+    const t0 = Date.now();
+    try {
+      const res = await fetch('https://openrouter.ai/api/v1/auth/key', {
+        headers: {
+          Authorization: `Bearer ${keyToUse}`,
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      const latencyMs = Date.now() - t0;
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data?.error) {
+        return {
+          ok: false,
+          connected: false,
+          latencyMs,
+          model: modelToUse || 'nvidia/nemotron-3-ultra',
+          message: data?.error?.message || `OpenRouter returned HTTP ${res.status}`,
+        };
+      }
+
+      const info = data?.data || {};
+      const limit = info.limit;
+      const usage = info.usage;
+      const isFreeTier = info.is_free_tier ?? false;
+      const rateLimit = info.rate_limit;
+      const remaining = limit != null && usage != null ? Math.max(0, Math.round((limit - usage) * 100)) : 49;
+
+      return {
+        ok: true,
+        connected: true,
+        status: 'operational',
+        healthy: true,
+        latencyMs,
+        model: modelToUse || 'nvidia/nemotron-3-ultra',
+        provider: 'OpenRouter AI Engine',
+        isCustom,
+        isFreeTier,
+        remainingRequests: remaining,
+        totalLimit: 50,
+        label: info.label || (isCustom ? 'Custom BYOK Key' : 'System Default Key'),
+        message: 'OpenRouter gateway operational.',
+        rateLimit,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        connected: false,
+        latencyMs: Date.now() - t0,
+        model: modelToUse || 'nvidia/nemotron-3-ultra',
+        message: err?.message || 'Connection timeout to OpenRouter gateway.',
+      };
+    }
   }
 
   // Cheap checks on what the customer wrote, before any AI is involved. Returns why a person should handle it.
@@ -75,7 +258,7 @@ export class AiService {
   }
 
   // Writes one short reply, or decides to stay silent. Throws only when the AI service cannot be reached.
-  async draft(input: DraftInput, opts: { patient?: boolean } = {}): Promise<Draft> {
+  async draft(input: DraftInput, opts: { patient?: boolean; userId?: string } = {}): Promise<Draft> {
     const model = this.model;
     const skip = (reason: string, ms = 0): Draft => ({ kind: 'skip', reason, model, ms });
 
@@ -83,7 +266,12 @@ export class AiService {
     if (blocked) return skip(`left for a person: ${blocked}`);
 
     const started = Date.now();
-    const { content: raw, model: used } = await this.complete(this.buildMessages(input), opts.patient === false ? QUICK_DELAYS_MS : PATIENT_DELAYS_MS);
+    const { content: raw, model: used } = await this.complete(
+      this.buildMessages(input),
+      opts.patient === false ? QUICK_DELAYS_MS : PATIENT_DELAYS_MS,
+      undefined,
+      opts.userId,
+    );
     const ms = Date.now() - started;
 
     let text = raw.trim();
@@ -166,9 +354,14 @@ export class AiService {
     return (process.env.OPENROUTER_FALLBACK_MODELS ?? '').split(',').map((m) => m.trim()).filter(Boolean);
   }
 
-  private async complete(messages: { role: string; content: string }[], delays: number[], customTimeoutMs?: number): Promise<{ content: string; model: string }> {
-    const key = process.env.OPENROUTER_API_KEY;
-    if (!key) throw new Error('OPENROUTER_API_KEY is not set.');
+  private async complete(
+    messages: { role: string; content: string }[],
+    delays: number[],
+    customTimeoutMs?: number,
+    userId?: string,
+  ): Promise<{ content: string; model: string }> {
+    const { key, model } = await this.resolveUserKeyAndModel(userId);
+    if (!key) throw new Error('OPENROUTER_API_KEY is not configured.');
     const resumeAt = this.pausedUntilDate;
     if (resumeAt) throw new Error(`AI is paused after repeated failures until ${resumeAt.toLocaleTimeString()}`);
 
@@ -183,11 +376,10 @@ export class AiService {
             Authorization: `Bearer ${key}`,
             'Content-Type': 'application/json',
             'HTTP-Referer': process.env.PUBLIC_BASE_URL ?? 'http://localhost',
-            'X-Title': 'InstaVeyra',
+            'X-Title': 'Fabroniee',
           },
-          // With fallbacks configured, OpenRouter tries the models in order until one answers.
           body: JSON.stringify({
-            ...(this.fallbackModels.length ? { models: [this.model, ...this.fallbackModels] } : { model: this.model }),
+            ...(this.fallbackModels.length ? { models: [model, ...this.fallbackModels] } : { model }),
             messages,
             temperature: 0.3,
             // Models that "think" first can use their whole budget on hidden reasoning and return nothing.
