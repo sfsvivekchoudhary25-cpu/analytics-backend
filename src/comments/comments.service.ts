@@ -410,8 +410,9 @@ export class CommentsService {
     const existing = await this.comments.findOne({ where: { id: inc.id } });
     const own = await this.resolveOwner(ownerUsername);
     if (existing) {
-      if (own && !existing.ownerUsername) {
+      if (own && existing.ownerUsername !== own) {
         existing.ownerUsername = own;
+        existing.isOwn = inc.username.toLowerCase() === own;
       }
       if (!existing.username && inc.username) {
         existing.username = inc.username;
@@ -543,7 +544,7 @@ export class CommentsService {
         );
       }
       if (newComments) this.logger.log(`Sync (${own || 'default'}): ${newComments} new comment(s) found`);
-      await this.processAuto();
+      await this.processAuto(own ?? undefined);
     } finally {
       this.syncing = false;
     }

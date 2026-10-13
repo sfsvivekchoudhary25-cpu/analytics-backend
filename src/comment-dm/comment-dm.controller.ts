@@ -18,6 +18,12 @@ export class CommentDmController {
     return this.service.create(account);
   }
 
+  @Post('process')
+  async triggerProcess(@CurrentAccount() account?: string) {
+    await this.service.processAuto(account);
+    return { ok: true };
+  }
+
   @Get('automations/:id')
   getOne(@Param('id') id: string, @CurrentAccount() account?: string) {
     return this.service.getOne(id, account);

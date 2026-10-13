@@ -282,7 +282,7 @@ export class InstagramOauthController {
   private async subscribeToMessages(accessToken: string) {
     try {
       const params = new URLSearchParams({
-        subscribed_fields: 'messages,messaging_seen,message_reactions,messaging_postbacks,messaging_referral',
+        subscribed_fields: 'messages,messaging_seen,message_reactions,messaging_postbacks,messaging_referral,comments,live_comments',
         access_token: accessToken,
       });
       const res = await fetch(`${GRAPH}/me/subscribed_apps?${params}`, { method: 'POST' });

@@ -328,7 +328,11 @@ export class CommentDmService {
     } else if (wasEnabled && !rule.enabled) {
       this.logger.log(`"${rule.name}" turned off.`);
     }
-    return this.rules.save(rule);
+    const saved = await this.rules.save(rule);
+    if (!wasEnabled && saved.enabled) {
+      this.processAuto(own ?? undefined).catch((err) => this.logger.error(`Immediate processAuto failed: ${(err as Error).message}`));
+    }
+    return saved;
   }
 
   // Recent posts to choose from, for the "Check this post" step.
@@ -430,22 +434,51 @@ export class CommentDmService {
     ).filter((r) => r.enabledAt);
     if (!active.length) return;
 
-    const earliestEnabledAt = active.reduce((min, r) => (r.enabledAt! < min ? r.enabledAt! : min), active[0].enabledAt!);
-    const candidates = await this.comments.find({
-      where: { isOwn: false, parentId: IsNull(), commentedAt: MoreThan(earliestEnabledAt), ownerUsername: own },
-      order: { commentedAt: 'ASC' },
-      take: 25,
-    });
+    // 10-minute grace window before rule was enabled to catch test comments posted right before activation
+    const earliestEnabledAt = active.reduce((min, r) => {
+      const windowStart = new Date(r.enabledAt!.getTime() - 10 * 60 * 1000);
+      return windowStart < min ? windowStart : min;
+    }, new Date(active[0].enabledAt!.getTime() - 10 * 60 * 1000));
+
+    // Media IDs targeted specifically by active rules
+    const targetMediaIds = active.map((r) => r.mediaId).filter((id): id is string => Boolean(id));
+
+    const candidateQuery = this.comments
+      .createQueryBuilder('c')
+      .where('c.is_own = false AND c.parent_id IS NULL AND c.commented_at > :earliest', {
+        earliest: earliestEnabledAt,
+      });
+
+    if (targetMediaIds.length > 0) {
+      candidateQuery.andWhere(
+        '(LOWER(c.ownerUsername) = :own OR c.ownerUsername IS NULL OR c.media_id IN (:...mediaIds))',
+        { own, mediaIds: targetMediaIds },
+      );
+    } else {
+      candidateQuery.andWhere('(LOWER(c.ownerUsername) = :own OR c.ownerUsername IS NULL)', { own });
+    }
+
+    const candidates = await candidateQuery.orderBy('c.commented_at', 'ASC').take(25).getMany();
     if (!candidates.length) return;
 
     const already = new Set((await this.logs.find({ select: { commentId: true } })).map((l) => l.commentId));
     const claims = candidates
       .filter((c) => !already.has(c.id))
-      .map((c) => ({ c, rule: active.find((r) => c.commentedAt > r.enabledAt! && this.matches(r, c)) }))
+      .map((c) => ({
+        c,
+        rule: active.find((r) => {
+          const threshold = new Date(r.enabledAt!.getTime() - 10 * 60 * 1000);
+          return c.commentedAt > threshold && this.matches(r, c);
+        }),
+      }))
       .filter((x): x is { c: Comment; rule: CommentDmRule } => !!x.rule);
     if (!claims.length) return;
 
     for (const { c, rule } of claims) {
+      if (c.ownerUsername !== own) {
+        c.ownerUsername = own;
+        await this.comments.save(c).catch(() => {});
+      }
       try {
         if (rule.requireFollow) {
           // Step 1: Check if commenter is ALREADY following BEFORE sending any message
@@ -465,6 +498,7 @@ export class CommentDmService {
                 ruleId: rule.id,
                 commentId: c.id,
                 username: c.username,
+                ownerUsername: own,
                 ref: null,
                 igsid: recipientId || igsid,
                 status: 'sent',
@@ -507,6 +541,7 @@ export class CommentDmService {
                   ruleId: rule.id,
                   commentId: c.id,
                   username: c.username,
+                  ownerUsername: own,
                   ref: null,
                   igsid: recipientId,
                   status: 'sent',
@@ -527,6 +562,7 @@ export class CommentDmService {
               ruleId: rule.id,
               commentId: c.id,
               username: c.username,
+              ownerUsername: own,
               ref: null,
               igsid: recipientId || igsid,
               status: 'follow_gate',
@@ -542,13 +578,13 @@ export class CommentDmService {
           const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
           const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
           await this.logs.save(
-            this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ref: null, igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false }),
+            this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false }),
           );
           this.logger.log(`DM sent to @${c.username || c.id} via "${rule.name}" (reply to comment: "${preview(c.text, 50)}")`);
         }
       } catch (err) {
         const note = (err as Error).message;
-        await this.logs.save(this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ref: null, status: 'failed', note, followGateSentAt: null, pendingFollowGate: false }));
+        await this.logs.save(this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, status: 'failed', note, followGateSentAt: null, pendingFollowGate: false }));
         this.logger.warn(`Private reply FAILED for @${c.username || c.id}: ${note}`);
       }
     }

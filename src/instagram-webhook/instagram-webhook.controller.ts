@@ -63,16 +63,19 @@ export class InstagramWebhookController {
   @Post()
   @HttpCode(200)
   receive(@Req() req: { rawBody?: Buffer; headers: Record<string, string> }) {
-    const secret = process.env.INSTAGRAM_APP_SECRET ?? '';
+    const secrets = [process.env.INSTAGRAM_APP_SECRET, process.env.FACEBOOK_APP_SECRET].filter(Boolean) as string[];
     const signature = req.headers['x-hub-signature-256'] ?? '';
-    const expected =
-      'sha256=' + createHmac('sha256', secret).update(req.rawBody ?? Buffer.alloc(0)).digest('hex');
-    if (!secret || !safeEqual(signature, expected)) {
+    const rawBuffer = req.rawBody ?? Buffer.alloc(0);
+    const isValid = secrets.some((sec) => {
+      const expected = 'sha256=' + createHmac('sha256', sec).update(rawBuffer).digest('hex');
+      return safeEqual(signature, expected);
+    });
+    if (!secrets.length || !isValid) {
       this.logger.warn(
-        !secret
-          ? 'Event REJECTED: INSTAGRAM_APP_SECRET is not set'
+        !secrets.length
+          ? 'Event REJECTED: no app secret configured'
           : signature
-            ? 'Event REJECTED: signature does not match INSTAGRAM_APP_SECRET (wrong secret, or not from Meta)'
+            ? 'Event REJECTED: signature does not match configured app secrets'
             : 'Event REJECTED: no signature header (not from Meta)',
       );
       throw new UnauthorizedException();
