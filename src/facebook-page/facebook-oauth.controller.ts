@@ -127,6 +127,32 @@ export class FacebookOauthController {
       await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null);
       this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id})${matched ? ', matches your Instagram account' : ''}.`);
 
+      // Subscribe Page to feed and messaging webhooks
+      try {
+        const pageSub = new URLSearchParams({
+          subscribed_fields: 'feed,messages,messaging_postbacks',
+          access_token: chosen.access_token,
+        });
+        await fetch(`${FB_API}/${chosen.id}/subscribed_apps?${pageSub}`, { method: 'POST' });
+        this.logger.log(`Subscribed Facebook Page "${chosen.name}" to webhooks.`);
+      } catch (subErr) {
+        this.logger.warn(`Could not subscribe Facebook Page to webhooks: ${subErr}`);
+      }
+
+      // If linked to an Instagram Business account, subscribe it to comment & message webhooks as well
+      if (chosen.instagram_business_account?.id) {
+        try {
+          const igSub = new URLSearchParams({
+            subscribed_fields: 'comments,live_comments,messages,messaging_postbacks',
+            access_token: chosen.access_token,
+          });
+          await fetch(`${FB_API}/${chosen.instagram_business_account.id}/subscribed_apps?${igSub}`, { method: 'POST' });
+          this.logger.log(`Subscribed Instagram Business Account ${chosen.instagram_business_account.id} to webhooks.`);
+        } catch (igSubErr) {
+          this.logger.warn(`Could not subscribe Instagram Business Account to webhooks: ${igSubErr}`);
+        }
+      }
+
       // Dynamically auto-connect Instagram connection using Page access token if not already connected
       try {
         await this.connection.connect(chosen.access_token);
