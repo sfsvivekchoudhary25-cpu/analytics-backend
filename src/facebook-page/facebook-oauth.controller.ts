@@ -67,13 +67,15 @@ export class FacebookOauthController {
       state,
     });
 
-    const useConfig = req?.query?.use_config === 'true' || req?.query?.use_config === '1';
-    if (useConfig && configId) {
+    // If a Facebook Login for Business configuration exists, prefer config_id (required by Meta for Business Apps)
+    // unless the caller specifically asks for raw scopes with use_scope=1
+    const preferScope = req?.query?.use_scope === 'true' || req?.query?.use_scope === '1';
+    if (configId && !preferScope) {
       params.append('config_id', configId);
     } else {
       params.append(
         'scope',
-        'pages_show_list,pages_read_engagement,pages_manage_metadata,pages_manage_posts,instagram_basic,instagram_manage_comments,instagram_manage_messages,instagram_manage_insights,instagram_content_publish,business_management,public_profile',
+        'pages_show_list,pages_read_engagement,pages_manage_metadata,instagram_basic,instagram_manage_comments,instagram_manage_messages,public_profile',
       );
     }
 
