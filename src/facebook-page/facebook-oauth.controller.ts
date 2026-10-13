@@ -52,7 +52,7 @@ export class FacebookOauthController {
       { expiresIn: '15m' },
     );
     const appId = process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '';
-    const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID ?? '921623610716684';
+    const configId = process.env.FACEBOOK_LOGIN_CONFIG_ID || '';
 
     const params = new URLSearchParams({
       client_id: appId,
@@ -61,10 +61,9 @@ export class FacebookOauthController {
       state,
     });
 
-    // If a Facebook Login for Business configuration exists, prefer config_id (required by Meta for Business Apps)
-    // unless the caller specifically asks for raw scopes with use_scope=1
-    const preferScope = req?.query?.use_scope === 'true' || req?.query?.use_scope === '1';
-    if (configId && !preferScope) {
+    // Use standard scopes by default. Only use config_id if caller explicitly passes use_config=1
+    const useConfig = req?.query?.use_config === 'true' || req?.query?.use_config === '1';
+    if (useConfig && configId) {
       params.append('config_id', configId);
       params.append('override_default_response_type', 'true');
     } else {
