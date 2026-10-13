@@ -66,6 +66,7 @@ export class FacebookOauthController {
     const preferScope = req?.query?.use_scope === 'true' || req?.query?.use_scope === '1';
     if (configId && !preferScope) {
       params.append('config_id', configId);
+      params.append('override_default_response_type', 'true');
     } else {
       params.append(
         'scope',
