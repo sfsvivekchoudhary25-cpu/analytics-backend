@@ -4,11 +4,14 @@ import {
   Get,
   Post,
   UploadedFile,
+  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { AuthGuard } from '../auth/auth.guard';
 import { CloudinaryService, CloudinaryHealth } from './cloudinary.service';
 
+@UseGuards(AuthGuard)
 @Controller('integrations/cloudinary')
 export class CloudinaryController {
   constructor(private readonly cloudinaryService: CloudinaryService) {}

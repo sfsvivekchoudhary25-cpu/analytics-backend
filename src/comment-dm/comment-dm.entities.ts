@@ -1,6 +1,6 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
-export type DmLogStatus = 'sent' | 'failed' | 'invited' | 'follow_gate' | 'follow_verified';
+export type DmLogStatus = 'sent' | 'failed' | 'invited' | 'follow_gate' | 'follow_verified' | 'processing' | 'canceled';
 
 export const DEFAULT_FOLLOW_GATE_TEXT =
   "Oh no! It seems you're not following me 👀\nVisit my profile and hit that follow button 😁.\nOnce you do, I'll send you what you asked for!";

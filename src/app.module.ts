@@ -25,16 +25,46 @@ import { User } from './auth/user.entity';
 import { CloudinaryModule } from './cloudinary/cloudinary.module';
 import { AiModule } from './ai/ai.module';
 import { HashtagsModule } from './hashtags/hashtags.module';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+import { AuditModule } from './common/audit/audit.module';
+import { AuditLog } from './common/audit/audit-log.entity';
+import { RlsModule } from './common/rls/rls.module';
 
 @Module({
   imports: [
     ScheduleModule.forRoot(),
+    RlsModule,
+    ThrottlerModule.forRoot([
+      {
+        ttl: 60000, // 60 seconds
+        limit: 120, // 120 requests per minute baseline
+      },
+    ]),
     TypeOrmModule.forRoot({
       type: 'postgres',
       url: process.env.DATABASE_URL,
-      entities: [User, InstagramConnection, Submission, Conversation, Message, Story, Comment, AutoReplySetting, AutoReplyRule, MessageAutoSetting, MessageAutoRule, MessageAutoLog, CommentDmRule, CommentDmLog, FacebookPageConnection],
+      entities: [
+        User,
+        InstagramConnection,
+        Submission,
+        Conversation,
+        Message,
+        Story,
+        Comment,
+        AutoReplySetting,
+        AutoReplyRule,
+        MessageAutoSetting,
+        MessageAutoRule,
+        MessageAutoLog,
+        CommentDmRule,
+        CommentDmLog,
+        FacebookPageConnection,
+        AuditLog,
+      ],
       synchronize: true, // MVP only: switch to migrations before production
     }),
+    AuditModule,
     CloudinaryModule,
     AuthModule,
     AiModule,
@@ -49,6 +79,12 @@ import { HashtagsModule } from './hashtags/hashtags.module';
     DashboardModule,
     FacebookPageModule,
     HashtagsModule,
+  ],
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
   ],
 })
 export class AppModule {}

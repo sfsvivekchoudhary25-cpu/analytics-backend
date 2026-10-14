@@ -46,6 +46,8 @@ export class CommentDmService {
   }
 
   private async getOwnOrThrow(id: string, ownerUsername?: string): Promise<CommentDmRule> {
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!id || !UUID_REGEX.test(id)) throw new NotFoundException('Automation not found.');
     const own = await this.resolveOwner(ownerUsername);
     if (!own) throw new NotFoundException('Automation not found.');
     const rule = await this.rules
@@ -603,55 +605,97 @@ export class CommentDmService {
     this.logger.log(`[comment-dm] pending rows waiting for action: ${anyPending}`);
     if (!anyPending) return;
 
-    for (const { ev } of events) {
+    // Follow-gate entries older than 7 days are considered expired to prevent stale activations on unrelated DMs
+    const MAX_FOLLOW_GATE_AGE_MS = 7 * 24 * 3600_000;
+    const gateCutoff = new Date(Date.now() - MAX_FOLLOW_GATE_AGE_MS);
+
+    for (const { ownId, ev } of events) {
       const senderId: string | undefined = ev.sender?.id;
-      this.logger.log(`[comment-dm] event: senderId=${senderId} is_echo=${!!ev.message?.is_echo} hasReferral=${!!(ev.referral ?? ev.message?.referral ?? ev.postback?.referral)}`);
+      this.logger.log(`[comment-dm] event: senderId=${senderId} ownId=${ownId} is_echo=${!!ev.message?.is_echo} hasReferral=${!!(ev.referral ?? ev.message?.referral ?? ev.postback?.referral)}`);
       if (!senderId || ev.message?.is_echo) {
         this.logger.log('[comment-dm] skipped: no senderId or is_echo');
         continue;
       }
 
+      // Resolve creator account for this webhook event to preserve multi-tenant scoping
+      let eventOwner: string | undefined = undefined;
+      if (ownId) {
+        const conn = await this.connection.getConnectionByIgUserId(ownId).catch(() => null);
+        if (conn?.username) eventOwner = conn.username.toLowerCase();
+      }
+
       // ── Case 1: Follow-gate pending — any message from this IGSID triggers a re-check ──
+      const followGateWhere: any = {
+        igsid: senderId,
+        pendingFollowGate: true,
+        createdAt: MoreThan(gateCutoff),
+      };
+      if (eventOwner) {
+        followGateWhere.ownerUsername = eventOwner;
+      }
+
       const followGateLog = await this.logs.findOne({
-        where: { igsid: senderId, pendingFollowGate: true },
+        where: followGateWhere,
         order: { followGateSentAt: 'DESC' },
       });
+
       if (followGateLog) {
         const rule = await this.rules.findOne({ where: { id: followGateLog.ruleId } });
+        if (!rule || !rule.enabled) {
+          this.logger.log(`[follow-gate webhook] Rule ${followGateLog.ruleId} is deleted or disabled. Canceling pending follow gate for @${followGateLog.username}.`);
+          await this.logs.update(followGateLog.id, {
+            pendingFollowGate: false,
+            status: 'canceled',
+            note: 'Automation rule was disabled or deleted before follow confirmation',
+          });
+          continue;
+        }
+
         const isFollowing = await this.checkIsFollowing(senderId);
         this.logger.log(`[follow-gate webhook] @${followGateLog.username} messaged in — is_following=${isFollowing}`);
 
         const postbackTitle = String(ev.postback?.title ?? '').toLowerCase();
-        const msgText = String(ev.message?.text ?? '').toLowerCase();
+        const postbackPayload = String(ev.postback?.payload ?? '');
+        const quickReplyPayload = String(ev.message?.quick_reply?.payload ?? '');
+        const msgText = String(ev.message?.text ?? '').trim().toLowerCase();
+
+        // Exact & word-boundary confirmation matching (prevents false positives from words like 'yesterday' or 'not following')
         const isExplicitConfirmation =
-          ev.postback?.payload === 'CONFIRM_FOLLOW' ||
-          postbackTitle.includes('follow') ||
-          postbackTitle.includes('confirm') ||
-          ev.message?.quick_reply?.payload === 'CONFIRM_FOLLOW' ||
-          msgText.includes('follow') ||
-          msgText.includes('confirm') ||
-          msgText.includes('done') ||
-          msgText.includes('yes');
+          postbackPayload === 'CONFIRM_FOLLOW' ||
+          quickReplyPayload === 'CONFIRM_FOLLOW' ||
+          postbackTitle === "i'm following ✅" ||
+          postbackTitle === 'confirm follow' ||
+          /\b(i'?m following|following|followed|confirm follow)\b/i.test(msgText) ||
+          /^(yes|done|confirm|followed|following)$/i.test(msgText);
 
         // Verified if Meta confirms (true), OR if API is blocked by Meta (#200 dev mode: isFollowing === null)
-        // and the user explicitly tapped "I'm following ✅" or confirmed.
+        // and the user explicitly confirmed.
         const confirmed = isFollowing === true || (isFollowing === null && isExplicitConfirmation);
 
         if (confirmed) {
-          const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule ?? ({} as any), followGateLog.username || 'there');
+          // Concurrency protection: Atomically claim this log row so concurrent webhooks or background crons don't double-send
+          const claim = await this.logs.update(
+            { id: followGateLog.id, pendingFollowGate: true },
+            { pendingFollowGate: false, status: 'processing' },
+          );
+          if (!claim.affected) {
+            this.logger.log(`[follow-gate webhook] Log ${followGateLog.id} already claimed by another worker, skipping duplicate send`);
+            continue;
+          }
+
+          const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, followGateLog.username || 'there');
           try {
-            await this.messaging.send(senderId, dmText, 'system', dmButtons, dmCard);
-            await this.logs.update(
-              { igsid: senderId, pendingFollowGate: true },
-              {
-                status: 'follow_verified',
-                pendingFollowGate: false,
-                dmSentAt: new Date(),
-                note: isFollowing === true ? 'follow_gate: user confirmed follow, DM sent' : 'follow_gate: user confirmed (dev fallback), DM sent',
-              },
-            );
+            await this.messaging.send(senderId, dmText, 'system', dmButtons, dmCard, followGateLog.ownerUsername ?? undefined);
+            await this.logs.update(followGateLog.id, {
+              status: 'follow_verified',
+              pendingFollowGate: false,
+              dmSentAt: new Date(),
+              note: isFollowing === true ? 'follow_gate: user confirmed follow, DM sent' : 'follow_gate: user confirmed (dev fallback), DM sent',
+            });
             this.logger.log(`[follow-gate webhook] DM sent to @${followGateLog.username} after follow confirmed`);
           } catch (err) {
+            // Revert state if dispatch failed so it can be retried
+            await this.logs.update(followGateLog.id, { pendingFollowGate: true, status: 'invited' });
             this.logger.warn(`[follow-gate webhook] DM send failed for @${followGateLog.username}: ${(err as Error).message}`);
           }
         } else {
@@ -660,7 +704,7 @@ export class CommentDmService {
           if (isExplicitConfirmation && lastGateMs > 45 * 1000) {
             let profileUrl = 'https://www.instagram.com/';
             try {
-              const status = await this.connection.getStatus();
+              const status = await this.connection.getStatus(followGateLog.ownerUsername ?? undefined);
               if (status.username) profileUrl = `https://www.instagram.com/${status.username}/`;
             } catch {}
 
@@ -671,11 +715,8 @@ export class CommentDmService {
 
             const reminderText = `You're not following us yet 👀! Tap "Visit Profile" below to hit Follow, then tap "I'm following ✅" again.`;
             try {
-              await this.messaging.send(senderId, reminderText, 'system', reminderButtons);
-              await this.logs.update(
-                { igsid: senderId, pendingFollowGate: true },
-                { followGateSentAt: new Date() },
-              );
+              await this.messaging.send(senderId, reminderText, 'system', reminderButtons, undefined, followGateLog.ownerUsername ?? undefined);
+              await this.logs.update(followGateLog.id, { followGateSentAt: new Date() });
               this.logger.log(`[follow-gate webhook] Reminder sent with buttons to @${followGateLog.username} — still not following`);
             } catch (err) {
               this.logger.warn(`[follow-gate webhook] Reminder send failed: ${(err as Error).message}`);
@@ -690,17 +731,21 @@ export class CommentDmService {
       // ── Case 2: Legacy "invited" flow (old ig.me link workaround) ──
       const ref: string | undefined = ev.referral?.ref ?? ev.message?.referral?.ref ?? ev.postback?.referral?.ref;
 
-      let log = ref ? await this.logs.findOne({ where: { ref, dmSentAt: IsNull() } }) : null;
+      const refWhere: any = { ref, dmSentAt: IsNull() };
+      if (eventOwner) refWhere.ownerUsername = eventOwner;
+      let log = ref ? await this.logs.findOne({ where: refWhere }) : null;
       let matchedBy = 'ref';
       if (!log) {
-        const profile = await this.graph.get(`/${senderId}`, { fields: 'username' }).catch((err) => {
+        const profile = await this.graph.get(`/${senderId}`, { fields: 'username' }, { account: eventOwner }).catch((err) => {
           this.logger.warn(`[comment-dm] username lookup for ${senderId} failed: ${(err as Error).message}`);
           return null;
         });
         const username = String(profile?.username ?? '').toLowerCase();
         this.logger.log(`[comment-dm] no ref match; looked up username="${username}" for sender ${senderId}`);
         if (!username) continue;
-        log = await this.logs.findOne({ where: { username, dmSentAt: IsNull(), status: 'invited' }, order: { createdAt: 'DESC' } });
+        const userWhere: any = { username, dmSentAt: IsNull(), status: 'invited' };
+        if (eventOwner) userWhere.ownerUsername = eventOwner;
+        log = await this.logs.findOne({ where: userWhere, order: { createdAt: 'DESC' } });
         matchedBy = 'username';
       }
       if (!log) {
@@ -709,12 +754,23 @@ export class CommentDmService {
       }
 
       const rule = await this.rules.findOne({ where: { id: log.ruleId } });
-      const text = (rule?.dmText ?? 'Thanks!').replaceAll('{username}', log.username || 'there');
+      if (!rule || !rule.enabled) {
+        this.logger.log(`[comment-dm] Rule ${log.ruleId} deleted or disabled, skipping invited DM dispatch`);
+        await this.logs.update(log.id, { status: 'canceled', note: 'Rule deleted or disabled before message arrival' });
+        continue;
+      }
+
+      // Claim row before sending
+      const claim = await this.logs.update({ id: log.id, status: 'invited', dmSentAt: IsNull() }, { status: 'processing' });
+      if (!claim.affected) continue;
+
+      const text = (rule.dmText || 'Thanks!').replaceAll('{username}', log.username || 'there');
       try {
-        await this.messaging.send(senderId, text, 'system');
-        await this.logs.update(log.id, { igsid: senderId, dmSentAt: new Date() });
+        await this.messaging.send(senderId, text, 'system', undefined, undefined, log.ownerUsername ?? undefined);
+        await this.logs.update(log.id, { igsid: senderId, dmSentAt: new Date(), status: 'sent', note: `sent_via_${matchedBy}` });
         this.logger.log(`DM SENT to @${log.username || senderId} after they messaged in (matched by ${matchedBy}): "${preview(text)}"`);
       } catch (err) {
+        await this.logs.update(log.id, { status: 'invited' });
         this.logger.warn(`DM send failed for @${log.username || senderId}: ${(err as Error).message}`);
       }
     }
@@ -724,8 +780,12 @@ export class CommentDmService {
   // If the customer sent an inbound DM (like tapping "I'm following ✅") or if they followed us on Instagram,
   // this re-checks follow status via Meta Graph API and delivers either the real DM or the follow reminder.
   async processPendingFollowGates() {
+    // Only check pending logs within 7 days
+    const MAX_AGE = 7 * 24 * 3600_000;
+    const cutoff = new Date(Date.now() - MAX_AGE);
+
     const pendingLogs = await this.logs.find({
-      where: { pendingFollowGate: true },
+      where: { pendingFollowGate: true, createdAt: MoreThan(cutoff) },
       order: { createdAt: 'ASC' },
     });
     if (!pendingLogs.length) return;
@@ -743,7 +803,8 @@ export class CommentDmService {
     }
 
     for (const [igsid, logs] of byIgsid.entries()) {
-      const username = logs[0].username || igsid;
+      const targetLog = logs[0];
+      const username = targetLog.username || igsid;
       const latestGateSentAt = logs.reduce(
         (max, l) => (l.followGateSentAt && l.followGateSentAt > max ? l.followGateSentAt : max),
         new Date(0),
@@ -751,25 +812,22 @@ export class CommentDmService {
 
       // Check the latest message overall in the conversation
       const lastMessage = await this.messages.findOne({
-        where: { igsid },
+        where: targetLog.ownerUsername ? { igsid, ownerUsername: targetLog.ownerUsername } : { igsid },
         order: { createdAt: 'DESC' },
       });
 
       // Check if the customer sent any inbound message
       const lastInbound = await this.messages.findOne({
-        where: { igsid, direction: 'in' },
+        where: targetLog.ownerUsername ? { igsid, direction: 'in', ownerUsername: targetLog.ownerUsername } : { igsid, direction: 'in' },
         order: { createdAt: 'DESC' },
       });
 
       const isWaitingForReply = Boolean(lastMessage?.direction === 'in');
       const newInboundSincePrompt = Boolean(lastInbound && lastInbound.createdAt > latestGateSentAt);
-      const msgText = String(lastInbound?.text ?? '').toLowerCase();
+      const msgText = String(lastInbound?.text ?? '').trim().toLowerCase();
       const explicitText =
-        msgText.includes('following') ||
-        msgText.includes('follow') ||
-        msgText.includes('confirm') ||
-        msgText.includes('done') ||
-        msgText.includes('yes');
+        /\b(i'?m following|following|followed|confirm follow)\b/i.test(msgText) ||
+        /^(yes|done|confirm|followed|following)$/i.test(msgText);
 
       const msSinceLastPrompt = Date.now() - latestGateSentAt.getTime();
 
@@ -783,7 +841,15 @@ export class CommentDmService {
       const isFollowing = await this.checkIsFollowing(igsid);
       this.logger.log(`[follow-gate fallback] @${username} (igsid: ${igsid}) is_following=${isFollowing}`);
 
-      const rule = await this.rules.findOne({ where: { id: logs[0].ruleId } });
+      const rule = await this.rules.findOne({ where: { id: targetLog.ruleId } });
+      if (!rule || !rule.enabled) {
+        await this.logs.update(targetLog.id, {
+          pendingFollowGate: false,
+          status: 'canceled',
+          note: 'Rule disabled or removed before follow confirmation',
+        });
+        continue;
+      }
 
       // Follow is confirmed if:
       // 1. Meta API returns true
@@ -791,32 +857,36 @@ export class CommentDmService {
       const confirmed = isFollowing === true || (isFollowing === null && explicitText && (newInboundSincePrompt || isWaitingForReply));
 
       if (confirmed) {
+        // Atomic claim to prevent double-send race with incoming webhooks
+        const claim = await this.logs.update(
+          { id: targetLog.id, pendingFollowGate: true },
+          { pendingFollowGate: false, status: 'processing' },
+        );
+        if (!claim.affected) continue;
+
         // User confirmed follow! Send real DM
-        const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule ?? ({} as any), username);
+        const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, username);
         try {
-          await this.messaging.send(igsid, dmText, 'system', dmButtons, dmCard);
+          await this.messaging.send(igsid, dmText, 'system', dmButtons, dmCard, targetLog.ownerUsername ?? undefined);
           const now = new Date();
-          await this.logs.update(
-            { igsid, pendingFollowGate: true },
-            {
-              status: 'follow_verified',
-              pendingFollowGate: false,
-              dmSentAt: now,
-              note: isFollowing === true ? 'follow_gate: user confirmed follow, DM sent' : 'follow_gate: user confirmed (dev fallback), DM sent',
-            },
-          );
+          await this.logs.update(targetLog.id, {
+            status: 'follow_verified',
+            pendingFollowGate: false,
+            dmSentAt: now,
+            note: isFollowing === true ? 'follow_gate: user confirmed follow, DM sent' : 'follow_gate: user confirmed (dev fallback), DM sent',
+          });
           this.logger.log(`[follow-gate fallback] DM delivered to @${username} after follow confirmed`);
         } catch (err) {
+          await this.logs.update(targetLog.id, { pendingFollowGate: true, status: 'invited' });
           this.logger.warn(`[follow-gate fallback] DM send failed for @${username}: ${(err as Error).message}`);
         }
       } else {
         // Still not following!
-        // CRITICAL BUG FIX: Only send a reminder if the customer ACTIVELY sent a NEW inbound message since the last prompt!
-        // Passive background checks (when newInboundSincePrompt is false) must NEVER send reminders.
+        // Only send a reminder if the customer ACTIVELY sent a NEW inbound message since the last prompt
         if (newInboundSincePrompt && isWaitingForReply && msSinceLastPrompt > 15_000) {
           let profileUrl = 'https://www.instagram.com/';
           try {
-            const status = await this.connection.getStatus();
+            const status = await this.connection.getStatus(targetLog.ownerUsername ?? undefined);
             if (status.username) profileUrl = `https://www.instagram.com/${status.username}/`;
           } catch {}
 
@@ -827,12 +897,9 @@ export class CommentDmService {
 
           const reminderText = `You're not following us yet 👀! Tap "Visit Profile" below to hit Follow, then tap "I'm following ✅" again.`;
           try {
-            await this.messaging.send(igsid, reminderText, 'system', reminderButtons);
+            await this.messaging.send(igsid, reminderText, 'system', reminderButtons, undefined, targetLog.ownerUsername ?? undefined);
             const now = new Date();
-            await this.logs.update(
-              { igsid, pendingFollowGate: true },
-              { followGateSentAt: now },
-            );
+            await this.logs.update(targetLog.id, { followGateSentAt: now });
             this.logger.log(`[follow-gate fallback] Reminder sent with buttons to @${username} — still not following`);
           } catch (err) {
             this.logger.warn(`[follow-gate fallback] Reminder send failed: ${(err as Error).message}`);

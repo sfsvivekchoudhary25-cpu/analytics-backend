@@ -1,37 +1,40 @@
-import { Body, Controller, Get, Post, Request, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Req, Request, UseGuards } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { AuthGuard } from './auth.guard';
 import { AuthService } from './auth.service';
+import { LoginDto } from './dto/login.dto';
+import { RegisterDto } from './dto/register.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @Post('login')
-  login(@Body() body: { email?: string; password: string }) {
-    return this.authService.login(body);
+  login(@Body() dto: LoginDto, @Req() req: any) {
+    const meta = { ip: req.ip || req.connection?.remoteAddress, userAgent: req.headers['user-agent'] };
+    return this.authService.login(dto, meta);
   }
 
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @Post('register')
-  register(
-    @Body()
-    body: {
-      email: string;
-      name: string;
-      password: string;
-      instagramHandle?: string;
-    },
-  ) {
-    return this.authService.register(body);
+  register(@Body() dto: RegisterDto, @Req() req: any) {
+    const meta = { ip: req.ip || req.connection?.remoteAddress, userAgent: req.headers['user-agent'] };
+    return this.authService.register(dto, meta);
   }
 
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
   @Post('forgot-password')
-  forgotPassword(@Body('email') email: string) {
-    return this.authService.forgotPassword(email);
+  forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.forgotPassword(dto.email);
   }
 
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
   @Post('reset-password')
-  resetPassword(@Body() body: { email: string; code?: string; newPassword: string }) {
-    return this.authService.resetPassword(body);
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto);
   }
 
   @UseGuards(AuthGuard)
