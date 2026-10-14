@@ -5,6 +5,7 @@ import { randomBytes, scrypt, timingSafeEqual } from 'crypto';
 import { promisify } from 'util';
 import { Repository } from 'typeorm';
 import { User } from './user.entity';
+import { AuditService } from '../common/audit/audit.service';
 
 const scryptAsync = promisify(scrypt);
 
@@ -13,6 +14,7 @@ export class AuthService {
   constructor(
     @InjectRepository(User) private readonly userRepo: Repository<User>,
     private readonly jwt: JwtService,
+    private readonly audit: AuditService,
   ) {}
 
   async hashPassword(password: string): Promise<string> {
@@ -34,7 +36,21 @@ export class AuthService {
     }
   }
 
-  async register(dto: { email: string; name: string; password: string; instagramHandle?: string }) {
+  async register(
+    dto: { email: string; name: string; password: string; instagramHandle?: string; botTrap?: string },
+    meta?: { ip?: string; userAgent?: string },
+  ) {
+    if (dto.botTrap) {
+      await this.audit.log({
+        action: 'BOT_TRAP_TRIGGERED',
+        targetResource: 'auth/register',
+        ipAddress: meta?.ip,
+        userAgent: meta?.userAgent,
+        details: { email: dto.email },
+      });
+      throw new BadRequestException('Registration could not be completed.');
+    }
+
     const email = (dto.email || '').trim().toLowerCase();
     const name = (dto.name || '').trim();
     const password = dto.password || '';
@@ -74,6 +90,16 @@ export class AuthService {
       instagramHandle: user.instagramHandle,
     });
 
+    await this.audit.log({
+      actorId: user.id,
+      actorEmail: user.email,
+      action: 'USER_REGISTER_SUCCESS',
+      targetResource: 'auth',
+      targetId: user.id,
+      ipAddress: meta?.ip,
+      userAgent: meta?.userAgent,
+    });
+
     return {
       ok: true,
       token,
@@ -87,16 +113,26 @@ export class AuthService {
     };
   }
 
-  async login(body: { email?: string; password: string }) {
+  async login(
+    body: { email?: string; password: string },
+    meta?: { ip?: string; userAgent?: string },
+  ) {
     const email = (body.email || '').trim().toLowerCase();
     const password = String(body.password || '');
-    const adminPassword = process.env.ADMIN_PASSWORD || 'fdjNiJdowLNR';
+    const adminPassword = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV !== 'production' ? 'fdjNiJdowLNR' : undefined);
 
     if (email) {
       const user = await this.userRepo.findOne({ where: { email } });
       if (user) {
-        const matches = (await this.verifyPassword(password, user.passwordHash)) || password === adminPassword;
+        const matches = (await this.verifyPassword(password, user.passwordHash)) || (adminPassword && password === adminPassword);
         if (!matches) {
+          await this.audit.log({
+            actorEmail: email,
+            action: 'LOGIN_FAILED_INVALID_PASSWORD',
+            targetResource: 'auth/login',
+            ipAddress: meta?.ip,
+            userAgent: meta?.userAgent,
+          });
           throw new UnauthorizedException('Invalid email or password.');
         }
 
@@ -106,6 +142,16 @@ export class AuthService {
           name: user.name,
           role: user.role,
           instagramHandle: user.instagramHandle,
+        });
+
+        await this.audit.log({
+          actorId: user.id,
+          actorEmail: user.email,
+          action: 'LOGIN_SUCCESS',
+          targetResource: 'auth/login',
+          targetId: user.id,
+          ipAddress: meta?.ip,
+          userAgent: meta?.userAgent,
         });
 
         return {
@@ -121,7 +167,7 @@ export class AuthService {
         };
       }
 
-      if (password === adminPassword) {
+      if (adminPassword && password === adminPassword) {
         const hash = await this.hashPassword(password);
         const newUser = await this.userRepo.save(
           this.userRepo.create({
@@ -140,6 +186,13 @@ export class AuthService {
         return { ok: true, token, user: newUser };
       }
 
+      await this.audit.log({
+        actorEmail: email,
+        action: 'LOGIN_FAILED_USER_NOT_FOUND',
+        targetResource: 'auth/login',
+        ipAddress: meta?.ip,
+        userAgent: meta?.userAgent,
+      });
       throw new UnauthorizedException('No account found with this email.');
     }
 

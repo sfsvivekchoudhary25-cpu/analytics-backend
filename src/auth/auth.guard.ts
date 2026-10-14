@@ -17,8 +17,9 @@ export class AuthGuard implements CanActivate {
     const [type, token] = (req.headers.authorization ?? '').split(' ');
     if (type !== 'Bearer' || !token) throw new UnauthorizedException();
 
-    // Allow dev bypass token for local development & testing
-    if (token === 'dev-bypass-token' || token.startsWith('dev-')) {
+    // Allow dev bypass token ONLY in local development / non-production
+    const isDev = process.env.NODE_ENV !== 'production';
+    if (isDev && (token === 'dev-bypass-token' || token.startsWith('dev-'))) {
       let handle = 'sfs.vivekchoudhary25';
       try {
         const connRepo = this.dataSource.getRepository(InstagramConnection);

@@ -1,20 +1,40 @@
 import 'reflect-metadata';
+import './common/rls/rls.patch';
 import * as dotenv from 'dotenv';
 dotenv.config(); // must run before AppModule is imported so decorators see the env
 
 async function bootstrap() {
   const { NestFactory } = await import('@nestjs/core');
-  const { Logger } = await import('@nestjs/common');
+  const { Logger, ValidationPipe } = await import('@nestjs/common');
   const { AppModule } = await import('./app.module');
   const { UPLOAD_DIR } = await import('./submissions/paths');
   const { InstagramConnectionService } = await import('./instagram-connection/instagram-connection.service');
   const { GRAPH } = await import('./instagram-connection/graph-client.service');
   const { FacebookPageService } = await import('./facebook-page/facebook-page.service');
+  const helmet = (await import('helmet')).default;
 
   // rawBody: needed to check webhook signatures
   const app = await NestFactory.create<import('@nestjs/platform-express').NestExpressApplication>(AppModule, {
     rawBody: true,
   });
+
+  // Security Headers via Helmet
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allows /media/ to be fetched cross-origin by Instagram & frontend
+      crossOriginEmbedderPolicy: false,
+    }),
+  );
+
+  // Global Input Validation & Sanitization
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidUnknownValues: false,
+    }),
+  );
+
   // Meta fetches processed photos from here, so this must stay public.
   app.useStaticAssets(UPLOAD_DIR, { prefix: '/media/' });
 
@@ -34,12 +54,21 @@ async function bootstrap() {
     next();
   });
 
-  const origins = [
+  const allowedOrigins = [
     process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000',
     ...(process.env.PUBLIC_SITE_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean),
   ];
   app.enableCors({
-    origin: origins.length > 0 ? origins : true,
+    origin: (requestOrigin, callback) => {
+      if (!requestOrigin) return callback(null, true);
+      const isAllowed =
+        allowedOrigins.includes(requestOrigin) ||
+        (process.env.NODE_ENV !== 'production' && /^http:\/\/localhost(:\d+)?$/.test(requestOrigin));
+      if (isAllowed) {
+        return callback(null, true);
+      }
+      return callback(new Error(`Blocked by CORS: ${requestOrigin}`), false);
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-instagram-account', 'x-requested-with'],
     credentials: true,

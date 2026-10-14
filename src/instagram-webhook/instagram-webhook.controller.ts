@@ -25,8 +25,11 @@ function safeEqual(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
+import { SkipThrottle } from '@nestjs/throttler';
+
 // Public on purpose: Meta calls these, not the admin panel. Both routes
 // authenticate the caller themselves (verify token / payload signature).
+@SkipThrottle()
 @Controller('instagram/webhook')
 export class InstagramWebhookController {
   private readonly logger = new Logger('Webhook');
@@ -50,7 +53,7 @@ export class InstagramWebhookController {
   ) {
     const expected =
       process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN ||
-      'dfed4dff43bfe4c623eaee3cd7aafd9e493448ca3e877a3f';
+      (process.env.NODE_ENV !== 'production' ? 'dfed4dff43bfe4c623eaee3cd7aafd9e493448ca3e877a3f' : '');
     if (mode !== 'subscribe' || !expected || !safeEqual(String(token ?? ''), expected)) {
       this.logger.warn('Verification handshake REJECTED (wrong verify token or mode)');
       throw new ForbiddenException();
