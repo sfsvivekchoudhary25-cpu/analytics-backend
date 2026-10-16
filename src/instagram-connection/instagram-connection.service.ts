@@ -461,7 +461,17 @@ export class InstagramConnectionService implements OnModuleInit {
       if (conn) return conn;
     }
     const [connection] = await this.repo.find({ order: { updatedAt: 'DESC' }, take: 1 });
-    return connection ?? null;
+    if (connection) return connection;
+
+    try {
+      const fallbackConn = await this.repo
+        .createQueryBuilder('c')
+        .orderBy('c.updatedAt', 'DESC')
+        .getOne();
+      if (fallbackConn) return fallbackConn;
+    } catch {}
+
+    return null;
   }
 
   private async getConnectionOrThrow(account?: string): Promise<InstagramConnection> {
