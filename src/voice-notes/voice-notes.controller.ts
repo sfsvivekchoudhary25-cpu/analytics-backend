@@ -29,6 +29,20 @@ export class VoiceNotesController {
     return this.service.previewCleanup(body.rawTranscript, body.languageCode);
   }
 
+  // Ultra-fast audio transcription using Groq Whisper
+  @Post('transcribe-audio')
+  @UseInterceptors(FileInterceptor('audio', { limits: { fileSize: 25 * 1024 * 1024 } }))
+  async transcribeAudio(
+    @UploadedFile() file: AudioUploadFile | undefined,
+    @Body('languageCode') languageCode?: string,
+  ) {
+    if (!file || !file.buffer) {
+      return { text: '' };
+    }
+    const text = await this.service.transcribeAudioWithGroq(file.buffer, file.mimetype, languageCode);
+    return { text };
+  }
+
   // Create voice note with optional audio file and raw transcript
   @Post()
   @UseInterceptors(FileInterceptor('audio', { limits: { fileSize: 25 * 1024 * 1024 } }))
