@@ -56,10 +56,78 @@ export class VoiceNotesService {
     return this.aiService.cleanVoiceNote(rawTranscript, languageCode);
   }
 
+  // Transcribe audio using Groq Whisper (blazing fast STT)
+  async transcribeAudioWithGroq(
+    buffer: Buffer,
+    mimetype: string,
+    languageCode?: string,
+  ): Promise<string> {
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+      this.logger.warn('GROQ_API_KEY is not configured; skipping Whisper audio transcription.');
+      return '';
+    }
+
+    try {
+      const model = process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo';
+      const ext = mimetype.includes('mp4')
+        ? 'mp4'
+        : mimetype.includes('ogg')
+        ? 'ogg'
+        : mimetype.includes('wav')
+        ? 'wav'
+        : mimetype.includes('m4a')
+        ? 'm4a'
+        : mimetype.includes('mp3')
+        ? 'mp3'
+        : 'webm';
+
+      const blob = new Blob([new Uint8Array(buffer)], { type: mimetype || 'audio/webm' });
+      const formData = new FormData();
+      formData.append('file', blob, `audio.${ext}`);
+      formData.append('model', model);
+      formData.append('response_format', 'json');
+
+      if (languageCode) {
+        const shortLang = languageCode.split('-')[0].toLowerCase();
+        formData.append('language', shortLang);
+      }
+
+      const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        this.logger.warn(`Groq Whisper transcription API returned ${res.status}: ${errorText}`);
+        return '';
+      }
+
+      const json = (await res.json()) as { text?: string };
+      return (json.text || '').trim();
+    } catch (err) {
+      this.logger.error(`Groq Whisper audio transcription failed: ${(err as Error).message}`);
+      return '';
+    }
+  }
+
   // Create & persist voice note
   async create(dto: CreateVoiceNoteDto, file?: AudioUploadFile, ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    const raw = (dto.rawTranscript || '').trim();
+    let raw = (dto.rawTranscript || '').trim();
+
+    // If raw transcript is empty but an audio file was provided, automatically transcribe with Groq Whisper
+    if (!raw && file && file.buffer) {
+      const whisperText = await this.transcribeAudioWithGroq(file.buffer, file.mimetype, dto.languageCode);
+      if (whisperText) {
+        raw = whisperText;
+        dto.rawTranscript = whisperText;
+      }
+    }
 
     if (!raw && !file) {
       throw new BadRequestException('Either voice transcript or audio recording is required.');
