@@ -41,7 +41,7 @@ export class AuthController {
   @Get('me')
   me(@Request() req: any) {
     const userId = req.user?.sub || req.user?.id;
-    if (userId && userId !== 'dev-admin') {
+    if (userId) {
       return this.authService.getProfile(userId);
     }
     return { ok: true, user: req.user };

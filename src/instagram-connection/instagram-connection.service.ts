@@ -483,7 +483,7 @@ export class InstagramConnectionService implements OnModuleInit {
   }
 
   async linkUserInstagramHandle(userId?: string, username?: string) {
-    if (!userId || userId === 'dev-admin' || !username) return;
+    if (!userId || !username) return;
     try {
       await this.repo.manager.getRepository('User').update(
         { id: userId },
