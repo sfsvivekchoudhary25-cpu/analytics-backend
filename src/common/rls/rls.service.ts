@@ -68,10 +68,13 @@ export class RlsService implements OnModuleInit {
         TO PUBLIC
         USING (
           current_setting('app.bypass_rls', true) = 'on'
+          OR current_setting('app.current_user_role', true) = 'admin'
           OR LOWER("username") = LOWER(NULLIF(current_setting('app.current_tenant', true), ''))
+          OR (NULLIF(current_setting('app.current_tenant', true), '') IS NULL)
         )
         WITH CHECK (
           current_setting('app.bypass_rls', true) = 'on'
+          OR current_setting('app.current_user_role', true) = 'admin'
           OR LOWER("username") = LOWER(NULLIF(current_setting('app.current_tenant', true), ''))
         );
       `).catch(() => {});

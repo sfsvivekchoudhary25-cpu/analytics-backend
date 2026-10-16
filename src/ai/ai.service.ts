@@ -693,5 +693,145 @@ export class AiService {
       explanation: 'Sticker polls trigger high early story-swipe completion, which Meta correlates with the original post and pushes into the Explore feed.'
     };
   }
+
+  // --- AI Voice Note Structuring & Cleanup Engine ---
+  async cleanVoiceNote(rawTranscript: string, language = 'en-US'): Promise<{
+    title: string;
+    cleanedText: string;
+    category: 'idea' | 'todo' | 'reminder' | 'instagram_caption' | 'client_note' | 'journal';
+    tags: string[];
+    actionItems: { id: string; text: string; completed: boolean; dueDate?: string | null }[];
+    model: string;
+  }> {
+    const trimmed = rawTranscript.trim();
+    if (!trimmed) {
+      return {
+        title: 'Empty Voice Note',
+        cleanedText: '',
+        category: 'idea',
+        tags: ['voice-note'],
+        actionItems: [],
+        model: 'fallback',
+      };
+    }
+
+    if (this.available) {
+      try {
+        const res = await this.complete(
+          [
+            {
+              role: 'system',
+              content: `You are an executive audio intelligence assistant. Your task is to process a raw, spoken voice transcription and output a clean, organized, actionable note.
+
+STRICT RULES:
+1. Punctuate, capitalize, and remove verbal fillers ("umm", "uh", "like", "you know", "I mean", "basically", repeated words).
+2. Retain 100% of the speaker's original meaning and facts. NEVER invent or assume facts not explicitly mentioned.
+3. If the user mentions action items, deadlines, or to-dos, extract them explicitly into the actionItems array.
+4. Output MUST be valid JSON adhering strictly to this schema:
+{
+  "title": "Concise 3 to 6-word title summarizing the core topic",
+  "category": "idea" | "todo" | "reminder" | "instagram_caption" | "client_note" | "journal",
+  "cleanedText": "Polished, well-formatted markdown text with logical paragraph breaks",
+  "tags": ["relevant", "topic", "tags"],
+  "actionItems": [
+    {
+      "text": "Specific actionable task",
+      "dueDate": "ISO date string or null if not specified"
+    }
+  ]
+}`,
+            },
+            {
+              role: 'user',
+              content: `Language: ${language}\n\nSpoken Voice Transcription:\n"${trimmed}"\n\nReturn valid JSON only.`,
+            },
+          ],
+          [],
+          10000,
+        );
+
+        const jsonMatch = res.content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          const actionItems = Array.isArray(parsed.actionItems)
+            ? parsed.actionItems
+                .map((item: any, idx: number) => ({
+                  id: `task-${Date.now()}-${idx}`,
+                  text: typeof item === 'string' ? item : item.text || '',
+                  completed: false,
+                  dueDate: item.dueDate || null,
+                }))
+                .filter((i: any) => i.text.trim())
+            : [];
+
+          return {
+            title: String(parsed.title || trimmed.slice(0, 30)),
+            cleanedText: String(parsed.cleanedText || trimmed),
+            category: ['idea', 'todo', 'reminder', 'instagram_caption', 'client_note', 'journal'].includes(parsed.category)
+              ? parsed.category
+              : 'idea',
+            tags: Array.isArray(parsed.tags) ? parsed.tags.map((t: any) => String(t).toLowerCase().trim()).filter(Boolean) : ['voice-note'],
+            actionItems,
+            model: res.model,
+          };
+        }
+      } catch (err) {
+        this.logger.warn(`AI Voice Note cleaning failed: ${(err as Error).message}. Using heuristic fallback.`);
+      }
+    }
+
+    // Heuristic Fallback Engine
+    return this.heuristicCleanVoiceNote(trimmed);
+  }
+
+  private heuristicCleanVoiceNote(trimmed: string) {
+    // 1. Remove common spoken filler words
+    const cleaned = trimmed
+      .replace(/\b(umm|um|uh|uhh|er|like|you know|i mean|basically|literally|sort of|kind of)\b\s*/gi, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    // 2. Generate a clean title
+    const words = cleaned.split(/\s+/);
+    const title = words.slice(0, 5).join(' ') + (words.length > 5 ? '…' : '');
+
+    // 3. Detect action items
+    const sentences = cleaned.split(/[.!?]+/).map((s) => s.trim()).filter(Boolean);
+    const actionItems: { id: string; text: string; completed: boolean }[] = [];
+    const actionRegex = /^(need to|have to|must|remember to|call|email|message|send|check|buy|create|review|schedule|fix)\b/i;
+
+    sentences.forEach((s, idx) => {
+      if (actionRegex.test(s)) {
+        actionItems.push({
+          id: `task-${Date.now()}-${idx}`,
+          text: s,
+          completed: false,
+        });
+      }
+    });
+
+    // 4. Infer category
+    let category: 'idea' | 'todo' | 'reminder' | 'instagram_caption' | 'client_note' | 'journal' = 'idea';
+    const lower = cleaned.toLowerCase();
+    if (actionItems.length > 0 || /\b(todo|to do|task|tasks|deadline)\b/i.test(lower)) {
+      category = 'todo';
+    } else if (/\b(caption|instagram|post|reel|story|hashtag|bio)\b/i.test(lower)) {
+      category = 'instagram_caption';
+    } else if (/\b(client|customer|supplier|buyer|lead|invoice|order)\b/i.test(lower)) {
+      category = 'client_note';
+    } else if (/\b(remind|reminder|tomorrow|next week|at \d+)\b/i.test(lower)) {
+      category = 'reminder';
+    }
+
+    return {
+      title: title ? title.charAt(0).toUpperCase() + title.slice(1) : 'Voice Note',
+      cleanedText: cleaned.charAt(0).toUpperCase() + cleaned.slice(1),
+      category,
+      tags: ['voice-note', category],
+      actionItems,
+      model: 'Heuristic Audio Engine',
+    };
+  }
 }
+
 

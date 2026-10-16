@@ -30,6 +30,8 @@ import { APP_GUARD } from '@nestjs/core';
 import { AuditModule } from './common/audit/audit.module';
 import { AuditLog } from './common/audit/audit-log.entity';
 import { RlsModule } from './common/rls/rls.module';
+import { VoiceNotesModule } from './voice-notes/voice-notes.module';
+import { VoiceNote } from './voice-notes/voice-note.entity';
 
 @Module({
   imports: [
@@ -61,6 +63,7 @@ import { RlsModule } from './common/rls/rls.module';
         CommentDmLog,
         FacebookPageConnection,
         AuditLog,
+        VoiceNote,
       ],
       synchronize: true, // MVP only: switch to migrations before production
     }),
@@ -79,6 +82,7 @@ import { RlsModule } from './common/rls/rls.module';
     DashboardModule,
     FacebookPageModule,
     HashtagsModule,
+    VoiceNotesModule,
   ],
   providers: [
     {
