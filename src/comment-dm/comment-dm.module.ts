@@ -8,10 +8,20 @@ import { FacebookPageModule } from '../facebook-page/facebook-page.module';
 import { CommentDmController } from './comment-dm.controller';
 import { CommentDmLog, CommentDmRule } from './comment-dm.entities';
 import { CommentDmService } from './comment-dm.service';
+import { Submission } from '../submissions/submission.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([CommentDmRule, CommentDmLog, Comment, Message, Conversation, AutoReplyRule, AutoReplySetting]),
+    TypeOrmModule.forFeature([
+      CommentDmRule,
+      CommentDmLog,
+      Comment,
+      Message,
+      Conversation,
+      AutoReplyRule,
+      AutoReplySetting,
+      Submission,
+    ]),
     InstagramConnectionModule,
     MessagingModule,
     FacebookPageModule,
