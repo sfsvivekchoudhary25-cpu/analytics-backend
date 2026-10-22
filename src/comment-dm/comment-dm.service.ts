@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, MoreThan, Not, Repository } from 'typeorm';
+import { Between, ILike, IsNull, MoreThan, Not, Repository } from 'typeorm';
 import { GraphClient } from '../instagram-connection/graph-client.service';
 import { FacebookPageService, MessageButton } from '../facebook-page/facebook-page.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
@@ -11,6 +11,7 @@ import { Conversation, Message } from '../messaging/messaging.entities';
 import { MessagingService } from '../messaging/messaging.service';
 import { CommentDmLog, CommentDmRule, DEFAULT_FOLLOW_GATE_TEXT } from './comment-dm.entities';
 import { AutoReplyRule, AutoReplySetting } from '../comments/comment.entities';
+import { Submission } from '../submissions/submission.entity';
 
 const preview = (t: string, n = 80) => {
   const s = String(t ?? '').replace(/\s+/g, ' ').trim();
@@ -30,6 +31,7 @@ export class CommentDmService {
     @InjectRepository(Conversation) private readonly conversations: Repository<Conversation>,
     @InjectRepository(AutoReplyRule) private readonly autoRules: Repository<AutoReplyRule>,
     @InjectRepository(AutoReplySetting) private readonly autoSettings: Repository<AutoReplySetting>,
+    @InjectRepository(Submission) private readonly submissions: Repository<Submission>,
     private readonly graph: GraphClient,
     private readonly messaging: MessagingService,
     private readonly facebookPage: FacebookPageService,
@@ -937,6 +939,89 @@ export class CommentDmService {
     }
     await this.processPendingFollowGates().catch((err) => this.logger.error(`Follow gate processing failed: ${(err as Error).message}`));
     await this.reconcile().catch((err) => this.logger.warn(`Reconcile failed: ${(err as Error).message}`));
+  }
+
+  /**
+   * 20-Hour Lead Recovery Cron:
+   * Runs every 15 minutes.
+   * Finds automated DMs sent 18–22.5 hours ago that haven't received a reply or converted.
+   * Sends a friendly follow-up before Meta's 24-hour messaging window expires.
+   */
+  @Cron('*/15 * * * *')
+  async recoverExpiringLeads() {
+    const now = Date.now();
+    // Meta messaging window is 24 hours. We target leads between 18 hours and 22.5 hours ago.
+    const windowStart = new Date(now - 22.5 * 3600_000);
+    const windowEnd = new Date(now - 18 * 3600_000);
+
+    const candidates = await this.logs.find({
+      where: {
+        status: 'sent',
+        igsid: Not(IsNull()),
+        repliedAt: IsNull(),
+        dmSentAt: Between(windowStart, windowEnd),
+      },
+      take: 50,
+    });
+
+    if (!candidates.length) return;
+
+    for (const log of candidates) {
+      // 1. Skip if a recovery reminder has already been sent
+      if (log.note && log.note.includes('recovery_reminder_sent')) {
+        continue;
+      }
+
+      // 2. Check if a reply was received in the messages table
+      const reply = await this.messages.findOne({
+        where: { igsid: log.igsid!, direction: 'in', createdAt: MoreThan(log.dmSentAt!) },
+      });
+      if (reply) {
+        await this.logs.update(log.id, { repliedAt: reply.createdAt });
+        continue;
+      }
+
+      // 3. Check if user already converted / submitted an order or photo
+      if (log.username) {
+        const submission = await this.submissions.findOne({
+          where: [
+            { igUsername: ILike(log.username) },
+            ...(log.igsid ? [{ igsid: log.igsid }] : []),
+          ],
+        });
+        if (submission) {
+          const updatedNote = log.note ? `${log.note} | converted` : 'converted';
+          await this.logs.update(log.id, { note: updatedNote });
+          continue;
+        }
+      }
+
+      // 4. Send the 20-hour recovery follow-up message
+      try {
+        const usernameDisplay = log.username ? `@${log.username}` : 'there';
+        const recoveryText = `Hey ${usernameDisplay}! 👋 Just wanted to check in quickly before our chat window closes — did you get a chance to check out what I sent earlier? Let me know if you need any help! ✨`;
+
+        const buttons: MessageButton[] = [
+          { type: 'postback', title: 'Need help 💬', payload: 'RECOVERY_HELP' },
+          { type: 'postback', title: 'Still interested 👍', payload: 'RECOVERY_INTERESTED' },
+        ];
+
+        await this.messaging.send(
+          log.igsid!,
+          recoveryText,
+          'auto',
+          buttons,
+          undefined,
+          log.ownerUsername ?? undefined,
+        );
+
+        const updatedNote = log.note ? `${log.note} | recovery_reminder_sent` : 'recovery_reminder_sent';
+        await this.logs.update(log.id, { note: updatedNote });
+        this.logger.log(`[Lead Recovery] Sent 20-hour recovery reminder to @${log.username || log.igsid}`);
+      } catch (err) {
+        this.logger.warn(`[Lead Recovery] Could not send reminder to @${log.username || log.igsid}: ${(err as Error).message}`);
+      }
+    }
   }
 
   // ---------- performance overview ----------

@@ -32,6 +32,7 @@ import { AuditLog } from './common/audit/audit-log.entity';
 import { RlsModule } from './common/rls/rls.module';
 import { VoiceNotesModule } from './voice-notes/voice-notes.module';
 import { VoiceNote } from './voice-notes/voice-note.entity';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -83,6 +84,7 @@ import { VoiceNote } from './voice-notes/voice-note.entity';
     FacebookPageModule,
     HashtagsModule,
     VoiceNotesModule,
+    HealthModule,
   ],
   providers: [
     {
