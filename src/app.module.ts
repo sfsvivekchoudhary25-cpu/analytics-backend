@@ -33,6 +33,8 @@ import { RlsModule } from './common/rls/rls.module';
 import { VoiceNotesModule } from './voice-notes/voice-notes.module';
 import { VoiceNote } from './voice-notes/voice-note.entity';
 import { HealthModule } from './health/health.module';
+import { SavedReelsModule } from './saved-reels/saved-reels.module';
+import { SavedReel } from './saved-reels/saved-reel.entity';
 
 @Module({
   imports: [
@@ -65,6 +67,7 @@ import { HealthModule } from './health/health.module';
         FacebookPageConnection,
         AuditLog,
         VoiceNote,
+        SavedReel,
       ],
       synchronize: true, // MVP only: switch to migrations before production
     }),
@@ -85,6 +88,7 @@ import { HealthModule } from './health/health.module';
     HashtagsModule,
     VoiceNotesModule,
     HealthModule,
+    SavedReelsModule,
   ],
   providers: [
     {
