@@ -32,8 +32,9 @@ export class AiController {
   }
 
   @Post('diagnose-post')
-  diagnosePost(@Body() body: any) {
-    return this.service.diagnosePost(body);
+  diagnosePost(@Request() req: any, @Body() body: any) {
+    const userId = req.user?.sub || req.user?.id;
+    return this.service.diagnosePost(body, userId);
   }
 
   @Post('optimize-caption')

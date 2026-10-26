@@ -359,13 +359,14 @@ export class AiService {
     delays: number[],
     customTimeoutMs?: number,
     userId?: string,
+    customMaxTokens?: number,
   ): Promise<{ content: string; model: string }> {
     const { key, model } = await this.resolveUserKeyAndModel(userId);
     if (!key) throw new Error('OPENROUTER_API_KEY is not configured.');
     const resumeAt = this.pausedUntilDate;
     if (resumeAt) throw new Error(`AI is paused after repeated failures until ${resumeAt.toLocaleTimeString()}`);
 
-    const timeoutMs = customTimeoutMs ?? Number(process.env.OPENROUTER_TIMEOUT_MS ?? 12000);
+    const timeoutMs = customTimeoutMs ?? Number(process.env.OPENROUTER_TIMEOUT_MS ?? 15000);
     let lastError = 'unknown error';
 
     for (let attempt = 0; attempt <= delays.length; attempt++) {
@@ -382,10 +383,8 @@ export class AiService {
             ...(this.fallbackModels.length ? { models: [model, ...this.fallbackModels] } : { model }),
             messages,
             temperature: 0.3,
-            // Models that "think" first can use their whole budget on hidden reasoning and return nothing.
-            // Ask for little thinking and leave plenty of room for the short answer.
             reasoning: { effort: 'low' },
-            max_tokens: 1200,
+            max_tokens: customMaxTokens ?? 2500,
           }),
           signal: AbortSignal.timeout(timeoutMs),
         });
@@ -395,7 +394,15 @@ export class AiService {
             lastError = `OpenRouter error: ${body.error.message || JSON.stringify(body.error)}`;
             break;
           }
-          const content = body?.choices?.[0]?.message?.content;
+          let content = body?.choices?.[0]?.message?.content;
+          // Fallback: If content is null/empty but the model emitted output inside reasoning
+          if ((!content || typeof content !== 'string' || !content.trim()) && typeof body?.choices?.[0]?.message?.reasoning === 'string') {
+            const rText = body.choices[0].message.reasoning;
+            const rMatch = rText.match(/\{[\s\S]*\}/);
+            if (rMatch) {
+              content = rMatch[0];
+            }
+          }
           if (typeof content === 'string' && content.trim()) {
             this.consecutiveFailures = 0;
             return { content, model: String(body?.model ?? this.model) };
@@ -424,93 +431,124 @@ export class AiService {
     throw new Error(`AI service unavailable: ${lastError.slice(0, 200)}`);
   }
 
-  // --- Post Diagnostic & Growth Copilot ---
+  // --- Post Diagnostic & Growth Copilot (100% Real-Data AI Powered) ---
   async diagnosePost(post: {
     caption?: string;
+    mediaType?: string;
+    postedAt?: string;
     likes?: number;
     commentsCount?: number;
     ageHours?: number;
     reach?: number;
     saved?: number;
     shares?: number;
+    impressions?: number;
+    recentComments?: (string | { text: string; username?: string })[];
     topCommenters?: { username: string; count: number }[];
     keywordMatchRate?: number;
     activeRuleKeywords?: string[];
-  }) {
-    const caption = post.caption || '';
+  }, userId?: string) {
+    const caption = (post.caption || '').trim();
     const likes = post.likes ?? 0;
     const commentsCount = post.commentsCount ?? 0;
-    const ratio = likes > 0 ? commentsCount / likes : commentsCount;
+    const mediaType = post.mediaType || 'POST';
+    const reach = post.reach ?? 0;
+    const saved = post.saved ?? 0;
+    const shares = post.shares ?? 0;
+    const impressions = post.impressions ?? 0;
+    const ratio = likes > 0 ? (commentsCount / likes).toFixed(2) : String(commentsCount);
 
-    // Calculate algorithmic growth score (0-100)
-    let score = 55;
-    if (ratio >= 2.0) score += 20;
-    else if (ratio >= 0.5) score += 10;
-    if ((post.keywordMatchRate ?? 0) >= 90) score += 12;
-    else if ((post.keywordMatchRate ?? 0) >= 50) score += 6;
-    const hasCta = /\b(comment|dm|link|save|share|order|buy|message)\b/i.test(caption);
-    if (hasCta) score += 13;
-    score = Math.min(96, Math.max(48, score));
+    // Format recent real comments for the AI prompt
+    const commentsList: string[] = (post.recentComments || []).map((c) => {
+      if (typeof c === 'string') return c.trim();
+      return (c.username ? `@${c.username}: ` : '') + (c.text || '').trim();
+    }).filter(Boolean).slice(0, 30);
 
-    if (this.available) {
-      try {
-        const res = await this.complete([
-          {
-            role: 'system',
-            content: 'You are an Instagram Growth & Engagement AI Copilot. Return valid JSON only with keys: headline, summary, actionItems (array of {title, description, priority: "high"|"medium"}), viralLevers (array of {label, status: "strong"|"opportunity", detail}). Plain text strings with NO markdown formatting inside the JSON values.'
-          },
-          {
-            role: 'user',
-            content: `Analyze this post: Caption: "${caption}". Likes: ${likes}, Comments: ${commentsCount}, Comments-to-Likes ratio: ${ratio.toFixed(1)}x, Top commenters: ${JSON.stringify(post.topCommenters || [])}, Rule keywords: "${(post.activeRuleKeywords || []).join(', ')}", Keyword match rate: ${post.keywordMatchRate ?? 0}%.`
-          }
-        ], [], 7000);
-        const jsonMatch = res.content.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          return { score, model: res.model, ...parsed };
-        }
-      } catch {
-        // Fall back to expert heuristic engine
-      }
+    const activeKeywords = (post.activeRuleKeywords || []).map((k) => k.trim()).filter(Boolean);
+    const topFans = (post.topCommenters || []).map((f) => `@${f.username} (${f.count} comments)`).join(', ');
+
+    if (!this.available) {
+      throw new Error('AI Engine is not configured. Please add an OpenRouter API key in settings.');
     }
 
-    const topFan = post.topCommenters?.[0]?.username;
-    const topFanCount = post.topCommenters?.[0]?.count ?? 0;
-    const actionItems = [];
-    if (!hasCta) {
-      actionItems.push({
-        title: 'Deploy Pinned Creator CTA',
-        description: 'Post a pinned comment like "Comment LINK for details 👇" to convert passive lurkers into inbound DM leads.',
-        priority: 'high'
-      });
+    const systemPrompt = `You are an elite Instagram Growth, Viral Content & Conversion AI Copilot.
+You specialize in analyzing Instagram posts, audience comments, engagement psychology, and automated DM funnels.
+Analyze the provided real Instagram post data (caption, media type, likes, comments, reach, saves, shares, and real audience comment texts).
+
+You MUST return a VALID JSON object (and nothing else, no markdown code fence, no commentary) with the following exact keys:
+{
+  "score": <number between 1 and 100 representing real algorithmic growth potential>,
+  "headline": "<punchy, authoritative 4-8 word diagnosis headline specific to this post>",
+  "summary": "<2-3 sentence deep-dive explaining why this post performed this way based directly on the actual caption, metrics, and what real commenters said>",
+  "audienceSentiment": "<Positive | Inquisitive | High-Intent | Mixed | Neutral>",
+  "detectedRequests": ["<array of specific questions or requests detected in follower comments, e.g. price inquiries, link requests, product details, compliments>"],
+  "actionItems": [
+    {
+      "title": "<Concise action title>",
+      "description": "<Specific, actionable next step for the creator referencing their real content, comments, or automation>",
+      "priority": "high" | "medium"
     }
-    if (topFan) {
-      actionItems.push({
-        title: `Nurture Super-Advocate @${topFan}`,
-        description: `@${topFan} contributed ${topFanCount} comments. Reach out with a VIP appreciation DM to cement community advocacy.`,
-        priority: 'high'
-      });
+  ],
+  "viralLevers": [
+    {
+      "label": "<Name of lever, e.g. Comment-to-Like Depth, CTA Conversion, Save Potential, Community Advocacy>",
+      "status": "strong" | "opportunity",
+      "detail": "<1 sentence assessment quoting or calculating from real post numbers/comments>"
     }
-    if ((post.keywordMatchRate ?? 100) < 100) {
-      actionItems.push({
-        title: 'Expand Trigger Vocabulary',
-        description: 'Several follower comments used compliments outside your current keywords. Add terms like "good" or "super" to hit 100% lead capture.',
-        priority: 'medium'
-      });
+  ]
+}`;
+
+    const userPrompt = `Analyze this real Instagram post:
+- Media Format: ${mediaType}
+- Caption: "${caption.slice(0, 1000)}"
+- Real Metrics:
+  * Likes: ${likes}
+  * Total Comments: ${commentsCount}
+  * Discussion Ratio: ${ratio} comments per like
+  * Reach: ${reach > 0 ? reach : 'Not recorded'}
+  * Saves: ${saved}
+  * Shares: ${shares}
+  * Impressions: ${impressions > 0 ? impressions : 'Not recorded'}
+- Active Auto-Reply Triggers: ${activeKeywords.length > 0 ? activeKeywords.join(', ') : 'None configured'}
+- Top Engaged Followers: ${topFans || 'None identified yet'}
+- Real Follower Comments (${commentsList.length} recent):
+${commentsList.length > 0 ? commentsList.map((c, i) => `  ${i + 1}. "${c}"`).join('\n') : '  (No comments posted yet)'}
+
+Generate your expert diagnostic now as pure JSON:`;
+
+    const res = await this.complete(
+      [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      [1000, 2000],
+      25000,
+      userId,
+      2500,
+    );
+
+    const raw = res.content || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error(`AI generated invalid response format from model ${res.model}`);
     }
 
-    return {
-      score,
-      model: 'Algorithmic Growth Engine',
-      headline: ratio >= 1.0 ? 'High Conversational Virality & Audience Loyalty' : 'Steady Discovery Momentum',
-      summary: `This post achieves an outstanding ${ratio.toFixed(1)}× discussion density with strong community engagement. Adding a direct link prompt and expanding keyword triggers will maximize automated lead conversion.`,
-      actionItems,
-      viralLevers: [
-        { label: 'Discussion Density', status: ratio >= 1.0 ? 'strong' : 'opportunity', detail: `${ratio.toFixed(1)}× comments per like (Top 1% viral depth)` },
-        { label: 'Action Prompt (CTA)', status: hasCta ? 'strong' : 'opportunity', detail: hasCta ? 'Clear conversion trigger present' : 'Needs bookmark or comment prompt' },
-        { label: 'Automation Coverage', status: (post.keywordMatchRate ?? 0) >= 90 ? 'strong' : 'opportunity', detail: `${post.keywordMatchRate ?? 0}% comment capture rate` },
-      ]
-    };
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        score: typeof parsed.score === 'number' ? Math.min(100, Math.max(1, Math.round(parsed.score))) : 75,
+        model: res.model,
+        headline: parsed.headline || 'Audience Engagement Analysis',
+        summary: parsed.summary || 'Post performance analyzed via real engagement data.',
+        audienceSentiment: parsed.audienceSentiment || 'Engaged',
+        detectedRequests: Array.isArray(parsed.detectedRequests) ? parsed.detectedRequests : [],
+        actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems : [],
+        viralLevers: Array.isArray(parsed.viralLevers) ? parsed.viralLevers : [],
+        isAiGenerated: true,
+      };
+    } catch (parseErr) {
+      throw new Error(`Failed to parse AI diagnosis JSON: ${(parseErr as Error).message}`);
+    }
   }
 
   // --- Caption & Hook Optimizer ---
