@@ -528,20 +528,20 @@ export class AiService {
         },
       ];
 
-      const viralLevers = [
+      const viralLevers: { label: string; status: 'strong' | 'opportunity'; detail: string }[] = [
         {
           label: 'Discussion Depth',
-          status: (commentsCount >= 5 ? 'strong' : 'opportunity') as const,
+          status: commentsCount >= 5 ? 'strong' : 'opportunity',
           detail: `${ratio} comments per like indicates ${commentsCount >= 5 ? 'an active dialogue' : 'room to spark deeper conversation'}.`,
         },
         {
           label: 'Save & Share Potential',
-          status: (saved + shares >= 3 ? 'strong' : 'opportunity') as const,
+          status: saved + shares >= 3 ? 'strong' : 'opportunity',
           detail: `${saved} saves and ${shares} shares track whether followers view this as reference material.`,
         },
         {
           label: 'Inbound Buyer Intent',
-          status: (inquiryCount > 0 ? 'strong' : 'opportunity') as const,
+          status: inquiryCount > 0 ? 'strong' : 'opportunity',
           detail: inquiryCount > 0 ? `${inquiryCount} buying/information inquiries detected in recent comments.` : 'No direct purchasing inquiries detected in sample comments.',
         },
       ];
