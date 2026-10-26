@@ -2,8 +2,7 @@ import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from
 import { JwtService } from '@nestjs/jwt';
 import { DataSource } from 'typeorm';
 import { User } from './user.entity';
-
-import { InstagramConnection } from '../instagram-connection/instagram-connection.entity';
+import { resolveAccount } from '../common/current-account.decorator';
 
 @Injectable()
 export class AuthGuard implements CanActivate {
@@ -17,7 +16,6 @@ export class AuthGuard implements CanActivate {
     const [type, token] = (req.headers.authorization ?? '').split(' ');
     if (type !== 'Bearer' || !token) throw new UnauthorizedException();
 
-
     try {
       const payload = await this.jwt.verifyAsync(token);
       req.user = payload;
@@ -28,6 +26,7 @@ export class AuthGuard implements CanActivate {
           req.user.instagramHandle = u.instagramHandle;
         }
       }
+      resolveAccount(req);
     } catch {
       throw new UnauthorizedException();
     }

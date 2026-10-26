@@ -269,6 +269,27 @@ export class CommentDmService {
     if (body.keywords !== undefined) {
       const kw = String(body.keywords).trim();
       if (kw.length > 500) throw new BadRequestException('Keywords are too long (500 characters max).');
+
+      // Prevent duplicate trigger keywords on the same post
+      const targetMedia = body.mediaId !== undefined ? (body.mediaId || null) : (rule.mediaId || null);
+      if (kw) {
+        const checkKws = kw.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
+        const existingRules = await this.rules.find({
+          where: own ? { ownerUsername: own } : {},
+        });
+        const conflict = existingRules.find((r) => {
+          if (r.id === rule.id) return false;
+          const rMedia = r.mediaId || null;
+          if (rMedia !== targetMedia) return false;
+          const rKws = (r.keywords || '').split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
+          return checkKws.some((ck) => rKws.includes(ck));
+        });
+        if (conflict) {
+          throw new BadRequestException(
+            `An automation with trigger keyword "${kw}" already exists for this post.`,
+          );
+        }
+      }
       rule.keywords = kw;
     }
     if (body.dmText !== undefined) {
