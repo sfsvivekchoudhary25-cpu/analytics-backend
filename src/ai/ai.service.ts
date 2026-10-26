@@ -351,7 +351,9 @@ export class AiService {
   }
 
   private get fallbackModels(): string[] {
-    return (process.env.OPENROUTER_FALLBACK_MODELS ?? '').split(',').map((m) => m.trim()).filter(Boolean);
+    const fromEnv = (process.env.OPENROUTER_FALLBACK_MODELS ?? '').split(',').map((m) => m.trim()).filter(Boolean);
+    if (fromEnv.length > 0) return fromEnv;
+    return ['liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3.5-lightning:free', 'meta-llama/llama-3.3-70b-instruct:free'];
   }
 
   private async complete(
@@ -467,11 +469,100 @@ export class AiService {
     const activeKeywords = (post.activeRuleKeywords || []).map((k) => k.trim()).filter(Boolean);
     const topFans = (post.topCommenters || []).map((f) => `@${f.username} (${f.count} comments)`).join(', ');
 
-    if (!this.available) {
-      throw new Error('AI Engine is not configured. Please add an OpenRouter API key in settings.');
-    }
+    const buildHeuristicDiagnosis = () => {
+      const baseEng = likes + commentsCount * 2;
+      const denominator = reach > 0 ? reach : impressions > 0 ? impressions : Math.max(likes * 5, 100);
+      const engRate = Math.min(25, (baseEng / denominator) * 100);
+      const score = Math.min(95, Math.max(45, Math.round(52 + engRate * 1.6 + (saved > 0 ? 6 : 0) + (shares > 0 ? 8 : 0))));
 
-    const systemPrompt = `You are an elite Instagram Growth, Viral Content & Conversion AI Copilot.
+      const detectedRequests: string[] = [];
+      let positiveCount = 0;
+      let inquiryCount = 0;
+
+      for (const comment of commentsList) {
+        const lower = comment.toLowerCase();
+        if (/link|price|how much|cost|buy|order|dm|where|shop|website|catalog|size|shipping/.test(lower)) {
+          inquiryCount++;
+          if (/link|send link/.test(lower) && !detectedRequests.includes('Link / catalog requests')) {
+            detectedRequests.push('Link / catalog requests');
+          } else if (/price|how much|cost|rate/.test(lower) && !detectedRequests.includes('Pricing & purchasing inquiries')) {
+            detectedRequests.push('Pricing & purchasing inquiries');
+          } else if (/where|shop|store|website/.test(lower) && !detectedRequests.includes('Store / availability queries')) {
+            detectedRequests.push('Store / availability queries');
+          }
+        }
+        if (/love|fire|🔥|❤️|awesome|amazing|obsessed|beautiful|perfect|best|gorgeous/.test(lower)) {
+          positiveCount++;
+        }
+      }
+
+      if (detectedRequests.length === 0 && commentsList.length > 0) {
+        detectedRequests.push('General follower feedback & appreciation');
+      }
+
+      const sentiment = inquiryCount > 2 ? 'High-Intent' : positiveCount >= commentsList.length * 0.4 ? 'Positive' : 'Engaged';
+      const headline = inquiryCount > 0 ? 'High Inbound Conversion Opportunity' : score > 70 ? 'Strong Algorithmic Resonance' : 'Audience Engagement Active';
+      const summary = `Post generated ${likes} likes and ${commentsCount} comments (${ratio} comments per like). Audience shows ${sentiment.toLowerCase()} engagement with ${detectedRequests.length} detected inquiry themes in recent discussion.`;
+
+      const actionItems = [
+        {
+          title: inquiryCount > 0 ? 'Deploy Fast DM Reply Automation' : 'Drive Deeper Comment Interactions',
+          description: inquiryCount > 0
+            ? 'Several commenters asked for links or pricing. Set up automated keyword triggers to instantly DM inbound leads.'
+            : 'Ask a conversational open question in your caption or pinned comment to increase comment velocity.',
+          priority: 'high' as const,
+        },
+        {
+          title: 'Boost Save & Share Triggers',
+          description: saved > 0 || shares > 0
+            ? `Post recorded ${saved} saves and ${shares} shares. Double down on educational, styling, or bookmarkable tips.`
+            : 'Add an explicit prompt to save this post for future reference or share with a friend who needs this.',
+          priority: 'medium' as const,
+        },
+        {
+          title: activeKeywords.length > 0 ? 'Refine Keyword Match Patterns' : 'Activate Comment-to-DM Triggers',
+          description: activeKeywords.length > 0
+            ? `Currently listening for: ${activeKeywords.join(', ')}. Monitor missed keywords to capture more conversations.`
+            : 'Add trigger words like "LINK", "INFO", or "SHOP" so followers who comment get an instant private reply.',
+          priority: 'high' as const,
+        },
+      ];
+
+      const viralLevers = [
+        {
+          label: 'Discussion Depth',
+          status: (commentsCount >= 5 ? 'strong' : 'opportunity') as const,
+          detail: `${ratio} comments per like indicates ${commentsCount >= 5 ? 'an active dialogue' : 'room to spark deeper conversation'}.`,
+        },
+        {
+          label: 'Save & Share Potential',
+          status: (saved + shares >= 3 ? 'strong' : 'opportunity') as const,
+          detail: `${saved} saves and ${shares} shares track whether followers view this as reference material.`,
+        },
+        {
+          label: 'Inbound Buyer Intent',
+          status: (inquiryCount > 0 ? 'strong' : 'opportunity') as const,
+          detail: inquiryCount > 0 ? `${inquiryCount} buying/information inquiries detected in recent comments.` : 'No direct purchasing inquiries detected in sample comments.',
+        },
+      ];
+
+      return {
+        score,
+        model: 'Algorithmic Growth Engine',
+        headline,
+        summary,
+        audienceSentiment: sentiment,
+        detectedRequests,
+        actionItems,
+        viralLevers,
+        isAiGenerated: false,
+        isFallback: true,
+      };
+    };
+
+    if (this.available && !this.pausedUntilDate) {
+      try {
+        const systemPrompt = `You are an elite Instagram Growth, Viral Content & Conversion AI Copilot.
 You specialize in analyzing Instagram posts, audience comments, engagement psychology, and automated DM funnels.
 Analyze the provided real Instagram post data (caption, media type, likes, comments, reach, saves, shares, and real audience comment texts).
 
@@ -498,7 +589,7 @@ You MUST return a VALID JSON object (and nothing else, no markdown code fence, n
   ]
 }`;
 
-    const userPrompt = `Analyze this real Instagram post:
+        const userPrompt = `Analyze this real Instagram post:
 - Media Format: ${mediaType}
 - Caption: "${caption.slice(0, 1000)}"
 - Real Metrics:
@@ -516,39 +607,39 @@ ${commentsList.length > 0 ? commentsList.map((c, i) => `  ${i + 1}. "${c}"`).joi
 
 Generate your expert diagnostic now as pure JSON:`;
 
-    const res = await this.complete(
-      [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      [1000, 2000],
-      25000,
-      userId,
-      2500,
-    );
+        const res = await this.complete(
+          [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          [1000, 2000],
+          25000,
+          userId,
+          2500,
+        );
 
-    const raw = res.content || '';
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error(`AI generated invalid response format from model ${res.model}`);
+        const raw = res.content || '';
+        const jsonMatch = raw.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return {
+            score: typeof parsed.score === 'number' ? Math.min(100, Math.max(1, Math.round(parsed.score))) : 75,
+            model: res.model,
+            headline: parsed.headline || 'Audience Engagement Analysis',
+            summary: parsed.summary || 'Post performance analyzed via real engagement data.',
+            audienceSentiment: parsed.audienceSentiment || 'Engaged',
+            detectedRequests: Array.isArray(parsed.detectedRequests) ? parsed.detectedRequests : [],
+            actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems : [],
+            viralLevers: Array.isArray(parsed.viralLevers) ? parsed.viralLevers : [],
+            isAiGenerated: true,
+          };
+        }
+      } catch (err) {
+        this.logger.warn(`AI diagnosis failed, falling back to heuristic engine: ${(err as Error).message}`);
+      }
     }
 
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      return {
-        score: typeof parsed.score === 'number' ? Math.min(100, Math.max(1, Math.round(parsed.score))) : 75,
-        model: res.model,
-        headline: parsed.headline || 'Audience Engagement Analysis',
-        summary: parsed.summary || 'Post performance analyzed via real engagement data.',
-        audienceSentiment: parsed.audienceSentiment || 'Engaged',
-        detectedRequests: Array.isArray(parsed.detectedRequests) ? parsed.detectedRequests : [],
-        actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems : [],
-        viralLevers: Array.isArray(parsed.viralLevers) ? parsed.viralLevers : [],
-        isAiGenerated: true,
-      };
-    } catch (parseErr) {
-      throw new Error(`Failed to parse AI diagnosis JSON: ${(parseErr as Error).message}`);
-    }
+    return buildHeuristicDiagnosis();
   }
 
   // --- Caption & Hook Optimizer ---
