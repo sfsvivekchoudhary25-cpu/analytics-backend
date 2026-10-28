@@ -352,8 +352,8 @@ export class AiService {
 
   private get fallbackModels(): string[] {
     const fromEnv = (process.env.OPENROUTER_FALLBACK_MODELS ?? '').split(',').map((m) => m.trim()).filter(Boolean);
-    if (fromEnv.length > 0) return fromEnv;
-    return ['liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3.5-lightning:free', 'meta-llama/llama-3.3-70b-instruct:free'];
+    if (fromEnv.length > 0) return fromEnv.slice(0, 2);
+    return ['liquid/lfm-2.5-2.6b:free', 'nvidia/nemotron-3.5-lightning:free'];
   }
 
   private async complete(
@@ -371,6 +371,8 @@ export class AiService {
     const timeoutMs = customTimeoutMs ?? Number(process.env.OPENROUTER_TIMEOUT_MS ?? 15000);
     let lastError = 'unknown error';
 
+    const candidateModels = Array.from(new Set([model, ...this.fallbackModels])).slice(0, 3);
+
     for (let attempt = 0; attempt <= delays.length; attempt++) {
       try {
         const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -382,7 +384,7 @@ export class AiService {
             'X-Title': 'Fabroniee',
           },
           body: JSON.stringify({
-            ...(this.fallbackModels.length ? { models: [model, ...this.fallbackModels] } : { model }),
+            ...(candidateModels.length > 1 ? { models: candidateModels } : { model: candidateModels[0] || model }),
             messages,
             temperature: 0.3,
             reasoning: { effort: 'low' },

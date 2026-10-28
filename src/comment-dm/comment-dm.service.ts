@@ -1365,7 +1365,7 @@ export class CommentDmService {
 
     for (const metricQuery of candidateBatches) {
       try {
-        const resp = await this.graph.get(`/${mediaId}/insights`, { metric: metricQuery }, { silent: true });
+        const resp = await this.graph.get(`/${mediaId}/insights`, { metric: metricQuery }, { silent: false, account: own ?? undefined });
         if (resp?.data && Array.isArray(resp.data)) {
           for (const item of resp.data) {
             const val = item.values?.[0]?.value ?? item.total_value?.value ?? null;
@@ -1385,7 +1385,7 @@ export class CommentDmService {
         const videoResp = await this.graph.get(
           `/${mediaId}/insights`,
           { metric: 'ig_reels_video_view_total_time,ig_reels_avg_watch_time' },
-          { silent: true },
+          { silent: true, account: own ?? undefined },
         );
         if (videoResp?.data && Array.isArray(videoResp.data)) {
           for (const item of videoResp.data) {
@@ -1408,7 +1408,7 @@ export class CommentDmService {
       const currentVal = met === 'total_interactions' ? insights.totalInteractions : (insights as any)[met];
       if (currentVal == null) {
         try {
-          const r = await this.graph.get(`/${mediaId}/insights`, { metric: met }, { silent: true });
+          const r = await this.graph.get(`/${mediaId}/insights`, { metric: met }, { silent: true, account: own ?? undefined });
           if (r?.data?.[0]) {
             const val = r.data[0].values?.[0]?.value ?? r.data[0].total_value?.value ?? null;
             if (met === 'total_interactions') insights.totalInteractions = val;
