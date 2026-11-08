@@ -119,7 +119,7 @@ export class AuthService {
   ) {
     const email = (body.email || '').trim().toLowerCase();
     const password = String(body.password || '');
-    const adminPassword = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV !== 'production' ? 'fdjNiJdowLNR' : undefined);
+    const adminPassword = process.env.ADMIN_PASSWORD || undefined;
 
     if (email) {
       const user = await this.userRepo.findOne({ where: { email } });

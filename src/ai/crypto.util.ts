@@ -3,7 +3,10 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypt
 const ALGORITHM = 'aes-256-gcm';
 
 function getMasterKey(): Buffer {
-  const secret = process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || 'fabroniee-master-encryption-key-32b-secret';
+  const secret = process.env.ENCRYPTION_KEY || process.env.JWT_SECRET;
+  if (!secret) {
+    throw new Error('ENCRYPTION_KEY (or JWT_SECRET) must be set to encrypt/decrypt stored API keys.');
+  }
   return createHash('sha256').update(secret).digest();
 }
 
