@@ -14,13 +14,18 @@ export class RlsInterceptor implements NestInterceptor {
     const path: string = req.path || req.originalUrl || '';
     const isWebhook = path.startsWith('/instagram-webhook') || path.startsWith('/instagram/webhook');
     const isAuth = path.startsWith('/auth');
+    // Routes with no user session by design: OAuth redirects from Meta (the callback
+    // resolves the tenant from the verified Instagram/Facebook identity itself) and the
+    // website submission endpoint (authenticated by SUBMISSIONS_API_KEY in the handler).
+    const isOAuthCallback = /^\/(instagram|facebook-page)\/oauth\/callback\/?$/.test(path);
+    const isPublicSubmission = /^\/public\/submissions\/?$/.test(path);
 
     const user = req.user;
     let tenant: string | undefined = undefined;
     let role = user?.role || 'user';
     let userId = user?.id || user?.sub;
     let userEmail = user?.email;
-    const bypass = isWebhook || isAuth;
+    const bypass = isWebhook || isAuth || isOAuthCallback || isPublicSubmission;
 
     if (!bypass && user) {
       if (role === 'admin') {

@@ -49,6 +49,14 @@ import { SavedReel } from './saved-reels/saved-reel.entity';
     TypeOrmModule.forRoot({
       type: 'postgres',
       url: process.env.DATABASE_URL,
+      // Verified TLS for remote hosts (Supabase/Render); off for local dev.
+      // If the server cert isn't trusted, set DATABASE_CA_CERT to the CA PEM
+      // (Supabase dashboard -> Database -> SSL Configuration).
+      ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || '')
+        ? false
+        : process.env.DATABASE_CA_CERT
+          ? { ca: process.env.DATABASE_CA_CERT.replace(/\\n/g, '\n') }
+          : true,
       entities: [
         User,
         InstagramConnection,

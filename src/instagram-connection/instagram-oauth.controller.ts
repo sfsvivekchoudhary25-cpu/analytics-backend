@@ -211,8 +211,9 @@ export class InstagramOauthController {
     });
 
     const body = await res.json();
-    this.logger.log(`Instagram exchangeCode response: ${JSON.stringify(body)}`);
     const first = body.data?.[0] ?? body;
+    // Never log the response body: it contains the live access_token.
+    this.logger.log(`Instagram exchangeCode: status=${res.status} user_id=${first.user_id ?? 'n/a'} token=${first.access_token ? 'received' : 'missing'}`);
     const token = first.access_token;
     if (!res.ok || !token) throw new Error(body.error_message ?? body.error?.message ?? 'Instagram rejected the authorization code.');
 
