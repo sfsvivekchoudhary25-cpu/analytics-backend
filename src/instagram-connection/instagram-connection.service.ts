@@ -458,8 +458,10 @@ export class InstagramConnectionService implements OnModuleInit {
         .createQueryBuilder('c')
         .where('LOWER(c.username) = :u OR LOWER(c.username) = :atU', { u: clean, atU: `@${clean}` })
         .getOne();
-      if (conn) return conn;
+      // A specific account was asked for: never answer with a DIFFERENT account's connection.
+      return conn ?? null;
     }
+    // No account given (background jobs only; request handlers always pass one): legacy "latest connection".
     const [connection] = await this.repo.find({ order: { updatedAt: 'DESC' }, take: 1 });
     if (connection) return connection;
 

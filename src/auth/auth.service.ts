@@ -54,7 +54,6 @@ export class AuthService {
     const email = (dto.email || '').trim().toLowerCase();
     const name = (dto.name || '').trim();
     const password = dto.password || '';
-    const instagramHandle = (dto.instagramHandle || '').trim().replace(/^@/, '');
 
     if (!email || !email.includes('@')) {
       throw new BadRequestException('Please provide a valid email address.');
@@ -77,8 +76,9 @@ export class AuthService {
         email,
         name,
         passwordHash,
-        instagramHandle: instagramHandle || null,
-        role: 'admin',
+        // Never trust a typed handle: it is set only after a verified Instagram connection (OAuth / token).
+        instagramHandle: null,
+        role: 'user',
       }),
     );
 
@@ -124,7 +124,8 @@ export class AuthService {
     if (email) {
       const user = await this.userRepo.findOne({ where: { email } });
       if (user) {
-        const matches = (await this.verifyPassword(password, user.passwordHash)) || (adminPassword && password === adminPassword);
+        // The master ADMIN_PASSWORD only works for admin accounts, never to sign in as a regular user.
+        const matches = (await this.verifyPassword(password, user.passwordHash)) || (user.role === 'admin' && adminPassword && password === adminPassword);
         if (!matches) {
           await this.audit.log({
             actorEmail: email,
@@ -167,25 +168,7 @@ export class AuthService {
         };
       }
 
-      if (adminPassword && password === adminPassword) {
-        const hash = await this.hashPassword(password);
-        const newUser = await this.userRepo.save(
-          this.userRepo.create({
-            email,
-            name: email.split('@')[0],
-            passwordHash: hash,
-            role: 'admin',
-          }),
-        );
-        const token = await this.jwt.signAsync({
-          sub: newUser.id,
-          email: newUser.email,
-          name: newUser.name,
-          role: newUser.role,
-        });
-        return { ok: true, token, user: newUser };
-      }
-
+      // An unknown email is never auto-created (it used to become an admin when given the master password).
       await this.audit.log({
         actorEmail: email,
         action: 'LOGIN_FAILED_USER_NOT_FOUND',
@@ -285,7 +268,7 @@ export class AuthService {
     if (dto.creatorNiche) user.creatorNiche = dto.creatorNiche;
     if (dto.monthlyVolume) user.monthlyVolume = dto.monthlyVolume;
     if (dto.facebookPageName) user.facebookPageName = dto.facebookPageName;
-    if (dto.instagramHandle) user.instagramHandle = dto.instagramHandle;
+    // dto.instagramHandle is deliberately ignored: the handle is linked only by a verified Instagram connection.
     if (dto.tiktokHandle) user.tiktokHandle = dto.tiktokHandle;
     if (dto.youtubeChannel) user.youtubeChannel = dto.youtubeChannel;
     user.onboardingCompleted = true;

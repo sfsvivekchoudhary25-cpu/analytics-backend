@@ -1,5 +1,8 @@
 import { createParamDecorator, ExecutionContext } from '@nestjs/common';
 
+/** Account name for "this user has no Instagram account". Matches no real connection or data row. */
+export const NO_ACCOUNT = '__no_account__';
+
 /**
  * Resolves and memoizes the active Instagram handle onto req.account.
  * Can be called upfront in AuthGuard/middleware or lazily in @CurrentAccount.
@@ -30,6 +33,13 @@ export function resolveAccount(req: any): string | undefined {
     const sanitized = String(req.user.instagramHandle).trim().replace(/^@/, '').toLowerCase();
     req.account = sanitized;
     return sanitized;
+  }
+
+  // 2b. A signed-in regular user with no verified Instagram account owns NO account. Without this they would get
+  // "undefined", which the connection service used to turn into "the most recently connected account" (someone else's).
+  if (req.user && !isAdmin) {
+    req.account = NO_ACCOUNT;
+    return NO_ACCOUNT;
   }
 
   // 3. Fallback only if no authenticated session exists on public routes

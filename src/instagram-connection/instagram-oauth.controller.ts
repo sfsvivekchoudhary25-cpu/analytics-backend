@@ -147,7 +147,7 @@ export class InstagramOauthController {
           name: username,
           passwordHash: '',
           instagramHandle: username,
-          role: 'admin',
+          role: 'user',
         });
         user = await this.userRepo.save(user);
       } else if (!user.instagramHandle) {
