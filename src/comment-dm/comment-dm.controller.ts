@@ -55,6 +55,7 @@ export class CommentDmController {
       mediaId?: string | null;
       mediaPermalink?: string | null;
       mediaThumb?: string | null;
+      recoveryEnabled?: boolean;
     },
     @CurrentAccount() account?: string,
   ) {

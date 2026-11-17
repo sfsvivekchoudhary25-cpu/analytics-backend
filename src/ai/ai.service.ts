@@ -1,8 +1,8 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../auth/user.entity';
-import { decryptApiKey, encryptApiKey } from './crypto.util';
+import { decryptApiKey } from './crypto.util';
 
 export type DraftInput = {
   channel: 'message' | 'comment';
@@ -74,10 +74,14 @@ export class AiService {
           if (decrypted) {
             return {
               key: decrypted,
-              model: user.openrouterModel || process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
+              model: user.aiModel || user.openrouterModel || process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
               isCustom: true,
             };
           }
+        }
+        // Normal users: the platform's key, with the model they picked.
+        if (user?.aiModel) {
+          return { key: process.env.OPENROUTER_API_KEY || '', model: user.aiModel, isCustom: false };
         }
       } catch (e) {
         this.logger.warn(`Could not load custom OpenRouter key: ${(e as Error).message}`);
@@ -91,32 +95,61 @@ export class AiService {
     };
   }
 
-  async saveUserConfig(userId: string, apiKey: string, model?: string) {
+  private catalog: { at: number; models: { id: string; name: string; free: boolean }[]; freeTierOnly: boolean | null } | null = null;
+
+  // Every text model OpenRouter offers (free or paid) and whether this server's key can only use free ones.
+  async getModelCatalog() {
+    if (this.catalog && Date.now() - this.catalog.at < 60 * 60_000) return this.catalog;
+    try {
+      const key = process.env.OPENROUTER_API_KEY || '';
+      const [list, account]: any[] = await Promise.all([
+        fetch('https://openrouter.ai/api/v1/models', { signal: AbortSignal.timeout(10000) }).then((r) => r.json()),
+        key
+          ? fetch('https://openrouter.ai/api/v1/auth/key', { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10000) })
+              .then((r) => r.json())
+              .catch(() => null)
+          : null,
+      ]);
+      const models = (list?.data ?? [])
+        .filter((m: any) => (m.architecture?.output_modalities ?? ['text']).includes('text'))
+        .map((m: any) => ({
+          id: String(m.id),
+          name: String(m.name ?? m.id),
+          free: Number(m.pricing?.prompt) === 0 && Number(m.pricing?.completion) === 0,
+        }))
+        .sort((a: any, b: any) => Number(b.free) - Number(a.free) || a.name.localeCompare(b.name));
+      if (!models.length) throw new Error('empty model list');
+      const d = account?.data;
+      // null = unknown (the account call failed): the UI warns instead of blocking.
+      const freeTierOnly = d ? d.is_free_tier === true || (typeof d.limit_remaining === 'number' && d.limit_remaining <= 0) : null;
+      this.catalog = { at: Date.now(), models, freeTierOnly };
+      return this.catalog;
+    } catch (e) {
+      this.logger.warn(`Could not load the OpenRouter model list: ${(e as Error).message}`);
+      if (this.catalog) return this.catalog; // stale beats nothing
+      throw new BadGatewayException('Could not load the model list from OpenRouter. Try again in a moment.');
+    }
+  }
+
+  // Users only choose a model; the API key always comes from the server environment.
+  async saveUserConfig(userId: string, model: string) {
     if (!userId) throw new BadRequestException('User identification is required.');
-    const cleanKey = (apiKey || '').trim();
-    if (!cleanKey) throw new BadRequestException('OpenRouter API key is required.');
-    if (!cleanKey.startsWith('sk-or-')) {
-      throw new BadRequestException('Invalid OpenRouter key. OpenRouter API keys start with "sk-or-".');
+    const clean = (model || '').trim();
+    if (!/^[\w.-]+\/[\w.:-]+$/.test(clean) || clean.length > 120) {
+      throw new BadRequestException('Invalid model id. Expected something like "provider/model-name".');
+    }
+    const { models, freeTierOnly } = await this.getModelCatalog().catch(() => ({ models: [], freeTierOnly: null }));
+    if (freeTierOnly && models.find((m) => m.id === clean && !m.free)) {
+      throw new BadRequestException('This account can only use free models. Pick a free model, or add credits on OpenRouter first.');
     }
 
     const user = await this.userRepo.findOne({ where: { id: userId } });
     if (!user) throw new NotFoundException('User account not found.');
 
-    const enc = encryptApiKey(cleanKey);
-    user.openrouterApiKeyEncrypted = enc.encrypted;
-    user.openrouterApiKeyIv = enc.iv;
-    user.openrouterApiKeyTag = enc.tag;
-    user.openrouterKeyLast4 = enc.last4;
-    user.openrouterModel = (model || user.openrouterModel || 'nvidia/nemotron-3-ultra').trim();
-
+    user.aiModel = clean;
     await this.userRepo.save(user);
 
-    return {
-      ok: true,
-      message: 'OpenRouter API key encrypted with AES-256-GCM and stored securely.',
-      keyLast4: enc.last4,
-      model: user.openrouterModel,
-    };
+    return { ok: true, message: 'AI model updated.', model: clean };
   }
 
   async getUserConfig(userId?: string) {
@@ -134,14 +167,14 @@ export class AiService {
         configured: true,
         isCustom: true,
         keyLast4: user.openrouterKeyLast4,
-        model: user.openrouterModel || 'nvidia/nemotron-3-ultra',
+        model: user.aiModel || user.openrouterModel || 'nvidia/nemotron-3-ultra',
       };
     }
     return {
       configured: !!process.env.OPENROUTER_API_KEY,
       isCustom: false,
       keyLast4: null,
-      model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
+      model: user?.aiModel || process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-ultra',
     };
   }
 

@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, ILike, IsNull, MoreThan, Not, Repository } from 'typeorm';
+import { Between, ILike, In, IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
 import { GraphClient } from '../instagram-connection/graph-client.service';
 import { FacebookPageService, MessageButton } from '../facebook-page/facebook-page.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
@@ -10,6 +10,7 @@ import { messagingEvents } from '../instagram-webhook/events';
 import { Conversation, Message } from '../messaging/messaging.entities';
 import { MessagingService } from '../messaging/messaging.service';
 import { CommentDmLog, CommentDmRule, DEFAULT_FOLLOW_GATE_TEXT } from './comment-dm.entities';
+import { pickRule } from './comment-dm.match';
 import { AutoReplyRule, AutoReplySetting } from '../comments/comment.entities';
 import { Submission } from '../submissions/submission.entity';
 
@@ -254,6 +255,7 @@ export class CommentDmService {
       mediaId?: string | null;
       mediaPermalink?: string | null;
       mediaThumb?: string | null;
+      recoveryEnabled?: boolean;
     },
     ownerUsername?: string,
   ) {
@@ -301,6 +303,7 @@ export class CommentDmService {
     if (typeof body.requireFollow === 'boolean') {
       rule.requireFollow = body.requireFollow;
     }
+    if (typeof body.recoveryEnabled === 'boolean') rule.recoveryEnabled = body.recoveryEnabled;
     if (body.followGateText !== undefined) {
       const gateText = String(body.followGateText).trim();
       if (gateText.length > 1000) throw new BadRequestException('Follow gate message is too long (1000 characters max).');
@@ -349,7 +352,7 @@ export class CommentDmService {
     if (typeof body.enabled === 'boolean') rule.enabled = body.enabled;
     if (!wasEnabled && rule.enabled) {
       rule.enabledAt = new Date();
-      this.logger.log(`"${rule.name}" ACTIVE. Only comments made after ${rule.enabledAt.toLocaleTimeString()} will be invited.`);
+      this.logger.log(`"${rule.name}" ACTIVE. Comments from 10 minutes before ${rule.enabledAt.toLocaleTimeString()} onwards will be answered (the grace window catches test comments).`);
     } else if (wasEnabled && !rule.enabled) {
       this.logger.log(`"${rule.name}" turned off.`);
     }
@@ -428,14 +431,6 @@ export class CommentDmService {
 
   // ---------- matching + inviting ----------
 
-  private matches(rule: CommentDmRule, c: Comment) {
-    if (rule.mediaId && c.mediaId !== rule.mediaId) return false;
-    const kws = rule.keywords.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
-    if (kws.length === 0) return true; // any comment on the chosen post
-    const t = c.text.toLowerCase();
-    return kws.some((k) => t.includes(k));
-  }
-
   // Looks at recent, not-yet-attempted comments and, for whichever match any active automation, sends the
   // rule's message straight to the commenter as a real private reply (via the Facebook Page's /messages
   // endpoint, recipient.comment_id). A comment is attempted at most once (comment_dm_log.comment_id is
@@ -472,7 +467,8 @@ export class CommentDmService {
       .createQueryBuilder('c')
       .where('c.is_own = false AND c.parent_id IS NULL AND c.commented_at > :earliest', {
         earliest: earliestEnabledAt,
-      });
+      })
+      .andWhere('NOT EXISTS (SELECT 1 FROM comment_dm_log l WHERE l.comment_id = c.id)');
 
     if (targetMediaIds.length > 0) {
       candidateQuery.andWhere(
@@ -486,15 +482,10 @@ export class CommentDmService {
     const candidates = await candidateQuery.orderBy('c.commented_at', 'ASC').take(25).getMany();
     if (!candidates.length) return;
 
-    const already = new Set((await this.logs.find({ select: { commentId: true } })).map((l) => l.commentId));
     const claims = candidates
-      .filter((c) => !already.has(c.id))
       .map((c) => ({
         c,
-        rule: active.find((r) => {
-          const threshold = new Date(r.enabledAt!.getTime() - 10 * 60 * 1000);
-          return c.commentedAt > threshold && this.matches(r, c);
-        }),
+        rule: pickRule(active, c),
       }))
       .filter((x): x is { c: Comment; rule: CommentDmRule } => !!x.rule);
     if (!claims.length) return;
@@ -504,6 +495,13 @@ export class CommentDmService {
         c.ownerUsername = own;
         await this.comments.save(c).catch(() => {});
       }
+      // Claim the comment before sending (comment_id is unique), so two overlapping runs can never both send.
+      try {
+        await this.logs.insert({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, status: 'processing', pendingFollowGate: false });
+      } catch {
+        continue;
+      }
+      const finish = (patch: Parameters<typeof this.logs.update>[1]) => this.logs.update({ commentId: c.id }, patch);
       try {
         if (rule.requireFollow) {
           // Step 1: Check if commenter is ALREADY following BEFORE sending any message
@@ -518,21 +516,14 @@ export class CommentDmService {
             // Do NOT send the follow-gate "Oh no! It seems you're not following me" message!
             const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
             const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
-            await this.logs.save(
-              this.logs.create({
-                ruleId: rule.id,
-                commentId: c.id,
-                username: c.username,
-                ownerUsername: own,
-                ref: null,
+            await finish({
                 igsid: recipientId || igsid,
                 status: 'sent',
                 note: 'follow_gate: user was already following',
                 dmSentAt: new Date(),
                 followGateSentAt: null,
                 pendingFollowGate: false,
-              }),
-            );
+              });
             this.logger.log(`[follow-gate] @${c.username} already follows — DM sent directly via "${rule.name}"`);
             continue;
           }
@@ -561,55 +552,39 @@ export class CommentDmService {
             if (isFollowing === true) {
               const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
               await this.messaging.send(recipientId, dmText, 'system', dmButtons, dmCard);
-              await this.logs.save(
-                this.logs.create({
-                  ruleId: rule.id,
-                  commentId: c.id,
-                  username: c.username,
-                  ownerUsername: own,
-                  ref: null,
+              await finish({
                   igsid: recipientId,
                   status: 'sent',
                   note: 'follow_gate: user was already following',
                   dmSentAt: new Date(),
                   followGateSentAt: new Date(),
                   pendingFollowGate: false,
-                }),
-              );
+                });
               this.logger.log(`[follow-gate] @${c.username} already follows — DM sent directly via "${rule.name}"`);
               continue;
             }
           }
 
           // Confirmed not following — leave as pending follow gate
-          await this.logs.save(
-            this.logs.create({
-              ruleId: rule.id,
-              commentId: c.id,
-              username: c.username,
-              ownerUsername: own,
-              ref: null,
-              igsid: recipientId || igsid,
+          await finish({
+                igsid: recipientId || igsid,
               status: 'follow_gate',
               note: isFollowing === null ? 'follow_gate: follow status unknown, waiting for reply' : 'follow_gate: user not following yet',
               dmSentAt: null,
               followGateSentAt: new Date(),
               pendingFollowGate: true,
-            }),
-          );
+            });
           this.logger.log(`[follow-gate] @${c.username} not following — follow-gate sent via "${rule.name}"`);
         } else {
           // No follow gate — send DM directly (supports text, buttons, and card templates).
           const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
           const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
-          await this.logs.save(
-            this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false }),
-          );
+          await finish({ igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false });
           this.logger.log(`DM sent to @${c.username || c.id} via "${rule.name}" (reply to comment: "${preview(c.text, 50)}")`);
         }
       } catch (err) {
         const note = (err as Error).message;
-        await this.logs.save(this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, status: 'failed', note, followGateSentAt: null, pendingFollowGate: false }));
+        await finish({ status: 'failed', note, followGateSentAt: null, pendingFollowGate: false });
         this.logger.warn(`Private reply FAILED for @${c.username || c.id}: ${note}`);
       }
     }
@@ -813,8 +788,7 @@ export class CommentDmService {
     });
     if (!pendingLogs.length) return;
 
-    // Fast-sync messages from Instagram Graph API so we catch taps/messages even if webhook didn't arrive
-    await this.messaging.syncFromInstagram().catch(() => {});
+    // No inbox sync here: the auto-reply tick already syncs every 10s, so taps are in the messages table.
 
     // Group pending logs by IGSID
     const byIgsid = new Map<string, CommentDmLog[]>();
@@ -970,6 +944,17 @@ export class CommentDmService {
    */
   @Cron('*/15 * * * *')
   async recoverExpiringLeads() {
+    // A claim that never finished (for example the backend restarted mid-send) is closed, not retried: we cannot
+    // know whether the DM went out, and a second one would be worse than none.
+    await this.logs.update(
+      { status: 'processing', createdAt: LessThan(new Date(Date.now() - 10 * 60_000)) },
+      { status: 'failed', pendingFollowGate: false, note: 'interrupted while sending; not retried, to avoid messaging twice' },
+    );
+
+    // The check-in message is opt-in per automation.
+    const optedIn = (await this.rules.find({ where: { recoveryEnabled: true } })).map((r) => r.id);
+    if (!optedIn.length) return;
+
     const now = Date.now();
     // Meta messaging window is 24 hours. We target leads between 18 hours and 22.5 hours ago.
     const windowStart = new Date(now - 22.5 * 3600_000);
@@ -978,6 +963,7 @@ export class CommentDmService {
     const candidates = await this.logs.find({
       where: {
         status: 'sent',
+        ruleId: In(optedIn),
         igsid: Not(IsNull()),
         repliedAt: IsNull(),
         dmSentAt: Between(windowStart, windowEnd),

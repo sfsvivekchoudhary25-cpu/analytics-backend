@@ -13,10 +13,15 @@ export class AiController {
     return this.service.getUserConfig(userId);
   }
 
+  @Get('models')
+  getModels() {
+    return this.service.getModelCatalog().then(({ models, freeTierOnly }) => ({ models, freeTierOnly }));
+  }
+
   @Post('config')
-  saveConfig(@Request() req: any, @Body() body: { apiKey: string; model?: string }) {
+  saveConfig(@Request() req: any, @Body() body: { model: string }) {
     const userId = req.user?.sub || req.user?.id;
-    return this.service.saveUserConfig(userId, body.apiKey, body.model);
+    return this.service.saveUserConfig(userId, body?.model);
   }
 
   @Delete('config')

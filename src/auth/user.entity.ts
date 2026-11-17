@@ -59,6 +59,10 @@ export class User {
   @Column({ type: 'varchar', length: 120, name: 'openrouter_model', nullable: true, default: 'nvidia/nemotron-3-ultra' })
   openrouterModel: string | null;
 
+  // The model the user picked in the dashboard. Null = use the server default (OPENROUTER_MODEL).
+  @Column({ type: 'varchar', length: 120, name: 'ai_model', nullable: true })
+  aiModel: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz', nullable: true })
   createdAt: Date;
 

@@ -7,7 +7,8 @@ import { commentEvents, commentId } from '../instagram-webhook/events';
 import { GraphClient, isGoneOnInstagram } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { AutoReplyRule, AutoReplySetting, Comment, ReplyKind } from './comment.entities';
-import { CommentDmRule } from '../comment-dm/comment-dm.entities';
+import { CommentDmLog, CommentDmRule } from '../comment-dm/comment-dm.entities';
+import { dmGate, pickRule } from '../comment-dm/comment-dm.match';
 
 type Incoming = {
   id: string;
@@ -45,6 +46,7 @@ export class CommentsService {
     @InjectRepository(AutoReplySetting) private readonly settingsRepo: Repository<AutoReplySetting>,
     @InjectRepository(AutoReplyRule) private readonly rulesRepo: Repository<AutoReplyRule>,
     @InjectRepository(CommentDmRule) private readonly commentDmRules: Repository<CommentDmRule>,
+    @InjectRepository(CommentDmLog) private readonly commentDmLogs: Repository<CommentDmLog>,
     private readonly graph: GraphClient,
     private readonly connection: InstagramConnectionService,
     private readonly ai: AiService,
@@ -566,18 +568,14 @@ export class CommentsService {
     return mediaId ? (await this.mediaInfo(mediaId)).caption : '';
   }
 
+  // Same rule, picked the same way, as the one that sends the DM (see comment-dm.match.ts).
   private async findMatchingDmRule(c: Comment): Promise<CommentDmRule | null> {
     try {
-      const active = await this.commentDmRules.find({ where: { enabled: true } });
-      for (const r of active) {
-        if (r.mediaId && c.mediaId !== r.mediaId) continue;
-        const kws = r.keywords.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
-        if (kws.length === 0 || kws.some((k) => c.text.toLowerCase().includes(k))) return r;
-      }
+      const where = c.ownerUsername ? { enabled: true, ownerUsername: c.ownerUsername.toLowerCase() } : { enabled: true };
+      return pickRule(await this.commentDmRules.find({ where }), c) ?? null;
     } catch {
-      // ignore
+      return null; // no rule found means no DM is promised, which is the safe side
     }
-    return null;
   }
 
   // "Try it" in the dashboard: what would the AI say to this comment? Nothing is posted.
@@ -636,7 +634,15 @@ export class CommentsService {
       const fill = (t: string) => t.replaceAll('{username}', c.username || 'there');
       const keywordRule = s.enabled ? this.matchKeywordRule(rules, c.text) : null;
       const catchAll = s.enabled ? rules.find((r) => r.enabled && !r.keywords.trim()) ?? null : null;
-      const matchingDmRule = await this.findMatchingDmRule(c);
+      // Only promise "check your DMs" once the DM has really gone out (or the follow-gate message is in their inbox).
+      const dmRule = await this.findMatchingDmRule(c);
+      const dmLog = dmRule ? await this.commentDmLogs.findOne({ where: { commentId: c.id } }) : null;
+      const gate = dmGate(dmRule, dmLog, Date.now() - c.commentedAt.getTime());
+      if (gate === 'wait') {
+        await this.comments.update({ id: c.id }, { autoState: 'new' }); // the DM is still being sent: look again on the next pass
+        continue;
+      }
+      const matchingDmRule = gate === 'promise' ? dmRule : null;
       const age = Date.now() - c.commentedAt.getTime();
       let text: string;
       let note: string;
