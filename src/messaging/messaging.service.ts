@@ -116,6 +116,9 @@ export class MessagingService implements OnModuleInit {
           const at = new Date(m.created_time);
           const outgoing = String(m.from?.username ?? '').toLowerCase() === ownHandle;
           const text = String(m.message ?? '');
+          // History sync only returns the text. A message with no text is an attachment whose type we cannot know,
+          // so it is not stored (real attachments with their type still arrive through the webhook).
+          if (!text) continue;
           // The same message may already be stored via the webhook, possibly under a different id format.
           const dup =
             (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) ||
@@ -131,7 +134,7 @@ export class MessagingService implements OnModuleInit {
               text,
               // An outgoing message we did not send ourselves through this app was typed in the Instagram app.
               source: outgoing ? 'app' : null,
-              attachmentType: text ? null : 'attachment',
+              attachmentType: null,
               attachmentUrl: null,
               mid: m.id,
               createdAt: at,
@@ -141,7 +144,7 @@ export class MessagingService implements OnModuleInit {
           if (!outgoing) addedInbound += 1;
           if (!lastAt || at >= lastAt) {
             lastAt = at;
-            lastText = text || '[attachment]';
+            lastText = text;
           }
           if (!outgoing && (!lastInboundAt || at > lastInboundAt)) lastInboundAt = at;
         }
