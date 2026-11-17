@@ -54,12 +54,16 @@ export class AutoMessageService {
     const own = await this.resolveOwner(ownerUsername);
     // Always look for the existing row (the owner-less one when the account is unknown) and in a fixed order,
     // otherwise every call without a resolved account inserts a new row and reads pick an arbitrary duplicate.
+    // shortcut: older deployments left many duplicate rows per account; preferring the switched-on row keeps a
+    // live setting live until those rows are cleaned up, after which the order is just by id.
     const lookup = this.settingsRepo.createQueryBuilder('s');
     const existing: MessageAutoSetting | null = await (own
       ? lookup.where('LOWER(s.ownerUsername) = :own', { own })
       : lookup.where('s.ownerUsername IS NULL')
     )
-      .orderBy('s.id', 'ASC')
+      .orderBy('s.aiEnabled', 'DESC')
+      .addOrderBy('s.enabled', 'DESC')
+      .addOrderBy('s.id', 'ASC')
       .getOne();
 
     if (existing) {
