@@ -52,13 +52,15 @@ export class AutoMessageService {
 
   private async getSettings(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    let existing: MessageAutoSetting | null = null;
-    if (own) {
-      existing = await this.settingsRepo
-        .createQueryBuilder('s')
-        .where('LOWER(s.ownerUsername) = :own', { own })
-        .getOne();
-    }
+    // Always look for the existing row (the owner-less one when the account is unknown) and in a fixed order,
+    // otherwise every call without a resolved account inserts a new row and reads pick an arbitrary duplicate.
+    const lookup = this.settingsRepo.createQueryBuilder('s');
+    const existing: MessageAutoSetting | null = await (own
+      ? lookup.where('LOWER(s.ownerUsername) = :own', { own })
+      : lookup.where('s.ownerUsername IS NULL')
+    )
+      .orderBy('s.id', 'ASC')
+      .getOne();
 
     if (existing) {
       if (own && !existing.ownerUsername) {

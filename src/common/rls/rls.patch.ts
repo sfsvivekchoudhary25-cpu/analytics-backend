@@ -14,17 +14,18 @@ if (!proto._rlsPatched) {
         if (store.bypass) {
           await origQuery.call(this, "SET app.bypass_rls = 'on';");
         } else {
-          if (store.tenant) {
-            await origQuery.call(this, 'SELECT set_config($1, $2, false);', ['app.current_tenant', store.tenant]);
-          }
-          if (store.userId) {
-            await origQuery.call(this, 'SELECT set_config($1, $2, false);', ['app.current_user_id', String(store.userId)]);
-          }
-          if (store.userEmail) {
-            await origQuery.call(this, 'SELECT set_config($1, $2, false);', ['app.current_user_email', store.userEmail]);
-          }
-          if (store.role) {
-            await origQuery.call(this, 'SELECT set_config($1, $2, false);', ['app.current_user_role', store.role]);
+          const settings: [string, string][] = [];
+          if (store.tenant) settings.push(['app.current_tenant', store.tenant]);
+          if (store.userId) settings.push(['app.current_user_id', String(store.userId)]);
+          if (store.userEmail) settings.push(['app.current_user_email', store.userEmail]);
+          if (store.role) settings.push(['app.current_user_role', store.role]);
+          if (settings.length) {
+            // One round trip for all settings: each separate query costs a full network RTT to the database.
+            await origQuery.call(
+              this,
+              `SELECT ${settings.map((_, i) => `set_config($${i * 2 + 1}, $${i * 2 + 2}, false)`).join(', ')};`,
+              settings.flat(),
+            );
           }
         }
       } else {
