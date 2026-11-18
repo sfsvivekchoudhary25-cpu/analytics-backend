@@ -110,6 +110,8 @@ export class MessagingService implements OnModuleInit {
   // right before processing replies, so a message caught by polling is answered in the same pass, with no
   // separate timer to wait for. This class does not schedule its own sync.
   private syncing = false;
+  // Instagram chat ids that could not be read, and until when we skip them.
+  private readonly unreadableChats = new Map<string, number>();
 
   // Saves one message row. For an account that chose "Don't store my messages" only the metadata (who / when /
   // direction / id) is written; the text is kept in short-lived memory so automation can still answer it.
@@ -300,7 +302,21 @@ export class MessagingService implements OnModuleInit {
         const isRecent = new Date(conv.updated_time).getTime() > Date.now() - 2 * 24 * 3600_000;
         if (!isRecent && existing && existing.lastMessageAt >= new Date(conv.updated_time)) continue; // nothing new here
 
-        const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle });
+        // One chat Instagram will not let us read (deleted, blocked, or no permission: code 100/33) must not stop the
+        // sync of every other chat. It is skipped, and not asked about again for an hour.
+        const badUntil = this.unreadableChats.get(conv.id);
+        if (badUntil && badUntil > Date.now()) continue;
+        let detail: any;
+        try {
+          detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle, silent: true });
+        } catch (err) {
+          if (err instanceof GraphApiError && err.code === 100) {
+            this.unreadableChats.set(conv.id, Date.now() + 3600_000);
+            this.logger.debug?.(`Skipping a chat Instagram will not let us read (@${ownHandle}): ${err.message}`);
+            continue;
+          }
+          throw err;
+        }
         const msgs: any[] = [...(detail.messages?.data ?? [])].reverse(); // oldest first
         let added = 0;
         let addedInbound = 0;
