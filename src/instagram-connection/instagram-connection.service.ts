@@ -65,6 +65,7 @@ export class InstagramConnectionService implements OnModuleInit {
         'comment',
         'submission',
         'story',
+        'facebook_page_connection',
       ];
       for (const table of legacyTables) {
         await this.repo.query(`UPDATE "${table}" SET "owner_username" = 'fabroniee' WHERE "owner_username" IS NULL`).catch(() => {});
@@ -118,7 +119,12 @@ export class InstagramConnectionService implements OnModuleInit {
     if (!profileUrl || !username) {
       try {
         const FB_API = 'https://graph.facebook.com/v21.0';
-        const [fbConn] = (await this.repo.manager.getRepository('FacebookPageConnection').find({ take: 1 })) as any;
+        // Only THIS account's Page, never "the first Page in the table".
+        const fbConn = (await this.repo.manager
+          .getRepository('FacebookPageConnection')
+          .createQueryBuilder('f')
+          .where('LOWER(f.owner_username) = :o', { o: String(connection.username || '').toLowerCase() })
+          .getOne()) as any;
         if (fbConn?.pageAccessToken && connection.igUserId) {
           const fbRes = await fetch(`${FB_API}/${connection.igUserId}?fields=id,username,name,profile_picture_url&access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
           const fbData = await fbRes.json();
@@ -323,7 +329,10 @@ export class InstagramConnectionService implements OnModuleInit {
     // 2. Also inspect Facebook Page access token if available
     try {
       const fbRepo = this.repo.manager.getRepository('FacebookPageConnection');
-      const [fbConn] = (await fbRepo.find({ take: 1 })) as any;
+      const fbConn = (await fbRepo
+        .createQueryBuilder('f')
+        .where('LOWER(f.owner_username) = :o', { o: String(connection.username || '').toLowerCase() })
+        .getOne()) as any;
       if (fbConn?.pageAccessToken) {
         await inspectToken(fbConn.pageAccessToken);
         await checkMePerms(fbConn.pageAccessToken, FB_API);
@@ -497,7 +506,8 @@ export class InstagramConnectionService implements OnModuleInit {
   }
 
   async disconnect(account?: string) {
-    const conn = await this.getConnectionRow(account);
+    // Destructive: never "the latest connection" when no account is named.
+    const conn = account ? await this.getConnectionRow(account) : null;
     if (conn) {
       const username = conn.username;
       await this.repo.remove(conn);
@@ -507,7 +517,8 @@ export class InstagramConnectionService implements OnModuleInit {
   }
 
   async wipeAccountData(account?: string) {
-    const conn = await this.getConnectionRow(account);
+    // Destructive: never "the latest connection" when no account is named.
+    const conn = account ? await this.getConnectionRow(account) : null;
     if (conn) {
       const username = conn.username;
       await this.repo.remove(conn);

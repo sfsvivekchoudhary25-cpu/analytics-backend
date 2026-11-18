@@ -174,7 +174,11 @@ export class InstagramOauthController {
       // Auto-link Facebook Page if one exists in FacebookPageConnection
       try {
         const fbRepo = this.userRepo.manager.getRepository('FacebookPageConnection');
-        const [fbConn] = (await fbRepo.find({ take: 1 })) as any;
+        // Only this account's own Page (never someone else's) can be completed with this Instagram id.
+        const fbConn = (await fbRepo
+          .createQueryBuilder('f')
+          .where('LOWER(f.owner_username) = :o', { o: String(username || '').toLowerCase() })
+          .getOne()) as any;
         if (fbConn && !fbConn.igUserId && userId) {
           fbConn.igUserId = userId;
           await fbRepo.save(fbConn);

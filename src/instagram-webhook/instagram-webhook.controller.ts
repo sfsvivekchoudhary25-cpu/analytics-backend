@@ -51,9 +51,9 @@ export class InstagramWebhookController {
     @Query('hub.verify_token') token: string,
     @Query('hub.challenge') challenge: string,
   ) {
-    const expected =
-      process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN ||
-      (process.env.NODE_ENV !== 'production' ? 'dfed4dff43bfe4c623eaee3cd7aafd9e493448ca3e877a3f' : '');
+    // Only the configured secret is accepted. (A fallback token used to be written in this file; anyone who could
+    // read the repository could pass the handshake in non-production mode.)
+    const expected = process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN || '';
     if (mode !== 'subscribe' || !expected || !safeEqual(String(token ?? ''), expected)) {
       this.logger.warn('Verification handshake REJECTED (wrong verify token or mode)');
       throw new ForbiddenException();

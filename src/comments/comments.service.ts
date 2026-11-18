@@ -80,7 +80,7 @@ export class CommentsService {
       const media = await this.graph.get('/me/media', {
         fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
         limit: '30',
-      });
+      }, { account: own });
       mediaData = media?.data ?? [];
     } catch (err) {
       this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
@@ -127,14 +127,17 @@ export class CommentsService {
   }
 
   // Post a top-level comment (e.g. hashtags, creator announcement) directly on an Instagram post/media
-  async postMediaComment(mediaId: string, rawText: string) {
+  async postMediaComment(mediaId: string, rawText: string, account?: string) {
     const text = String(rawText ?? '').trim();
     if (!text) throw new BadRequestException('Comment is empty.');
     if (text.length > 2200) throw new BadRequestException('Comment is too long (2200 characters max).');
+    // Must post AS the caller's own account. With no account of their own, the call is refused (it used to post
+    // as whichever account was connected most recently).
+    if (!account) throw new BadRequestException('No Instagram account connected.');
     try {
-      const res = await this.graph.post(`/${mediaId}/comments`, { message: text });
+      const res = await this.graph.post(`/${mediaId}/comments`, { message: text }, { account });
       this.logger.log(`POSTED comment on media ${mediaId}: "${preview(text)}"`);
-      this.sync().catch(() => {});
+      this.sync(account).catch(() => {});
       return { success: true, id: res?.id };
     } catch (err) {
       this.logger.warn(`Post comment on media ${mediaId} FAILED: ${(err as Error).message}`);
@@ -145,7 +148,7 @@ export class CommentsService {
   async setHidden(id: string, hidden: boolean) {
     const c = await this.getOrThrow(id);
     try {
-      await this.graph.post(`/${id}`, { hide: hidden ? 'true' : 'false' });
+      await this.graph.post(`/${id}`, { hide: hidden ? 'true' : 'false' }, { account: this.accountOf(c) });
     } catch (err) {
       // A comment Instagram has already dropped can't be told to hide/unhide either — but there's nothing
       // left to show or hide at that point, so just reflect that locally instead of blocking the user on it.
@@ -165,7 +168,7 @@ export class CommentsService {
   async like(id: string) {
     const c = await this.getOrThrow(id);
     try {
-      await this.graph.post(`/${id}/likes`, {});
+      await this.graph.post(`/${id}/likes`, {}, { account: this.accountOf(c) });
       this.logger.log(`LIKED comment by @${c.username || c.id}: "${preview(c.text, 50)}"`);
       return { success: true, id };
     } catch (err) {
@@ -178,7 +181,7 @@ export class CommentsService {
   async unlike(id: string) {
     const c = await this.getOrThrow(id);
     try {
-      await this.graph.delete(`/${id}/likes`);
+      await this.graph.delete(`/${id}/likes`, {}, { account: this.accountOf(c) });
       this.logger.log(`UNLIKED comment by @${c.username || c.id}`);
       return { success: true, id };
     } catch (err) {
@@ -187,8 +190,16 @@ export class CommentsService {
     }
   }
 
+  // The Instagram account that owns this comment: every action on a comment uses THAT account's token.
+  // If the comment has no owner recorded, refuse rather than guess "the latest connected account".
+  private accountOf(c: Comment): string {
+    const own = String(c.ownerUsername ?? '').trim();
+    if (!own) throw new BadRequestException('This comment is not linked to an Instagram account.');
+    return own;
+  }
+
   private async sendReply(c: Comment, text: string, kind: ReplyKind) {
-    await this.graph.post(`/${c.id}/replies`, { message: text });
+    await this.graph.post(`/${c.id}/replies`, { message: text }, { account: this.accountOf(c) });
     c.myReply = text;
     c.repliedAt = new Date();
     c.replyKind = kind;

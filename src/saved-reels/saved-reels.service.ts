@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SavedReel } from './saved-reel.entity';
@@ -35,7 +35,10 @@ export class SavedReelsService {
    * Resolve owner username, defaulting to 'default' if not authenticated
    */
   private resolveOwner(ownerUsername?: string): string {
-    return (ownerUsername || 'default').trim().replace(/^@/, '').toLowerCase();
+    const owner = (ownerUsername || '').trim().replace(/^@/, '').toLowerCase();
+    // Never fall back to a shared owner: with no owner there is nothing to read or write.
+    if (!owner) throw new UnauthorizedException();
+    return owner;
   }
 
   /**
@@ -44,10 +47,7 @@ export class SavedReelsService {
   async findAll(ownerUsername?: string): Promise<SavedReel[]> {
     const owner = this.resolveOwner(ownerUsername);
     return this.repo.find({
-      where: [
-        { ownerUsername: owner },
-        { ownerUsername: 'default' }, // Fallback to shared/default vault
-      ],
+      where: { ownerUsername: owner },
       order: { savedAt: 'DESC' },
     });
   }

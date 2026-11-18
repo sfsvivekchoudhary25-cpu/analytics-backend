@@ -115,9 +115,9 @@ async function bootstrap() {
   // Only the Comment-to-DM automation's send depends on this — everything else in the app is unaffected.
   const fbRedirect = process.env.FACEBOOK_REDIRECT_URI || (publicUrl ? `${publicUrl}/facebook-page/oauth/callback` : '');
   if (fbRedirect) log.log(`Facebook Page OAuth redirect URI (add under Facebook Login for Business in the Meta dashboard): ${fbRedirect}`);
-  const fbStatus: any = await app.get(FacebookPageService).getStatus();
-  if (fbStatus.connected) {
-    log.log(`Facebook Page: connected ("${fbStatus.pageName}") — Comment-to-DM automation can send.`);
+  const fbCount = await app.get(FacebookPageService).countConnected().catch(() => 0);
+  if (fbCount > 0) {
+    log.log(`Facebook Page: ${fbCount} account(s) have a Page connected — Comment-to-DM automation can send for them.`);
   } else {
     log.warn('Facebook Page: NOT connected. Comment-to-DM automation cannot send until one is connected in Account settings.');
   }

@@ -391,12 +391,15 @@ export class SubmissionsService {
 
     // Best match: the ig.me link's ref. Fallback: the sender's username.
     const ref: string | undefined = ev.referral?.ref ?? ev.message?.referral?.ref ?? ev.postback?.referral?.ref;
-    let s = ref ? await this.repo.findOne({ where: { ref } }) : null;
+    // Which of our connected accounts received this message (ownId = that account's Instagram id).
+    const owner = (await this.connection.getConnectionByIgUserId(ownId))?.username?.toLowerCase();
+    if (!owner) return; // an event for an account we don't have connected: never guess another one
+    let s = ref ? await this.repo.findOne({ where: { ref, ownerUsername: owner } }) : null;
     if (!s) {
-      const profile = await this.graph.get(`/${senderId}`, { fields: 'username' }).catch(() => null);
+      const profile = await this.graph.get(`/${senderId}`, { fields: 'username' }, { account: owner }).catch(() => null);
       const username = String(profile?.username ?? '').toLowerCase();
       if (username) {
-        s = await this.repo.findOne({ where: { igUsername: username, dmStatus: 'waiting' }, order: { createdAt: 'DESC' } });
+        s = await this.repo.findOne({ where: { igUsername: username, dmStatus: 'waiting', ownerUsername: owner }, order: { createdAt: 'DESC' } });
       }
     }
     if (!s) {
@@ -416,7 +419,7 @@ export class SubmissionsService {
   private async sendThanks(s: Submission) {
     try {
       const text = `Thanks @${s.igUsername}! 💛 Your photo is now live on our page${s.permalink ? `: ${s.permalink}` : '.'}`;
-      await this.messaging.send(s.igsid as string, text, 'system'); // also lands in the inbox thread
+      await this.messaging.send(s.igsid as string, text, 'system', undefined, undefined, s.ownerUsername ?? undefined); // also lands in the inbox thread, sent from the submission's own account
       s.dmStatus = 'sent';
       this.logger.log(`Thank-you DM sent to @${s.igUsername}`);
     } catch (err) {

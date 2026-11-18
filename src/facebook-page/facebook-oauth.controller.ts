@@ -110,22 +110,20 @@ export class FacebookOauthController {
         return back({ error: 'That Facebook login has no Pages you manage. Create/link a Page to your Instagram account first.' });
       }
 
-      // Prefer the Page whose linked Instagram account matches the one already connected via Instagram Login.
-      const myIgUserId = await this.connection.getIgUserId().catch(() => null);
-      const matched = myIgUserId ? pages.find((p) => p.instagram_business_account?.id === myIgUserId) : null;
-      // Fallback: pick any page that has a linked Instagram account, then just the first page
-      const withIg = pages.find((p) => p.instagram_business_account?.id);
-      const chosen = matched ?? (pages.length === 1 ? pages[0] : withIg ?? pages[0]);
-
+      // Use the Page that has an Instagram professional account linked. Meta itself tells us which Instagram
+      // account that is, and THAT account becomes the owner of the connection (nothing here is typed by a user).
+      const withIg = pages.find((p) => p.instagram_business_account?.id && p.instagram_business_account?.username);
+      const chosen = withIg ?? null;
       if (!chosen) {
         const names = pages.map((p) => p.name).join(', ');
         return back({
-          error: `Found ${pages.length} Pages (${names}) but none match your connected Instagram account. Make sure the right Page is linked to your Instagram account in Meta Business Suite.`,
+          error: `Found ${pages.length} Page(s) (${names}) but none has an Instagram professional account linked. Link one in Meta Business Suite and try again.`,
         });
       }
+      const igUsername = String(chosen.instagram_business_account!.username);
 
-      await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null);
-      this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id})${matched ? ', matches your Instagram account' : ''}.`);
+      await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null, igUsername);
+      this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id}) for @${igUsername}.`);
 
       // Subscribe Page to feed and messaging webhooks
       try {
@@ -153,10 +151,17 @@ export class FacebookOauthController {
         }
       }
 
-      // Dynamically auto-connect Instagram connection using Page access token if not already connected
+      // Auto-connect the Instagram account from the Page token ONLY if this account has no Instagram connection
+      // yet (never overwrite an existing Instagram Login token with a Page token).
       try {
-        await this.connection.connect(chosen.access_token);
-        this.logger.log(`Auto-connected Instagram account via Facebook Page token for page "${chosen.name}"`);
+        const existingIg = await this.connection.getConnectionRow(igUsername);
+        if (!existingIg) {
+          await this.connection.connect(chosen.access_token, undefined, null, {
+            userId: chosen.instagram_business_account?.id,
+            username: igUsername,
+          });
+          this.logger.log(`Auto-connected Instagram account @${igUsername} via Facebook Page token for page "${chosen.name}"`);
+        }
       } catch (igErr) {
         this.logger.warn(`Could not auto-connect Instagram from Facebook Page token: ${igErr}`);
       }
@@ -170,29 +175,21 @@ export class FacebookOauthController {
             .filter((p: any) => p.status === 'granted')
             .map((p: any) => p.permission);
           if (granted.length > 0) {
-            await this.pages.syncPermissionsToInstagramConnection(granted);
+            await this.pages.syncPermissionsToInstagramConnection(granted, igUsername);
           }
         }
       } catch (err) {
         this.logger.warn(`Could not sync permissions after Facebook OAuth: ${err}`);
       }
 
-      // Live-sync all permissions from Meta
+      // Live-sync all permissions from Meta (for this account only)
       try {
-        await this.connection.syncLivePermissions();
+        await this.connection.syncLivePermissions(igUsername);
       } catch (syncErr) {
         this.logger.warn(`Could not live-sync permissions: ${syncErr}`);
       }
 
-      // Also auto-provision or find user in app_users
-      let igUsername = (await this.connection.getStatus()).username || null;
-      if (!igUsername && chosen.instagram_business_account?.id) {
-        try {
-          const igInfo = await fetch(`https://graph.facebook.com/v21.0/${chosen.instagram_business_account.id}?fields=username&access_token=${chosen.access_token}`).then(r => r.json());
-          if (igInfo?.username) igUsername = igInfo.username;
-        } catch {}
-      }
-
+      // Also auto-provision or find the user for this verified Instagram account
       let sessionToken = '';
       if (igUsername) {
         const handle = igUsername.toLowerCase();
@@ -205,7 +202,7 @@ export class FacebookOauthController {
             name: chosen.name || igUsername,
             passwordHash: '',
             instagramHandle: igUsername,
-            role: 'admin',
+            role: 'user',
           });
           user = await this.userRepo.save(user);
         }
@@ -258,8 +255,8 @@ export class FacebookOauthController {
 
   private async listPages(
     userToken: string,
-  ): Promise<{ id: string; name: string; access_token: string; instagram_business_account?: { id: string } }[]> {
-    const params = new URLSearchParams({ fields: 'id,name,access_token,instagram_business_account', access_token: userToken });
+  ): Promise<{ id: string; name: string; access_token: string; instagram_business_account?: { id: string; username?: string } }[]> {
+    const params = new URLSearchParams({ fields: 'id,name,access_token,instagram_business_account{id,username}', access_token: userToken });
     const res = await fetch(`${FB_API}/me/accounts?${params}`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.error?.message ?? 'Could not list your Facebook Pages.');

@@ -391,9 +391,9 @@ export class CommentDmService {
 
   // Check whether the given IGSID follows us using the Facebook Messaging User Profile API.
   // Returns true/false/null (null = could not determine, treat as not following).
-  private async checkIsFollowing(igsid: string): Promise<boolean | null> {
+  private async checkIsFollowing(igsid: string, account?: string): Promise<boolean | null> {
     try {
-      const pageToken = await this.facebookPage.getPageAccessToken();
+      const pageToken = await this.facebookPage.getPageAccessToken(account);
       const FB_API = 'https://graph.facebook.com/v21.0';
       const res = await fetch(`${FB_API}/${igsid}?fields=is_user_follow_business&access_token=${encodeURIComponent(pageToken)}`);
       const body = await res.json();
@@ -423,7 +423,7 @@ export class CommentDmService {
       if (prevLog?.igsid) return prevLog.igsid;
     }
     try {
-      const data = await this.graph.get(`/${c.id}`, { fields: 'from{id,username}' }, { silent: true });
+      const data = await this.graph.get(`/${c.id}`, { fields: 'from{id,username}' }, { silent: true, account: c.ownerUsername ?? undefined });
       if (data?.from?.id) return String(data.from.id);
     } catch {}
     return null;
@@ -508,14 +508,14 @@ export class CommentDmService {
           const igsid = await this.getIgsidForComment(c);
           let isFollowing: boolean | null = null;
           if (igsid) {
-            isFollowing = await this.checkIsFollowing(igsid);
+            isFollowing = await this.checkIsFollowing(igsid, own ?? undefined);
           }
 
           if (isFollowing === true) {
             // Already following! Send real DM directly.
             // Do NOT send the follow-gate "Oh no! It seems you're not following me" message!
             const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-            const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
+            const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
             await finish({
                 igsid: recipientId || igsid,
                 status: 'sent',
@@ -531,7 +531,8 @@ export class CommentDmService {
           // Step 2: User is NOT following (or status unknown without sending a message)
           let profileUrl = 'https://www.instagram.com/';
           try {
-            const status = await this.connection.getStatus();
+            // The profile link must be the account that owns the comment, not "the latest connected account".
+            const status = await this.connection.getStatus(own ?? undefined);
             if (status.username) {
               profileUrl = `https://www.instagram.com/${status.username}/`;
             }
@@ -544,14 +545,14 @@ export class CommentDmService {
 
           // Send the follow-gate message as a private reply to the comment with buttons
           const gateText = (rule.followGateText || DEFAULT_FOLLOW_GATE_TEXT).replaceAll('{username}', c.username || 'there');
-          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, gateText, buttons);
+          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, gateText, buttons, undefined, own ?? undefined);
 
           // If follow status was unknown initially, check again with recipientId from Meta
           if (isFollowing === null) {
-            isFollowing = await this.checkIsFollowing(recipientId);
+            isFollowing = await this.checkIsFollowing(recipientId, own ?? undefined);
             if (isFollowing === true) {
               const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-              await this.messaging.send(recipientId, dmText, 'system', dmButtons, dmCard);
+              await this.messaging.send(recipientId, dmText, 'system', dmButtons, dmCard, own ?? undefined);
               await finish({
                   igsid: recipientId,
                   status: 'sent',
@@ -578,7 +579,7 @@ export class CommentDmService {
         } else {
           // No follow gate — send DM directly (supports text, buttons, and card templates).
           const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
+          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
           await finish({ igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false });
           this.logger.log(`DM sent to @${c.username || c.id} via "${rule.name}" (reply to comment: "${preview(c.text, 50)}")`);
         }
@@ -649,7 +650,7 @@ export class CommentDmService {
           continue;
         }
 
-        const isFollowing = await this.checkIsFollowing(senderId);
+        const isFollowing = await this.checkIsFollowing(senderId, followGateLog.ownerUsername ?? undefined);
         this.logger.log(`[follow-gate webhook] @${followGateLog.username} messaged in — is_following=${isFollowing}`);
 
         const postbackTitle = String(ev.postback?.title ?? '').toLowerCase();
@@ -835,7 +836,7 @@ export class CommentDmService {
       const shouldCheck = newInboundSincePrompt || isWaitingForReply || msSinceLastPrompt > 60_000;
       if (!shouldCheck) continue;
 
-      const isFollowing = await this.checkIsFollowing(igsid);
+      const isFollowing = await this.checkIsFollowing(igsid, targetLog.ownerUsername ?? undefined);
       this.logger.log(`[follow-gate fallback] @${username} (igsid: ${igsid}) is_following=${isFollowing}`);
 
       const rule = await this.rules.findOne({ where: { id: targetLog.ruleId } });

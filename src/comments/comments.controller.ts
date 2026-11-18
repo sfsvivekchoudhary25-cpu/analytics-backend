@@ -68,13 +68,13 @@ export class CommentsController {
   }
 
   @Post('media-comment')
-  postMediaCommentBody(@Body('mediaId') mediaId: string, @Body('message') message: string) {
-    return this.service.postMediaComment(mediaId, message);
+  postMediaCommentBody(@Body('mediaId') mediaId: string, @Body('message') message: string, @CurrentAccount() account?: string) {
+    return this.service.postMediaComment(mediaId, message, account);
   }
 
   @Post('media/:mediaId/comment')
-  postMediaComment(@Param('mediaId') mediaId: string, @Body('message') message: string) {
-    return this.service.postMediaComment(mediaId, message);
+  postMediaComment(@Param('mediaId') mediaId: string, @Body('message') message: string, @CurrentAccount() account?: string) {
+    return this.service.postMediaComment(mediaId, message, account);
   }
 
   @Post(':id/hide')

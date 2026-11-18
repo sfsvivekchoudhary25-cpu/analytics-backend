@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { GraphApiError } from '../instagram-connection/graph-client.service';
 import { FacebookPageConnection } from './facebook-page.entity';
+import { NO_ACCOUNT } from '../common/current-account.decorator';
 
 const FB_API = 'https://graph.facebook.com/v21.0';
 
@@ -23,27 +24,30 @@ export class FacebookPageService {
   // A System User token is NOT itself a Page token: /me on it resolves to the system user's own identity
   // (confirmed directly — it has no `instagram_business_account` field and isn't a Page). The real Page token
   // has to be read off /me/accounts, same as the OAuth flow does for a personal login token.
-  async connectWithToken(pastedToken: string) {
+  async connectWithToken(pastedToken: string, account?: string) {
     const token = pastedToken.trim();
     if (!token) throw new BadRequestException('Paste the access token first.');
+    const current = this.cleanAccount(account);
 
     const accountsRes = await fetch(
-      `${FB_API}/me/accounts?fields=id,name,access_token,instagram_business_account&access_token=${encodeURIComponent(token)}`,
+      `${FB_API}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${encodeURIComponent(token)}`,
     );
     const accountsBody = await accountsRes.json();
-    let result: { pageName: string };
+    let result: { pageName: string; ownerUsername: string };
     if (accountsRes.ok && Array.isArray(accountsBody.data) && accountsBody.data.length > 0) {
-      const pages = accountsBody.data as { id: string; name: string; access_token: string; instagram_business_account?: { id: string } }[];
-      const chosen = pages.length === 1 ? pages[0] : pages.find((p) => p.instagram_business_account) ?? pages[0];
-      result = await this.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null);
+      const pages = accountsBody.data as { id: string; name: string; access_token: string; instagram_business_account?: { id: string; username?: string } }[];
+      // Prefer the Page linked to the Instagram account this user already owns.
+      const mine = current ? pages.find((p) => p.instagram_business_account?.username?.toLowerCase() === current) : undefined;
+      const chosen = mine ?? (pages.length === 1 ? pages[0] : pages.find((p) => p.instagram_business_account) ?? pages[0]);
+      result = await this.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null, chosen.instagram_business_account?.username ?? null, current);
     } else {
       // Fall back to treating the pasted value as a Page token directly (e.g. someone pasted a Page token, not
       // a System User/personal token).
-      const meRes = await fetch(`${FB_API}/me?fields=id,name,instagram_business_account&access_token=${encodeURIComponent(token)}`);
+      const meRes = await fetch(`${FB_API}/me?fields=id,name,instagram_business_account{id,username}&access_token=${encodeURIComponent(token)}`);
       const meBody = await meRes.json();
       if (!meRes.ok) throw new BadRequestException(meBody?.error?.message ?? accountsBody?.error?.message ?? 'Facebook rejected that token.');
       if (!meBody.id || !meBody.name) throw new BadRequestException('That token did not resolve to a Facebook Page.');
-      result = await this.connect(meBody.id, meBody.name, token, meBody.instagram_business_account?.id ?? null);
+      result = await this.connect(meBody.id, meBody.name, token, meBody.instagram_business_account?.id ?? null, meBody.instagram_business_account?.username ?? null, current);
     }
 
     // Automatically query Meta for all live granted permissions on this token and sync them
@@ -55,7 +59,7 @@ export class FacebookPageService {
           .filter((p: any) => p.status === 'granted')
           .map((p: any) => p.permission);
         if (granted.length > 0) {
-          await this.syncPermissionsToInstagramConnection(granted);
+          await this.syncPermissionsToInstagramConnection(granted, result.ownerUsername);
         }
       }
     } catch (err) {
@@ -65,10 +69,16 @@ export class FacebookPageService {
     return result;
   }
 
-  async syncPermissionsToInstagramConnection(granted: string[]) {
+  // Only ever touches the Instagram connection of the given account, never "whichever row comes first".
+  async syncPermissionsToInstagramConnection(granted: string[], account?: string) {
+    const owner = this.cleanAccount(account);
+    if (!owner) return;
     try {
       const igRepo = this.repo.manager.getRepository('InstagramConnection');
-      const [igConn] = (await igRepo.find({ take: 1 })) as any;
+      const igConn = (await igRepo
+        .createQueryBuilder('c')
+        .where('LOWER(c.username) = :u', { u: owner })
+        .getOne()) as any;
       if (igConn) {
         const existing = (igConn.permissions ? igConn.permissions.split(',') : []).map((s: string) => s.trim());
         const combined = Array.from(new Set([...existing, ...granted])).filter(Boolean);
@@ -81,32 +91,63 @@ export class FacebookPageService {
     }
   }
 
-  async connect(pageId: string, pageName: string, pageAccessToken: string, igUserId: string | null) {
-    const row = (await this.getRow()) ?? this.repo.create();
+  // "fbUsername" is the Instagram handle Meta reports for this Page's linked Instagram account. It decides who
+  // owns the row, so the Page can only ever be tied to the Instagram account it is actually linked to.
+  // "expected" is the account the signed-in user already owns (if any): a mismatch is refused.
+  async connect(
+    pageId: string,
+    pageName: string,
+    pageAccessToken: string,
+    igUserId: string | null,
+    fbUsername: string | null,
+    expected?: string,
+  ) {
+    const owner = this.cleanAccount(fbUsername) || expected || '';
+    if (!owner) {
+      throw new BadRequestException('This Facebook Page has no Instagram professional account linked, so it cannot be tied to your account. Link one in Meta Business Suite first.');
+    }
+    if (expected && owner !== expected) {
+      throw new BadRequestException(`That Page is linked to @${owner}, but your account is @${expected}. Connect the Page that belongs to @${expected}.`);
+    }
+    const taken = await this.repo
+      .createQueryBuilder('f')
+      .where('f.page_id = :p AND (f.owner_username IS NULL OR LOWER(f.owner_username) <> :o)', { p: pageId, o: owner })
+      .getOne();
+    if (taken) {
+      throw new BadRequestException('That Facebook Page is already connected to a different account.');
+    }
+    const row = (await this.getRow(owner)) ?? this.repo.create();
+    row.ownerUsername = owner;
     row.pageId = pageId;
     row.pageName = pageName;
     row.pageAccessToken = pageAccessToken;
     row.igUserId = igUserId;
     await this.repo.save(row);
-    return { pageName };
+    return { pageName, ownerUsername: owner };
   }
 
-  async disconnect() {
-    const row = await this.getRow();
+  async disconnect(account?: string) {
+    const row = await this.getRow(account);
     if (row) await this.repo.remove(row);
     return { ok: true };
   }
 
-  async getStatus() {
-    const row = await this.getRow();
+  async getStatus(account?: string) {
+    const row = await this.getRow(account);
     if (!row) return { connected: false as const };
     return { connected: true as const, pageId: row.pageId, pageName: row.pageName, igUserId: row.igUserId };
   }
 
-  async getPageAccessToken(): Promise<string> {
-    const row = await this.getRow();
+  async getPageAccessToken(account?: string): Promise<string> {
+    const row = await this.getRow(account);
     if (!row) throw new BadRequestException('No Facebook Page connected.');
     return row.pageAccessToken;
+  }
+
+  /** Lower-cases/strips an account name. Empty for "no account" so lookups match nothing. */
+  private cleanAccount(account?: string | null): string {
+    const a = String(account ?? '').trim().replace(/^@/, '').toLowerCase();
+    return a === NO_ACCOUNT ? '' : a;
   }
 
   // Meta's actual "private reply to a comment" mechanism: not a dedicated endpoint, but the Page's own
@@ -118,8 +159,9 @@ export class FacebookPageService {
     text: string,
     buttons?: MessageButton[],
     card?: { title?: string; subtitle?: string; imageUrl?: string; buttons?: MessageButton[] },
+    account?: string,
   ): Promise<{ recipientId: string; messageId: string }> {
-    const row = await this.getRow();
+    const row = await this.getRow(account);
     if (!row) throw new BadRequestException('No Facebook Page connected.');
 
     const sanitizeUrl = (raw?: string | null): string => {
@@ -294,8 +336,15 @@ export class FacebookPageService {
     return { recipientId: body.recipient_id, messageId: body.message_id };
   }
 
-  private async getRow(): Promise<FacebookPageConnection | null> {
-    const [row] = await this.repo.find({ take: 1 });
-    return row ?? null;
+  // The Page of ONE account. There is deliberately no "first row" fallback: a missing account means no Page.
+  private async getRow(account?: string): Promise<FacebookPageConnection | null> {
+    const owner = this.cleanAccount(account);
+    if (!owner) return null;
+    return this.repo.createQueryBuilder('f').where('LOWER(f.owner_username) = :o', { o: owner }).getOne();
+  }
+
+  /** Number of connected Pages (for the startup log only). */
+  async countConnected(): Promise<number> {
+    return this.repo.count();
   }
 }
