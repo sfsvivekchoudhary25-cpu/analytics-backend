@@ -229,17 +229,20 @@ export class InstagramConnectionService implements OnModuleInit {
       } catch {}
     }
 
-    // 3. Fallback: if identity could not be retrieved from Graph API, use OAuth identity
-    if (!me && (fallbackIdentity?.userId || fallbackIdentity?.username)) {
+    // 3. Fallback: only when the login flow already gave us a REAL username. We never invent one: an account we cannot
+    //    identify used to be saved as "creator", which made unrelated people share one account and a 1-hour token.
+    if (!me && fallbackIdentity?.username && fallbackIdentity?.userId) {
       me = {
-        user_id: String(fallbackIdentity.userId || 'ig_' + Date.now()),
-        username: fallbackIdentity.username || 'creator',
+        user_id: String(fallbackIdentity.userId),
+        username: fallbackIdentity.username,
       };
       this.logger.log(`Using OAuth fallback identity: @${me.username} (id: ${me.user_id})`);
     }
 
     if (!me) {
-      throw new BadRequestException('Could not verify that token with Instagram. Double-check it and try again.');
+      throw new BadRequestException(
+        "Instagram would not tell us which account this is. Make sure it is a Professional (Business or Creator) account and that it is added as an Instagram Tester for this app, then try again.",
+      );
     }
 
     const cleanNew = me.username ? me.username.trim().toLowerCase() : null;
