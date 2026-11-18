@@ -32,9 +32,10 @@ export class InstagramConnection {
   @Column({ name: 'profile_picture_url', type: 'text', nullable: true })
   profilePictureUrl: string | null;
 
-  // Privacy switch. When false ("Don't store my messages") the text of customer DMs is never written to the
+  // Privacy switch. When false (the default for new accounts) the text of customer DMs is never written to the
   // database: chats are read live from Instagram and automation works from a short in-memory copy.
-  @Column({ name: 'store_messages', type: 'boolean', default: true })
+  // The account owner can turn storing on in Account > Data Privacy (then it is encrypted at rest).
+  @Column({ name: 'store_messages', type: 'boolean', default: false })
   storeMessages: boolean;
 
   @UpdateDateColumn({ name: 'updated_at' })
