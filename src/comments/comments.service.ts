@@ -71,19 +71,89 @@ export class CommentsService {
     });
   }
 
+  // One page of top-level comments for the inbox, newest first, filtered on the server so the browser never has to
+  // download them all. `cursor` is "<commentedAt ISO>|<id>" of the last comment of the previous page.
+  async page(
+    params: { tab?: string; post?: string; q?: string; limit?: number | string; cursor?: string },
+    ownerUsername?: string,
+  ) {
+    const own = await this.resolveOwner(ownerUsername);
+    const empty = { items: [] as Comment[], nextCursor: null as string | null, counts: { all: 0, unreplied: 0, replied: 0 } };
+    if (!own) return empty;
+    const limit = Math.min(Math.max(Number(params.limit) || 20, 1), 50);
+    const mine = () =>
+      this.comments
+        .createQueryBuilder('c')
+        .where('c.parentId IS NULL')
+        .andWhere('c.isOwn = false')
+        .andWhere('LOWER(c.ownerUsername) = :own', { own });
+
+    // Tab badges count everything (not narrowed by post or search).
+    const raw = await mine()
+      .select('COUNT(*)', 'all')
+      .addSelect('COUNT(*) FILTER (WHERE c.repliedAt IS NULL)', 'unreplied')
+      .addSelect('COUNT(*) FILTER (WHERE c.repliedAt IS NOT NULL)', 'replied')
+      .getRawOne();
+    const counts = { all: Number(raw?.all ?? 0), unreplied: Number(raw?.unreplied ?? 0), replied: Number(raw?.replied ?? 0) };
+
+    const qb = mine();
+    if (params.tab === 'unreplied') qb.andWhere('c.repliedAt IS NULL');
+    else if (params.tab === 'replied') qb.andWhere('c.repliedAt IS NOT NULL');
+    const post = String(params.post ?? '').trim();
+    // % and _ typed by the user are matched literally (post codes contain underscores).
+    const esc = (v: string) => v.replace(/[\\%_]/g, (m) => '\\' + m);
+    if (post) qb.andWhere('LOWER(c.mediaPermalink) LIKE :post', { post: `%${esc(post.toLowerCase())}%` });
+    const q = String(params.q ?? '').trim().toLowerCase();
+    if (q) {
+      const like = `%${esc(q)}%`;
+      qb.andWhere('(LOWER(c.username) LIKE :q OR LOWER(c.text) LIKE :q)', { q: like });
+    }
+    const [ts, id] = String(params.cursor ?? '').split('|');
+    const when = ts ? new Date(ts) : null;
+    if (when && !Number.isNaN(+when) && id) {
+      qb.andWhere('(c.commentedAt < :ts OR (c.commentedAt = :ts AND c.id < :id))', { ts: when, id });
+    }
+    const rows = await qb.orderBy('c.commentedAt', 'DESC').addOrderBy('c.id', 'DESC').take(limit + 1).getMany();
+    const items = rows.slice(0, limit);
+    const last = items[items.length - 1];
+    return {
+      items,
+      nextCursor: rows.length > limit && last ? `${last.commentedAt.toISOString()}|${last.id}` : null,
+      counts,
+    };
+  }
+
+  // The same posts, a slice at a time (the Instagram call behind it is remembered for a minute, so "load more" is instant).
+  async postsPage(offset: number | string | undefined, limit: number | string | undefined, ownerUsername?: string) {
+    const all = await this.postsWithComments(ownerUsername);
+    const from = Math.max(Number(offset) || 0, 0);
+    const size = Math.min(Math.max(Number(limit) || 6, 1), 30);
+    const items = all.slice(from, from + size);
+    return { items, total: all.length, nextOffset: from + size < all.length ? from + size : null };
+  }
+
+  private readonly postsMediaCache = new Map<string, { at: number; data: any[] }>();
+
   // Posts that Instagram says have comments, with how many of them the API has actually shared with us.
   async postsWithComments(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
     if (!own) return [];
     let mediaData: any[] = [];
-    try {
-      const media = await this.graph.get('/me/media', {
-        fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
-        limit: '30',
-      }, { account: own });
-      mediaData = media?.data ?? [];
-    } catch (err) {
-      this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
+    const cached = this.postsMediaCache.get(own);
+    if (cached && Date.now() - cached.at < 60_000) {
+      mediaData = cached.data;
+    } else {
+      try {
+        const media = await this.graph.get('/me/media', {
+          fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
+          limit: '30',
+        }, { account: own });
+        mediaData = media?.data ?? [];
+        this.postsMediaCache.set(own, { at: Date.now(), data: mediaData });
+      } catch (err) {
+        this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
+        mediaData = cached?.data ?? [];
+      }
     }
     const qb = this.comments
       .createQueryBuilder('c')
