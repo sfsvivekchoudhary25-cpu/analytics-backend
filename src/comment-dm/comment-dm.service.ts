@@ -20,9 +20,19 @@ const preview = (t: string, n = 80) => {
 };
 const DAY = 24 * 3600_000;
 
+// How soon the follow check asks Instagram about the same person again. After an unknown answer the wait doubles up
+// to 15 minutes. When Instagram says it may not answer yet (code 230: the person has not messaged us) the first wait
+// is 2 minutes, because only a message from the person can change that, and that message reaches us by webhook.
+const FOLLOW_CHECK_FIRST_WAIT_MS = 10_000;
+const FOLLOW_CHECK_CONSENT_WAIT_MS = 2 * 60_000;
+const FOLLOW_CHECK_MAX_WAIT_MS = 15 * 60_000;
+
 @Injectable()
 export class CommentDmService {
   private readonly logger = new Logger('Comment→DM');
+  // Per person (Instagram-scoped id): when the follow check may look again, and what it saw last. Memory only; a
+  // restart simply starts the waits over.
+  private readonly followChecks = new Map<string, { nextAt: number; misses: number; lastResult: boolean | null; needsConsent: boolean }>();
 
   constructor(
     @InjectRepository(CommentDmRule) private readonly rules: Repository<CommentDmRule>,
@@ -415,11 +425,17 @@ export class CommentDmService {
   // otherwise), so null means "cannot tell yet", never "not following".
   // Returns true/false/null (null = could not determine, treat as not following).
   private async checkIsFollowing(igsid: string, account?: string): Promise<boolean | null> {
+    return (await this.followStatus(igsid, account)).following;
+  }
+
+  // Same check, but also says WHY the answer is unknown: needsConsent means Instagram will not tell us until the
+  // person messages us, so asking again soon is pointless.
+  private async followStatus(igsid: string, account?: string): Promise<{ following: boolean | null; needsConsent: boolean }> {
     try {
       const p = await this.graph.get(`/${igsid}`, { fields: 'is_user_follow_business' }, { silent: true, account });
-      if (typeof p?.is_user_follow_business === 'boolean') return p.is_user_follow_business;
+      if (typeof p?.is_user_follow_business === 'boolean') return { following: p.is_user_follow_business, needsConsent: false };
     } catch (err) {
-      if (isConsentRequired(err)) return null; // not allowed to ask yet; a Page cannot change that
+      if (isConsentRequired(err)) return { following: null, needsConsent: true }; // a Page cannot change that
     }
     try {
       const pageToken = await this.facebookPage.getPageAccessToken(account);
@@ -428,12 +444,12 @@ export class CommentDmService {
       const body = await res.json();
       if (!res.ok) {
         this.logger.debug(`[follow-gate] is_user_follow_business check failed for ${igsid}: ${body?.error?.message}`);
-        return null;
+        return { following: null, needsConsent: false };
       }
-      return body?.is_user_follow_business === true;
+      return { following: body?.is_user_follow_business === true, needsConsent: false };
     } catch (err) {
       this.logger.debug(`[follow-gate] follow check error for ${igsid}: ${(err as Error).message}`);
-      return null;
+      return { following: null, needsConsent: false };
     }
   }
 
@@ -829,9 +845,18 @@ export class CommentDmService {
       byIgsid.set(log.igsid, list);
     }
 
+    // Forget people who are no longer waiting (confirmed, expired or removed).
+    for (const known of this.followChecks.keys()) if (!byIgsid.has(known)) this.followChecks.delete(known);
+
     for (const [igsid, logs] of byIgsid.entries()) {
       const targetLog = logs[0];
       const username = targetLog.username || igsid;
+
+      // Not due yet: skip before doing any database work for this person. A message from them reaches us by webhook
+      // (handleMessageWebhook) and is handled straight away, so this loop is only the safety net.
+      const wait = this.followChecks.get(igsid);
+      if (wait && Date.now() < wait.nextAt) continue;
+
       const latestGateSentAt = logs.reduce(
         (max, l) => (l.followGateSentAt && l.followGateSentAt > max ? l.followGateSentAt : max),
         new Date(0),
@@ -857,8 +882,23 @@ export class CommentDmService {
       const shouldCheck = newInboundSincePrompt || isWaitingForReply || msSinceLastPrompt > 60_000;
       if (!shouldCheck) continue;
 
-      const isFollowing = await this.checkIsFollowing(igsid, targetLog.ownerUsername ?? undefined);
-      this.logger.log(`[follow-gate fallback] @${username} (igsid: ${igsid}) is_following=${isFollowing}`);
+      const { following: isFollowing, needsConsent } = await this.followStatus(igsid, targetLog.ownerUsername ?? undefined);
+      if (isFollowing === true) {
+        this.followChecks.delete(igsid);
+      } else {
+        const misses = (wait?.misses ?? 0) + 1;
+        const first = needsConsent ? FOLLOW_CHECK_CONSENT_WAIT_MS : FOLLOW_CHECK_FIRST_WAIT_MS;
+        this.followChecks.set(igsid, {
+          misses,
+          needsConsent,
+          lastResult: isFollowing,
+          nextAt: Date.now() + Math.min(FOLLOW_CHECK_MAX_WAIT_MS, first * 2 ** (misses - 1)),
+        });
+      }
+      // Say it once, and again only when the answer changes (it used to be logged on every pass).
+      if (!wait || wait.lastResult !== isFollowing) {
+        this.logger.log(`[follow-gate fallback] @${username} (igsid: ${igsid}) is_following=${isFollowing}`);
+      }
 
       const rule = await this.rules.findOne({ where: { id: targetLog.ruleId } });
       if (!rule || !rule.enabled) {
