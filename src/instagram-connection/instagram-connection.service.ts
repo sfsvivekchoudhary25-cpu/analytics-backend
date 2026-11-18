@@ -241,7 +241,7 @@ export class InstagramConnectionService implements OnModuleInit {
 
     if (!me) {
       throw new BadRequestException(
-        "Instagram would not tell us which account this is. Make sure it is a Professional (Business or Creator) account and that it is added as an Instagram Tester for this app, then try again.",
+        "We couldn't verify your Instagram account. Please use a Professional account (Business or Creator) and try again. If it still doesn't work, contact support.",
       );
     }
 
