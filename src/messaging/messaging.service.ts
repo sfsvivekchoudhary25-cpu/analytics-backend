@@ -1,7 +1,7 @@
 import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Between, IsNull, MoreThan, Repository } from 'typeorm';
-import { GraphClient } from '../instagram-connection/graph-client.service';
+import { GraphApiError, GraphClient } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { eventDate, messagingEvents } from '../instagram-webhook/events';
 import { Conversation, Message } from './messaging.entities';
@@ -30,6 +30,34 @@ export function generateLetterAvatar(nameOrId: string | null | undefined): strin
     `</svg>`;
 
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+// Buttons in the shape Instagram expects (title up to 20 characters, valid links only).
+function formatButtons(buttons?: MessageButton[]) {
+  if (!buttons?.length) return undefined;
+  const safeUrl = (raw?: string | null): string => {
+    let u = (raw || '').trim();
+    if (!u || u === 'https://' || u === 'http://') return 'https://www.instagram.com';
+    if (!u.startsWith('http://') && !u.startsWith('https://')) u = 'https://' + u;
+    try {
+      const parsed = new URL(u);
+      return parsed.hostname && parsed.hostname.includes('.') ? parsed.toString() : 'https://www.instagram.com';
+    } catch {
+      return 'https://www.instagram.com';
+    }
+  };
+  return buttons.map((b) => ({
+    type: b.type,
+    title: (b.title || 'Click Here').slice(0, 20),
+    ...(b.type === 'web_url' ? { url: safeUrl(b.url) } : { payload: b.payload || 'ACTION' }),
+  }));
+}
+
+// Problems with the comment itself (not with the message format): trying a simpler format cannot help.
+// 100/2534014 comment or user not found or already replied to, 100/2534025 older than 7 days, 4/17/32/613 rate limits.
+export function isCommentLevelError(err: unknown): boolean {
+  if (!(err instanceof GraphApiError)) return false;
+  return (err.code === 100 && (err.subcode === 2534014 || err.subcode === 2534025)) || [4, 17, 32, 613].includes(Number(err.code));
 }
 
 @Injectable()
@@ -85,6 +113,58 @@ export class MessagingService implements OnModuleInit {
 
   // Saves one message row. For an account that chose "Don't store my messages" only the metadata (who / when /
   // direction / id) is written; the text is kept in short-lived memory so automation can still answer it.
+  // Private reply to a comment, sent with the account's own Instagram login (no Facebook Page needed):
+  // POST /<IG_ID>/messages with recipient.comment_id. Tries the richest format first (card, buttons) and falls back
+  // to simpler ones if Instagram rejects the format; stops at once for problems with the comment itself
+  // (already replied to, older than 7 days, gone), because a simpler format cannot fix those.
+  async sendPrivateReplyViaInstagram(
+    commentId: string,
+    text: string,
+    buttons?: MessageButton[],
+    card?: { title?: string; subtitle?: string; imageUrl?: string; buttons?: MessageButton[] },
+    account?: string,
+  ): Promise<{ recipientId: string; messageId: string }> {
+    const own = (await this.resolveOwner(account)) ?? undefined;
+    const igUserId = await this.connection.getIgUserId(own);
+    const formatted = formatButtons(card?.buttons || buttons);
+    const attempts: { label: string; message: any }[] = [];
+    if (card && (card.imageUrl || card.title)) {
+      const element: any = { title: (card.title || text).slice(0, 80), subtitle: (card.subtitle || text).slice(0, 80) };
+      if (card.imageUrl) element.image_url = card.imageUrl;
+      if (formatted?.length) element.buttons = formatted;
+      attempts.push({ label: 'card', message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [element] } } } });
+    }
+    if (formatted?.length) {
+      attempts.push({ label: 'buttons', message: { attachment: { type: 'template', payload: { template_type: 'button', text: text.slice(0, 640), buttons: formatted } } } });
+      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+      const title = (lines[0] || 'Hello').slice(0, 80);
+      const subtitle = (lines.slice(1).join(' ') || title).slice(0, 80);
+      attempts.push({ label: 'card-from-text', message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [{ title, subtitle, buttons: formatted }] } } } });
+      attempts.push({
+        label: 'quick-replies',
+        message: { text, quick_replies: formatted.map((b: any) => ({ content_type: 'text', title: b.title.slice(0, 20), payload: b.type === 'postback' ? b.payload : b.url })) },
+      });
+    }
+    attempts.push({ label: 'text', message: { text } });
+
+    let lastError: unknown;
+    for (const a of attempts) {
+      try {
+        const res = await this.graph.postJson(`/${igUserId}/messages`, { recipient: { comment_id: commentId }, message: a.message }, { account: own });
+        if (res?.recipient_id) {
+          this.logger.log(`Private reply sent through the Instagram login (${a.label}) for comment ${commentId}`);
+          return { recipientId: String(res.recipient_id), messageId: String(res.message_id ?? '') };
+        }
+        lastError = new Error('Instagram accepted the request but returned no recipient.');
+      } catch (err) {
+        lastError = err;
+        if (isCommentLevelError(err)) throw err; // a different format cannot fix this
+        this.logger.warn(`Private reply format "${a.label}" was not accepted: ${(err as Error).message}`);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Private reply failed.');
+  }
+
   // Saves one message. For an account that chose "Don't store my messages" NO row is written at all: the text goes to
   // short-lived memory only (so automation can answer it and the inbox preview works) and the few facts we need
   // (last inbound / outbound time and sender) are kept on the conversation row by touchConversation().

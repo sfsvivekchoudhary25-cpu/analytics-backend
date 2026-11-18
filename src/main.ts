@@ -139,7 +139,7 @@ async function bootstrap() {
       if (fbCount > 0) {
         log.log(`Facebook Page: ${fbCount} account(s) have a Page connected — Comment-to-DM automation can send for them.`);
       } else {
-        log.warn('Facebook Page: NOT connected. Comment-to-DM automation cannot send until one is connected in Account settings.');
+        log.log('Facebook Page: none connected (optional). Comment-to-DM sends through each Instagram account login.');
       }
     } catch {}
   });

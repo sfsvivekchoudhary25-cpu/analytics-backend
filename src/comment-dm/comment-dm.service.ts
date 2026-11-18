@@ -2,13 +2,13 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Between, ILike, In, IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
-import { GraphClient } from '../instagram-connection/graph-client.service';
+import { GraphClient, isConsentRequired } from '../instagram-connection/graph-client.service';
 import { FacebookPageService, MessageButton } from '../facebook-page/facebook-page.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { Comment } from '../comments/comment.entities';
 import { messagingEvents } from '../instagram-webhook/events';
 import { Conversation, Message } from '../messaging/messaging.entities';
-import { MessagingService } from '../messaging/messaging.service';
+import { MessagingService, isCommentLevelError } from '../messaging/messaging.service';
 import { CommentDmLog, CommentDmRule, DEFAULT_FOLLOW_GATE_TEXT } from './comment-dm.entities';
 import { pickRule } from './comment-dm.match';
 import { AutoReplyRule, AutoReplySetting } from '../comments/comment.entities';
@@ -389,9 +389,36 @@ export class CommentDmService {
 
 
 
-  // Check whether the given IGSID follows us using the Facebook Messaging User Profile API.
+  // Sends the first message to a commenter. The account's own Instagram login is used (no Facebook Page needed). A
+  // connected Page is only a fallback, for when Instagram's login route is refused for a reason that is not about
+  // the comment itself (for example a permission that was never granted).
+  private async sendPrivateReply(
+    commentId: string,
+    text: string,
+    buttons?: MessageButton[],
+    card?: { title?: string; subtitle?: string; imageUrl?: string; buttons?: MessageButton[] },
+    account?: string,
+  ): Promise<{ recipientId: string; messageId: string }> {
+    try {
+      return await this.messaging.sendPrivateReplyViaInstagram(commentId, text, buttons, card, account);
+    } catch (err) {
+      if (isCommentLevelError(err) || !(await this.facebookPage.isConnected(account).catch(() => false))) throw err;
+      this.logger.warn(`Instagram login route failed (${(err as Error).message}); trying the connected Facebook Page instead`);
+      return this.facebookPage.sendPrivateReply(commentId, text, buttons, card, account);
+    }
+  }
+
+  // Check whether the given IGSID follows us (User Profile API). Uses the account's Instagram login; the Facebook
+  // Page is only a fallback. Instagram only answers once the person has messaged us or tapped a button (code 230
+  // otherwise), so null means "cannot tell yet", never "not following".
   // Returns true/false/null (null = could not determine, treat as not following).
   private async checkIsFollowing(igsid: string, account?: string): Promise<boolean | null> {
+    try {
+      const p = await this.graph.get(`/${igsid}`, { fields: 'is_user_follow_business' }, { silent: true, account });
+      if (typeof p?.is_user_follow_business === 'boolean') return p.is_user_follow_business;
+    } catch (err) {
+      if (isConsentRequired(err)) return null; // not allowed to ask yet; a Page cannot change that
+    }
     try {
       const pageToken = await this.facebookPage.getPageAccessToken(account);
       const FB_API = 'https://graph.facebook.com/v21.0';
@@ -515,7 +542,7 @@ export class CommentDmService {
             // Already following! Send real DM directly.
             // Do NOT send the follow-gate "Oh no! It seems you're not following me" message!
             const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-            const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
+            const { recipientId } = await this.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
             await finish({
                 igsid: recipientId || igsid,
                 status: 'sent',
@@ -545,7 +572,7 @@ export class CommentDmService {
 
           // Send the follow-gate message as a private reply to the comment with buttons
           const gateText = (rule.followGateText || DEFAULT_FOLLOW_GATE_TEXT).replaceAll('{username}', c.username || 'there');
-          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, gateText, buttons, undefined, own ?? undefined);
+          const { recipientId } = await this.sendPrivateReply(c.id, gateText, buttons, undefined, own ?? undefined);
 
           // If follow status was unknown initially, check again with recipientId from Meta
           if (isFollowing === null) {
@@ -579,7 +606,7 @@ export class CommentDmService {
         } else {
           // No follow gate — send DM directly (supports text, buttons, and card templates).
           const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
+          const { recipientId } = await this.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
           await finish({ igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false });
           this.logger.log(`DM sent to @${c.username || c.id} via "${rule.name}" (reply to comment: "${preview(c.text, 50)}")`);
         }

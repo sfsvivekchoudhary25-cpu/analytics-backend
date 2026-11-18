@@ -291,6 +291,11 @@ export class FacebookPageService {
     return this.repo.createQueryBuilder('f').where('LOWER(f.owner_username) = :o', { o: owner }).getOne();
   }
 
+  /** True if this account has a Facebook Page connected (an optional extra, not required). */
+  async isConnected(account?: string): Promise<boolean> {
+    return !!(await this.getRow(account));
+  }
+
   /** Number of connected Pages (for the startup log only). */
   async countConnected(): Promise<number> {
     return this.repo.count();
