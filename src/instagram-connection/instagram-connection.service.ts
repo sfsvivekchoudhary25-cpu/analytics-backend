@@ -493,18 +493,6 @@ export class InstagramConnectionService implements OnModuleInit {
     return connection;
   }
 
-  async linkUserInstagramHandle(userId?: string, username?: string) {
-    if (!userId || !username) return;
-    try {
-      await this.repo.manager.getRepository('User').update(
-        { id: userId },
-        { instagramHandle: username },
-      );
-    } catch (err) {
-      this.logger.warn(`Could not link instagram handle to user ${userId}: ${err}`);
-    }
-  }
-
   async disconnect(account?: string) {
     // Destructive: never "the latest connection" when no account is named.
     const conn = account ? await this.getConnectionRow(account) : null;

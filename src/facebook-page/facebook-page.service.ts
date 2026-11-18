@@ -17,58 +17,6 @@ export class FacebookPageService {
 
   constructor(@InjectRepository(FacebookPageConnection) private readonly repo: Repository<FacebookPageConnection>) {}
 
-  // For a System User access token generated directly in Meta Business Suite (Business Settings > Users >
-  // System Users > Generate New Token) — sidesteps the OAuth consent dialog entirely, which is more reliable
-  // for a token that isn't tied to a browser login flow in the first place.
-  //
-  // A System User token is NOT itself a Page token: /me on it resolves to the system user's own identity
-  // (confirmed directly — it has no `instagram_business_account` field and isn't a Page). The real Page token
-  // has to be read off /me/accounts, same as the OAuth flow does for a personal login token.
-  async connectWithToken(pastedToken: string, account?: string) {
-    const token = pastedToken.trim();
-    if (!token) throw new BadRequestException('Paste the access token first.');
-    const current = this.cleanAccount(account);
-
-    const accountsRes = await fetch(
-      `${FB_API}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${encodeURIComponent(token)}`,
-    );
-    const accountsBody = await accountsRes.json();
-    let result: { pageName: string; ownerUsername: string };
-    if (accountsRes.ok && Array.isArray(accountsBody.data) && accountsBody.data.length > 0) {
-      const pages = accountsBody.data as { id: string; name: string; access_token: string; instagram_business_account?: { id: string; username?: string } }[];
-      // Prefer the Page linked to the Instagram account this user already owns.
-      const mine = current ? pages.find((p) => p.instagram_business_account?.username?.toLowerCase() === current) : undefined;
-      const chosen = mine ?? (pages.length === 1 ? pages[0] : pages.find((p) => p.instagram_business_account) ?? pages[0]);
-      result = await this.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null, chosen.instagram_business_account?.username ?? null, current);
-    } else {
-      // Fall back to treating the pasted value as a Page token directly (e.g. someone pasted a Page token, not
-      // a System User/personal token).
-      const meRes = await fetch(`${FB_API}/me?fields=id,name,instagram_business_account{id,username}&access_token=${encodeURIComponent(token)}`);
-      const meBody = await meRes.json();
-      if (!meRes.ok) throw new BadRequestException(meBody?.error?.message ?? accountsBody?.error?.message ?? 'Facebook rejected that token.');
-      if (!meBody.id || !meBody.name) throw new BadRequestException('That token did not resolve to a Facebook Page.');
-      result = await this.connect(meBody.id, meBody.name, token, meBody.instagram_business_account?.id ?? null, meBody.instagram_business_account?.username ?? null, current);
-    }
-
-    // Automatically query Meta for all live granted permissions on this token and sync them
-    try {
-      const permsRes = await fetch(`${FB_API}/me/permissions?access_token=${encodeURIComponent(token)}`);
-      const permsBody = await permsRes.json();
-      if (permsRes.ok && Array.isArray(permsBody.data)) {
-        const granted = permsBody.data
-          .filter((p: any) => p.status === 'granted')
-          .map((p: any) => p.permission);
-        if (granted.length > 0) {
-          await this.syncPermissionsToInstagramConnection(granted, result.ownerUsername);
-        }
-      }
-    } catch (err) {
-      this.logger.warn(`Could not sync live permissions from Meta: ${err}`);
-    }
-
-    return result;
-  }
-
   // Only ever touches the Instagram connection of the given account, never "whichever row comes first".
   async syncPermissionsToInstagramConnection(granted: string[], account?: string) {
     const owner = this.cleanAccount(account);
