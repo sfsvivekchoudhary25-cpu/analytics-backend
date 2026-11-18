@@ -808,21 +808,13 @@ export class CommentDmService {
         new Date(0),
       );
 
-      // Check the latest message overall in the conversation
-      const lastMessage = await this.messages.findOne({
-        where: targetLog.ownerUsername ? { igsid, ownerUsername: targetLog.ownerUsername } : { igsid },
-        order: { createdAt: 'DESC' },
-      });
+      // What the chat looks like: who wrote last, and whether the customer wrote since our prompt. (Accounts that
+      // keep no message rows answer this from the conversation and short-lived memory.)
+      const state = await this.messaging.chatState(targetLog.ownerUsername, igsid);
 
-      // Check if the customer sent any inbound message
-      const lastInbound = await this.messages.findOne({
-        where: targetLog.ownerUsername ? { igsid, direction: 'in', ownerUsername: targetLog.ownerUsername } : { igsid, direction: 'in' },
-        order: { createdAt: 'DESC' },
-      });
-
-      const isWaitingForReply = Boolean(lastMessage?.direction === 'in');
-      const newInboundSincePrompt = Boolean(lastInbound && lastInbound.createdAt > latestGateSentAt);
-      const msgText = String(lastInbound?.text ?? '').trim().toLowerCase();
+      const isWaitingForReply = Boolean(state.lastDirection === 'in');
+      const newInboundSincePrompt = Boolean(state.lastInboundAt && state.lastInboundAt > latestGateSentAt);
+      const msgText = String(state.lastInboundText ?? '').trim().toLowerCase();
       const explicitText =
         /\b(i'?m following|following|followed|confirm follow)\b/i.test(msgText) ||
         /^(yes|done|confirm|followed|following)$/i.test(msgText);
@@ -912,12 +904,9 @@ export class CommentDmService {
   async reconcile() {
     const pending = await this.logs.find({ where: { dmSentAt: Not(IsNull()), igsid: Not(IsNull()), repliedAt: IsNull() }, take: 100 });
     for (const log of pending) {
-      const reply = await this.messages.findOne({
-        where: { igsid: log.igsid!, direction: 'in', createdAt: MoreThan(log.dmSentAt!) },
-        order: { createdAt: 'ASC' },
-      });
-      if (reply) {
-        await this.logs.update(log.id, { repliedAt: reply.createdAt });
+      const repliedAt = await this.messaging.firstInboundAfter(log.ownerUsername, log.igsid!, log.dmSentAt!);
+      if (repliedAt) {
+        await this.logs.update(log.id, { repliedAt });
         this.logger.log(`@${log.username} replied to the automated DM.`);
       }
     }
@@ -981,11 +970,9 @@ export class CommentDmService {
       }
 
       // 2. Check if a reply was received in the messages table
-      const reply = await this.messages.findOne({
-        where: { igsid: log.igsid!, direction: 'in', createdAt: MoreThan(log.dmSentAt!) },
-      });
-      if (reply) {
-        await this.logs.update(log.id, { repliedAt: reply.createdAt });
+      const repliedAt = await this.messaging.firstInboundAfter(log.ownerUsername, log.igsid!, log.dmSentAt!);
+      if (repliedAt) {
+        await this.logs.update(log.id, { repliedAt });
         continue;
       }
 

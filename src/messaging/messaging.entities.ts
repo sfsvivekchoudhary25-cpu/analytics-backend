@@ -30,6 +30,15 @@ export class Conversation {
   @Column({ name: 'last_inbound_at', type: 'timestamptz', nullable: true })
   lastInboundAt: Date | null;
 
+  // When we (or the account owner) last sent something here, and who: 'app' (typed in Instagram), 'dashboard',
+  // 'auto' or 'system'. Kept on the conversation so accounts that don't store message rows still know whether a
+  // customer message was already answered, and whether a person took over.
+  @Column({ name: 'last_outbound_at', type: 'timestamptz', nullable: true })
+  lastOutboundAt: Date | null;
+
+  @Column({ name: 'last_outbound_source', type: 'varchar', nullable: true })
+  lastOutboundSource: string | null;
+
   @Column({ type: 'int', default: 0 })
   unread: number;
 }

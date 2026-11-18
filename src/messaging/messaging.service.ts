@@ -1,6 +1,6 @@
 import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, IsNull, Repository } from 'typeorm';
+import { Between, IsNull, MoreThan, Repository } from 'typeorm';
 import { GraphClient } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { eventDate, messagingEvents } from '../instagram-webhook/events';
@@ -85,19 +85,69 @@ export class MessagingService implements OnModuleInit {
 
   // Saves one message row. For an account that chose "Don't store my messages" only the metadata (who / when /
   // direction / id) is written; the text is kept in short-lived memory so automation can still answer it.
-  private async saveMessage(noStore: boolean, data: Partial<Message> & { igsid: string; direction: 'in' | 'out' }): Promise<Message> {
+  // Saves one message. For an account that chose "Don't store my messages" NO row is written at all: the text goes to
+  // short-lived memory only (so automation can answer it and the inbox preview works) and the few facts we need
+  // (last inbound / outbound time and sender) are kept on the conversation row by touchConversation().
+  private async saveMessage(
+    noStore: boolean,
+    data: Partial<Message> & { igsid: string; direction: 'in' | 'out' },
+    opts: { enqueue?: boolean } = {},
+  ): Promise<Message | null> {
     if (!noStore) return this.messages.save(this.messages.create(data));
-    const row = await this.messages.save(this.messages.create({ ...data, text: '', attachmentUrl: null }));
-    if (data.ownerUsername) {
-      this.privacy.remember(data.ownerUsername, data.igsid, {
-        id: row.id,
-        mid: row.mid ?? null,
-        direction: data.direction,
-        text: String(data.text ?? ''),
-        at: (row.createdAt ?? new Date()).getTime(),
-      });
+    if (!data.ownerUsername) return null;
+    const at = (data.createdAt ?? new Date()).getTime();
+    const mid = data.mid ?? null;
+    const text = String(data.text ?? '');
+    this.privacy.remember(data.ownerUsername, data.igsid, { id: mid ?? `${data.direction}-${at}-${data.igsid}`, mid, direction: data.direction, text, at });
+    if (data.direction === 'in' && mid && text && opts.enqueue !== false) {
+      this.privacy.enqueueInbound({ id: mid, mid, owner: data.ownerUsername, igsid: data.igsid, text, at });
     }
-    return row;
+    return null;
+  }
+
+  // Customer messages waiting for automation (accounts that don't store messages only).
+  queuedInbound(owner?: string | null) {
+    return this.privacy.queued(owner);
+  }
+
+  dequeueInbound(id: string) {
+    this.privacy.dequeue(id);
+  }
+
+  // The last few remembered messages before a moment (the AI uses these as context when nothing is stored).
+  recentChat(owner: string, igsid: string, beforeMs: number, n = 6) {
+    return this.privacy.recent(owner, igsid).filter((m) => m.at < beforeMs).slice(-n);
+  }
+
+  // What automations need to know about a chat, without reading message rows when none are kept.
+  async chatState(owner: string | null | undefined, igsid: string): Promise<{ lastDirection: 'in' | 'out' | null; lastInboundAt: Date | null; lastInboundText: string }> {
+    const own = owner ? owner.trim().replace(/^@/, '').toLowerCase() : undefined;
+    if (own && (await this.privacy.isNoStore(own))) {
+      const c = await this.conversations.findOne({ where: { igsid, ownerUsername: own } });
+      const inAt = c?.lastInboundAt ?? null;
+      const outAt = c?.lastOutboundAt ?? null;
+      const lastDirection = inAt && (!outAt || inAt >= outAt) ? 'in' : outAt ? 'out' : null;
+      const lastIn = this.privacy.recent(own, igsid).filter((m) => m.direction === 'in').pop();
+      return { lastDirection, lastInboundAt: inAt, lastInboundText: lastIn?.text ?? '' };
+    }
+    const where = (extra: object) => (own ? { igsid, ownerUsername: own, ...extra } : { igsid, ...extra });
+    const last = await this.messages.findOne({ where: where({}), order: { createdAt: 'DESC' } });
+    const lastIn = await this.messages.findOne({ where: where({ direction: 'in' as const }), order: { createdAt: 'DESC' } });
+    return { lastDirection: last?.direction ?? null, lastInboundAt: lastIn?.createdAt ?? null, lastInboundText: lastIn?.text ?? '' };
+  }
+
+  // The first customer message after a moment (used to tell whether they replied to an automated DM).
+  async firstInboundAfter(owner: string | null | undefined, igsid: string, after: Date): Promise<Date | null> {
+    const own = owner ? owner.trim().replace(/^@/, '').toLowerCase() : undefined;
+    if (own && (await this.privacy.isNoStore(own))) {
+      const c = await this.conversations.findOne({ where: { igsid, ownerUsername: own } });
+      return c?.lastInboundAt && c.lastInboundAt > after ? c.lastInboundAt : null;
+    }
+    const row = await this.messages.findOne({
+      where: { ...(own ? { ownerUsername: own } : {}), igsid, direction: 'in', createdAt: MoreThan(after) },
+      order: { createdAt: 'ASC' },
+    });
+    return row?.createdAt ?? null;
   }
 
   isNoStore(owner?: string | null) {
@@ -177,6 +227,8 @@ export class MessagingService implements OnModuleInit {
         let lastText = existing?.lastText ?? '';
         let lastAt = existing?.lastMessageAt ?? null;
         let lastInboundAt = existing?.lastInboundAt ?? null;
+        let lastOutboundAt = existing?.lastOutboundAt ?? null;
+        let lastOutboundSource = existing?.lastOutboundSource ?? null;
 
         for (const m of msgs) {
           const at = new Date(m.created_time);
@@ -185,17 +237,20 @@ export class MessagingService implements OnModuleInit {
           // History sync only returns the text. A message with no text is an attachment whose type we cannot know,
           // so it is not stored (real attachments with their type still arrive through the webhook).
           if (!text) continue;
-          // The same message may already be stored via the webhook, possibly under a different id format.
-          // (Message text is encrypted, so it cannot be compared in SQL: fetch the few rows around that moment and compare here.)
-          const sameMoment = await this.messages.find({
-            where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
-          });
-          // In "don't store" mode the stored rows carry no text, so compare with the short-lived in-memory copy;
-          // with no copy to compare against, a row at the same moment in the same direction counts as the same message.
-          const dup =
-            (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) ||
-            sameMoment.some((r) => (noStore ? (this.privacy.textOf(r.id) ?? text) === text : r.text === text));
-          if (dup) continue;
+          if (noStore) {
+            // No message rows exist in this mode, so "already seen" means: handled by the webhook (the conversation's
+            // last-message time is already at or past it) or remembered in memory.
+            if (existing && at.getTime() <= existing.lastMessageAt.getTime() + 3000) continue;
+            if (this.privacy.seenMid(ownHandle, m.id)) continue;
+          } else {
+            // The same message may already be stored via the webhook, possibly under a different id format.
+            // (Message text is encrypted, so it cannot be compared in SQL: fetch the few rows around that moment and compare here.)
+            const sameMoment = await this.messages.find({
+              where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
+            });
+            const dup = (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) || sameMoment.some((r) => r.text === text);
+            if (dup) continue;
+          }
           await this.saveMessage(noStore, {
             igsid: String(other.id),
             ownerUsername: ownHandle,
@@ -207,7 +262,7 @@ export class MessagingService implements OnModuleInit {
             attachmentUrl: null,
             mid: m.id,
             createdAt: at,
-          });
+          }, { enqueue: !!existing }); // a first-time import of old history is never queued for automation
           added += 1;
           if (!outgoing) addedInbound += 1;
           if (!lastAt || at >= lastAt) {
@@ -215,6 +270,10 @@ export class MessagingService implements OnModuleInit {
             lastText = noStore ? '' : text;
           }
           if (!outgoing && (!lastInboundAt || at > lastInboundAt)) lastInboundAt = at;
+          if (outgoing && (!lastOutboundAt || at > lastOutboundAt)) {
+            lastOutboundAt = at;
+            lastOutboundSource = 'app';
+          }
         }
 
         if (!existing || added) {
@@ -242,6 +301,8 @@ export class MessagingService implements OnModuleInit {
               lastText,
               lastMessageAt: lastAt ?? new Date(conv.updated_time),
               lastInboundAt,
+              lastOutboundAt,
+              lastOutboundSource,
               // A first-time import of old history is not "unread"; later messages are.
               unread: existing ? existing.unread + addedInbound : 0,
             }),
@@ -277,18 +338,18 @@ export class MessagingService implements OnModuleInit {
 
     // A customer edited a message we already stored.
     if (ev.message_edit?.mid) {
+      if (noStore) {
+        // No rows exist in this mode; only the short-lived in-memory copy is refreshed.
+        if (ownUsername) this.privacy.updateTextByMid(ownUsername, ev.message_edit.mid, String(ev.message_edit.text ?? ''));
+        this.logger.log(`A customer edited a message (edit #${ev.message_edit.num_edit ?? '?'})`);
+        return;
+      }
       const stored = await this.messages.findOne({ where: { mid: ev.message_edit.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (!stored) {
         this.logger.log(`Edit of a message we never stored (...${String(ev.message_edit.mid).slice(-8)}); ignored`);
         return;
       }
       const newText = String(ev.message_edit.text ?? '');
-      if (noStore) {
-        // Nothing is written to the database; only the short-lived copy is refreshed.
-        this.privacy.updateText(stored.id, newText);
-        this.logger.log(`A customer edited a message (edit #${ev.message_edit.num_edit ?? '?'})`);
-        return;
-      }
       const before = stored.text;
       stored.text = newText;
       if (ownUsername && !stored.ownerUsername) stored.ownerUsername = ownUsername;
@@ -310,6 +371,7 @@ export class MessagingService implements OnModuleInit {
         const customerId = ev.sender?.id;
         if (customerId && customerId !== ownId) {
           const at = eventDate(ev.timestamp);
+          if (noStore && ownUsername && this.privacy.seenMid(ownUsername, ev.postback.mid)) return; // duplicate delivery
           await this.saveMessage(noStore, {
             igsid: customerId,
             ownerUsername: ownUsername,
@@ -336,6 +398,7 @@ export class MessagingService implements OnModuleInit {
 
     // The customer deleted a message: keep the thread, replace its content.
     if (msg.is_deleted && msg.mid) {
+      if (noStore) return; // nothing is stored, so there is nothing to mark
       const stored = await this.messages.findOne({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (stored) {
         stored.text = '[message deleted by sender]';
@@ -349,7 +412,10 @@ export class MessagingService implements OnModuleInit {
 
     const customerId: string | undefined = echo ? ev.recipient?.id : ev.sender?.id;
     if (!customerId || customerId === ownId) return;
-    if (msg.mid && (await this.messages.exists({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } }))) {
+    const duplicate = noStore
+      ? !!ownUsername && this.privacy.seenMid(ownUsername, msg.mid) // no rows in this mode: remembered ids instead
+      : !!msg.mid && (await this.messages.exists({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } }));
+    if (duplicate) {
       this.logger.log(`Ignored duplicate delivery of message ...${String(msg.mid).slice(-8)}`);
       return;
     }
@@ -374,13 +440,13 @@ export class MessagingService implements OnModuleInit {
       mid: msg.mid ?? null,
       createdAt: at,
     });
-    const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined, noStore);
+    const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined, noStore, echo ? 'app' : undefined);
     this.logger.log(
       `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId} (unread: ${c.unread})`,
     );
   }
 
-  private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date, ownerUsername?: string, noStore = false) {
+  private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date, ownerUsername?: string, noStore = false, source?: string) {
     const cleanOwner = ownerUsername ? ownerUsername.trim().replace(/^@/, '').toLowerCase() : null;
     let c = await this.conversations.findOne({
       where: cleanOwner ? { igsid, ownerUsername: cleanOwner } : { igsid },
@@ -410,6 +476,10 @@ export class MessagingService implements OnModuleInit {
     if (dir === 'in') {
       c.lastInboundAt = at;
       c.unread += 1;
+    } else {
+      // Who last sent something here, and when: automation stays quiet after a person, even with no message rows.
+      c.lastOutboundAt = at;
+      c.lastOutboundSource = source ?? null;
     }
     return this.conversations.save(c);
   }
@@ -456,21 +526,18 @@ export class MessagingService implements OnModuleInit {
       }
       if (!convId) throw new Error('conversation not found on Instagram');
       const detail = await this.graph.get(`/${convId}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: own });
-      // Who sent it (app / dashboard / automation) is metadata we do keep, so it can still be labelled.
-      const stored = await this.messages.find({ where: { igsid: c.igsid, ownerUsername: own }, order: { createdAt: 'DESC' }, take: 200 });
-      const byMid = new Map(stored.filter((r) => r.mid).map((r) => [r.mid as string, r]));
       const messages = [...(detail.messages?.data ?? [])].reverse().map((m: any) => {
         const outgoing = String(m.from?.username ?? '').toLowerCase() === own;
-        const row = byMid.get(m.id);
         return {
-          id: row?.id ?? m.id,
+          id: m.id,
           igsid: c.igsid,
           ownerUsername: own,
           direction: outgoing ? 'out' : 'in',
           text: String(m.message ?? '') || '[media]',
-          attachmentType: row?.attachmentType ?? null,
+          attachmentType: null,
           attachmentUrl: null,
-          source: row?.source ?? (outgoing ? 'app' : null),
+          // Messages sent from this app are remembered for a while; anything else outgoing was typed in Instagram.
+          source: this.privacy.sourceOf(own, m.id) ?? (outgoing ? 'app' : null),
           mid: m.id,
           createdAt: new Date(m.created_time),
         };
@@ -716,8 +783,11 @@ export class MessagingService implements OnModuleInit {
     }
     const now = new Date();
     const noStore = await this.privacy.isNoStore(own);
-    // Instagram echoes our own DMs back through the webhook; if that already stored this mid, don't insert twice.
-    const alreadyStored = res?.message_id && (await this.messages.exists({ where: { mid: res.message_id, ...(own ? { ownerUsername: own } : {}) } }));
+    // Instagram echoes our own DMs back through the webhook. Remember this id as ours so the echo is not mistaken for
+    // a message typed in the Instagram app (in "don't store" mode there are no rows to check instead).
+    if (noStore && own) this.privacy.markSent(own, res?.message_id, source);
+    // If the echo already stored this mid, don't insert twice.
+    const alreadyStored = !noStore && res?.message_id && (await this.messages.exists({ where: { mid: res.message_id, ...(own ? { ownerUsername: own } : {}) } }));
     if (!alreadyStored) {
       await this.saveMessage(noStore, {
         igsid,
@@ -734,7 +804,7 @@ export class MessagingService implements OnModuleInit {
       // The webhook echo won the race and labelled it as typed in the app; set the true sender.
       await this.messages.update({ mid: res.message_id, ...(own ? { ownerUsername: own } : {}) }, { source, ...(own ? { ownerUsername: own } : {}) });
     }
-    const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined, noStore);
+    const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined, noStore, source);
     this.logger.log(`[Messaging] DM sent (${sentFormat}) to ${c.username ? '@' + c.username : igsid} (${text.length} characters)`);
     return { ok: true };
   }

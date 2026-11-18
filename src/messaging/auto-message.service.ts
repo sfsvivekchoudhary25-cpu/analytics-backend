@@ -304,10 +304,25 @@ export class AutoMessageService {
         qb.andWhere('LOWER(m.ownerUsername) = :own', { own });
       }
 
-      const pending = await qb
+      const dbPending = await qb
         .orderBy('m.createdAt', 'ASC')
         .limit(20)
         .getMany();
+      // Accounts that chose "Don't store my messages" have no message rows. Their customer messages wait in a
+      // short-lived in-memory queue instead (never saved); the automation log is keyed on Instagram's message id.
+      const queuedIds = new Set<string>();
+      const queuedMessages: Message[] = [];
+      for (const q of this.messaging.queuedInbound(own)) {
+        if (s.enabledAt && q.at < new Date(s.enabledAt).getTime()) {
+          this.messaging.dequeueInbound(q.id);
+          continue;
+        }
+        queuedIds.add(q.id);
+        queuedMessages.push(
+          Object.assign(new Message(), { id: q.id, mid: q.mid, igsid: q.igsid, ownerUsername: q.owner, direction: 'in' as const, text: q.text, attachmentType: null, attachmentUrl: null, source: null, createdAt: new Date(q.at) }),
+        );
+      }
+      const pending = [...dbPending, ...queuedMessages].slice(0, 20);
       if (!pending.length) return;
       const rules = await this.rulesRepo.find({
         where: own ? { ownerUsername: own } : {},
@@ -321,6 +336,7 @@ export class AutoMessageService {
         try {
           await this.logs.insert({ messageId: m.id, igsid: m.igsid, ownerUsername: own, outcome: 'processing' });
         } catch {
+          if (queuedIds.has(m.id)) this.messaging.dequeueInbound(m.id); // already handled by someone else
           continue;
         }
         const conv = await this.conversations.findOne({
@@ -340,6 +356,7 @@ export class AutoMessageService {
           await this.logs.delete({ messageId: m.id }); // nothing was sent, so it is safe to try again later
           continue;
         }
+        if (queuedIds.has(m.id)) this.messaging.dequeueInbound(m.id);
         await this.logs.update(
           { messageId: m.id },
           {
@@ -400,10 +417,16 @@ export class AutoMessageService {
     }
 
     // Someone already answered after this message: nothing left for automation to do.
-    const answeredWhere: any = { igsid: m.igsid, direction: 'out', createdAt: MoreThan(m.createdAt) };
-    if (own) answeredWhere.ownerUsername = own;
-    if (await this.messages.exists({ where: answeredWhere })) {
-      return skip('already answered');
+    // (Accounts that keep no message rows track this on the conversation: when something was last sent.)
+    const ownerForCheck = own ?? m.ownerUsername;
+    if (await this.messaging.isNoStore(ownerForCheck)) {
+      if (conv?.lastOutboundAt && conv.lastOutboundAt > m.createdAt) return skip('already answered');
+    } else {
+      const answeredWhere: any = { igsid: m.igsid, direction: 'out', createdAt: MoreThan(m.createdAt) };
+      if (own) answeredWhere.ownerUsername = own;
+      if (await this.messages.exists({ where: answeredWhere })) {
+        return skip('already answered');
+      }
     }
     // Global hourly cap per tenant account (rules and AI together).
     const capWhere: any = { outcome: 'sent', createdAt: MoreThan(new Date(Date.now() - HOUR)) };
@@ -497,11 +520,14 @@ export class AutoMessageService {
       order: { createdAt: 'DESC' },
       take: 6,
     });
-    if (!prior.length) return '';
-    // Rows of accounts that don't store text are empty; their text comes from short-lived memory instead.
-    const lines = prior
-      .reverse()
-      .map((x) => ({ direction: x.direction, text: x.text || this.messaging.cachedText(x.id) || '' }))
+    // Accounts that keep no message rows: the recent messages come from short-lived memory instead.
+    const rows: { direction: 'in' | 'out'; text: string }[] = prior.length
+      ? prior.reverse().map((x) => ({ direction: x.direction, text: x.text || this.messaging.cachedText(x.id) || '' }))
+      : m.ownerUsername
+        ? this.messaging.recentChat(m.ownerUsername, m.igsid, m.createdAt.getTime()).map((x) => ({ direction: x.direction, text: x.text }))
+        : [];
+    if (!rows.length) return '';
+    const lines = rows
       .filter((x) => x.text.trim() && !/^\[.*\]$/.test(x.text.trim()))
       .map((x) => `${x.direction === 'in' ? 'Customer' : 'Business'}: ${x.text.replace(/\s+/g, ' ').slice(0, 300)}`);
     return lines.length ? `Recent conversation (oldest first):\n${lines.join('\n')}` : '';
