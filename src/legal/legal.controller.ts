@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, Get, Header, Post } from '@nestj
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { AccountService } from '../account/account.service';
 
-const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'InstaVeyra (Inrō Studio)';
+const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'Fabroniee';
 const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'support@fabroniee.store';
 const UPDATED = 'November 18, 2026';
 
