@@ -35,6 +35,7 @@ import { VoiceNote } from './voice-notes/voice-note.entity';
 import { HealthModule } from './health/health.module';
 import { SavedReelsModule } from './saved-reels/saved-reels.module';
 import { SavedReel } from './saved-reels/saved-reel.entity';
+import { AccountModule } from './account/account.module';
 
 @Module({
   imports: [
@@ -104,6 +105,7 @@ import { SavedReel } from './saved-reels/saved-reel.entity';
     VoiceNotesModule,
     HealthModule,
     SavedReelsModule,
+    AccountModule,
   ],
   providers: [
     {

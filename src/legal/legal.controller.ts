@@ -1,4 +1,6 @@
-import { Controller, Get, Header, Post } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Header, Post } from '@nestjs/common';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { AccountService } from '../account/account.service';
 
 const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'InstaVeyra (Inrō Studio)';
 const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'support@fabroniee.store';
@@ -44,8 +46,29 @@ ${body}
 }
 
 // Public pages required for Meta App Review and live production compliance
+// Meta sends "signed_request" = base64url(signature).base64url(payload). The signature is HMAC-SHA256 of the payload
+// with the app secret; anything that does not verify is rejected, so nobody else can trigger a deletion.
+function parseSignedRequest(signed: string | undefined): { user_id?: string } | null {
+  if (!signed || !signed.includes('.')) return null;
+  const [sig, payload] = signed.split('.');
+  const secrets = [process.env.INSTAGRAM_APP_SECRET, process.env.FACEBOOK_APP_SECRET].filter(Boolean) as string[];
+  const given = Buffer.from(sig.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  const ok = secrets.some((secret) => {
+    const expected = createHmac('sha256', secret).update(payload).digest();
+    return expected.length === given.length && timingSafeEqual(expected, given);
+  });
+  if (!ok) return null;
+  try {
+    return JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
 @Controller()
 export class LegalController {
+  constructor(private readonly accounts: AccountService) {}
+
   @Get('privacy')
   @Get('legal/privacy')
   @Header('Content-Type', 'text/html; charset=utf-8')
@@ -180,18 +203,30 @@ export class LegalController {
     );
   }
 
+  // Meta's "data deletion request callback": the user asked Meta to have us erase their data.
   @Post('data-deletion')
-  dataDeletionPost() {
+  async dataDeletionPost(@Body('signed_request') signedRequest?: string) {
+    const data = parseSignedRequest(signedRequest);
+    if (!data?.user_id) throw new BadRequestException('Invalid signed_request.');
+    const report = await this.accounts.deleteByInstagramId(String(data.user_id));
     const base = process.env.PUBLIC_BASE_URL ?? 'https://analytics-backend-vxak.onrender.com';
-    return {
-      url: `${base}/data-deletion`,
-      confirmation_code: `del_${Date.now()}`,
-    };
+    const code = `del_${randomUUID()}`;
+    console.log(`[Legal] Data deletion request ${code}: ${JSON.stringify(report)}`);
+    return { url: `${base}/data-deletion?code=${code}`, confirmation_code: code };
   }
 
-  @Get('deauthorize')
+  // Meta's "deauthorize callback": the user removed the app. Their tokens are deleted (their data stays until they ask).
   @Post('deauthorize')
+  async deauthorizePost(@Body('signed_request') signedRequest?: string) {
+    const data = parseSignedRequest(signedRequest);
+    if (!data?.user_id) throw new BadRequestException('Invalid signed_request.');
+    await this.accounts.revokeConnectionsByInstagramId(String(data.user_id));
+    return { success: true };
+  }
+
+  // Opening this URL in a browser (Meta's "test" link) does nothing.
+  @Get('deauthorize')
   deauthorize() {
-    return { success: true, message: 'Deauthorized successfully' };
+    return { success: true };
   }
 }
