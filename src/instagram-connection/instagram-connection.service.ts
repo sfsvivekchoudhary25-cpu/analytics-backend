@@ -19,10 +19,21 @@ export class InstagramConnectionService implements OnModuleInit {
     private readonly repo: Repository<InstagramConnection>,
   ) {}
 
-  async onModuleInit() {
+  onModuleInit() {
+    // Run legacy reconciliation in background after server is up and listening
+    setTimeout(() => {
+      this.reconcileLegacyData().catch((e) => this.logger.debug?.(`Legacy reconciliation note: ${e.message}`));
+    }, 15000);
+  }
+
+  private async reconcileLegacyData() {
     try {
-      // Reconcile legacy logs: All rows created before sfs.vivekchoudhary25 was connected (Oct 8, 2026 ~11:50 UTC)
-      // or containing Swedish error notes / fabroniee references belong to fabroniee.
+      // Check if there are any unassigned legacy rows before running updates
+      const check = await this.repo.query(`SELECT 1 FROM "conversation" WHERE "owner_username" IS NULL LIMIT 1`).catch(() => []);
+      if (!check || check.length === 0) {
+        return;
+      }
+
       await this.repo.query(`
         UPDATE "message_auto_log"
         SET "owner_username" = 'fabroniee'

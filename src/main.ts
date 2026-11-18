@@ -3,6 +3,14 @@ import './common/rls/rls.patch';
 import * as dotenv from 'dotenv';
 dotenv.config(); // must run before AppModule is imported so decorators see the env
 
+process.on('unhandledRejection', (reason) => {
+  console.warn('[Process] Unhandled Rejection:', reason instanceof Error ? reason.stack : reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught Exception:', err.stack || err.message);
+});
+
 async function bootstrap() {
   const { NestFactory } = await import('@nestjs/core');
   const { Logger, ValidationPipe } = await import('@nestjs/common');
@@ -81,45 +89,59 @@ async function bootstrap() {
     const { execSync } = await import('child_process');
     if (process.platform === 'win32') {
       const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      let killed = false;
       for (const line of out.split('\n')) {
         const parts = line.trim().split(/\s+/);
         if (parts.length >= 5 && parts[1].endsWith(`:${port}`) && parts[3] === 'LISTENING') {
           const pid = Number(parts[4]);
           if (pid && pid !== process.pid) {
-            try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); } catch {}
+            try {
+              execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore' });
+              killed = true;
+            } catch {}
           }
         }
+      }
+      if (killed) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
       }
     }
   } catch {}
 
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
 
   // Startup summary: everything needed to see at a glance whether the setup is complete.
   const log = new Logger('Startup');
   const yes = (v?: string) => (v ? 'set' : 'MISSING');
   const publicUrl = (process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '');
-  log.log(`Backend ready on http://localhost:${port}`);
+  log.log(`Backend ready on http://localhost:${port} (0.0.0.0:${port})`);
   log.log(`Instagram API: ${GRAPH}`);
   log.log(`Public URL: ${publicUrl || 'MISSING (Instagram cannot reach webhooks or fetch photos)'}`);
   if (publicUrl) log.log(`Webhook callback: ${publicUrl}/instagram/webhook`);
   log.log(`Webhook verify token: ${yes(process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN)} | App secret: ${yes(process.env.INSTAGRAM_APP_SECRET)}${process.env.INSTAGRAM_APP_SECRET ? '' : ' (events will be rejected)'}`);
-  const status: any = await app.get(InstagramConnectionService).getStatus();
-  if (status.connected) {
-    const days = Math.round((new Date(status.expiresAt).getTime() - Date.now()) / 86_400_000);
-    log.log(`Instagram: connected as @${status.username} (token expires in ~${days} days)`);
-  } else {
-    log.warn('Instagram: NOT connected. Open the dashboard > Account > Connect with Instagram.');
-  }
 
-  // Only the Comment-to-DM automation's send depends on this — everything else in the app is unaffected.
-  const fbRedirect = process.env.FACEBOOK_REDIRECT_URI || (publicUrl ? `${publicUrl}/facebook-page/oauth/callback` : '');
-  if (fbRedirect) log.log(`Facebook Page OAuth redirect URI (add under Facebook Login for Business in the Meta dashboard): ${fbRedirect}`);
-  const fbCount = await app.get(FacebookPageService).countConnected().catch(() => 0);
-  if (fbCount > 0) {
-    log.log(`Facebook Page: ${fbCount} account(s) have a Page connected — Comment-to-DM automation can send for them.`);
-  } else {
-    log.warn('Facebook Page: NOT connected. Comment-to-DM automation cannot send until one is connected in Account settings.');
-  }
+  // Async logging of connection states so ready signal is instant
+  setImmediate(async () => {
+    try {
+      const status: any = await app.get(InstagramConnectionService).getStatus();
+      if (status.connected) {
+        const days = Math.round((new Date(status.expiresAt).getTime() - Date.now()) / 86_400_000);
+        log.log(`Instagram: connected as @${status.username} (token expires in ~${days} days)`);
+      } else {
+        log.warn('Instagram: NOT connected. Open the dashboard > Account > Connect with Instagram.');
+      }
+    } catch {}
+
+    try {
+      const fbRedirect = process.env.FACEBOOK_REDIRECT_URI || (publicUrl ? `${publicUrl}/facebook-page/oauth/callback` : '');
+      if (fbRedirect) log.log(`Facebook Page OAuth redirect URI (add under Facebook Login for Business in the Meta dashboard): ${fbRedirect}`);
+      const fbCount = await app.get(FacebookPageService).countConnected().catch(() => 0);
+      if (fbCount > 0) {
+        log.log(`Facebook Page: ${fbCount} account(s) have a Page connected — Comment-to-DM automation can send for them.`);
+      } else {
+        log.warn('Facebook Page: NOT connected. Comment-to-DM automation cannot send until one is connected in Account settings.');
+      }
+    } catch {}
+  });
 }
 bootstrap();
