@@ -345,7 +345,8 @@ export class AutoMessageService {
           {
             outcome: decision.outcome,
             note: decision.note,
-            replyText: decision.replyText ?? null,
+            // Accounts that chose not to store message text also keep no copy of what was sent.
+            replyText: (await this.messaging.isNoStore(m.ownerUsername ?? own)) ? null : decision.replyText ?? null,
             username: conv?.username ?? null,
             kind: decision.kind ?? 'rule',
           },
@@ -383,7 +384,8 @@ export class AutoMessageService {
       .filter(Boolean);
     if (username && ignored.includes(username)) return skip('account is on the ignore list');
 
-    const text = m.text.trim();
+    // For accounts that don't store message text, this comes from short-lived memory (or one live read from Instagram).
+    const text = (await this.messaging.textForAutomation(m)).trim();
     if (!text || /^\[.*\]$/.test(text)) return skip('no text to answer (attachment or system message)');
     if (Date.now() - m.createdAt.getTime() > WINDOW_GUARD_MS) return skip("outside Instagram's 24-hour window");
 
@@ -496,8 +498,10 @@ export class AutoMessageService {
       take: 6,
     });
     if (!prior.length) return '';
+    // Rows of accounts that don't store text are empty; their text comes from short-lived memory instead.
     const lines = prior
       .reverse()
+      .map((x) => ({ direction: x.direction, text: x.text || this.messaging.cachedText(x.id) || '' }))
       .filter((x) => x.text.trim() && !/^\[.*\]$/.test(x.text.trim()))
       .map((x) => `${x.direction === 'in' ? 'Customer' : 'Business'}: ${x.text.replace(/\s+/g, ' ').slice(0, 300)}`);
     return lines.length ? `Recent conversation (oldest first):\n${lines.join('\n')}` : '';

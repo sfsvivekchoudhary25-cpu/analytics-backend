@@ -8,6 +8,7 @@ import { AutoMessageService } from './auto-message.service';
 import { CommentDmLog } from '../comment-dm/comment-dm.entities';
 import { Conversation, Message } from './messaging.entities';
 import { MessageEncryptionBackfill } from './message-encryption.backfill';
+import { MessagePrivacyService } from './message-privacy.service';
 import { MessagingController } from './messaging.controller';
 import { MessagingService } from './messaging.service';
 
@@ -18,7 +19,7 @@ import { MessagingService } from './messaging.service';
     AiModule,
   ],
   controllers: [MessagingController, AutoMessageController],
-  providers: [MessagingService, AutoMessageService, MessageEncryptionBackfill],
+  providers: [MessagingService, AutoMessageService, MessageEncryptionBackfill, MessagePrivacyService],
   exports: [MessagingService, AutoMessageService],
 })
 export class MessagingModule {}

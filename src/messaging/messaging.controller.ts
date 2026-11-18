@@ -14,6 +14,17 @@ export class MessagingController {
     return this.service.syncFromInstagram(account);
   }
 
+  // The "Don't store my messages" switch.
+  @Get('privacy')
+  getPrivacy(@CurrentAccount() account?: string) {
+    return this.service.getPrivacy(account);
+  }
+
+  @Post('privacy')
+  setPrivacy(@Body('storeMessages') storeMessages: boolean, @CurrentAccount() account?: string) {
+    return this.service.setPrivacy(account, storeMessages !== false);
+  }
+
   @Get('conversations')
   list(@CurrentAccount() account?: string) {
     return this.service.listConversations(account);

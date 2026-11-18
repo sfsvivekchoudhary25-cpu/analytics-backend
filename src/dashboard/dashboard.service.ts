@@ -163,7 +163,7 @@ export class DashboardService {
       const inbound = convoInbound.get(m.igsid);
       return {
         username: manualUsernames.get(m.igsid) ?? m.igsid.slice(-6),
-        message: m.text,
+        message: m.text || 'Message sent (text not stored)',
         type: m.source === 'system' ? 'System DM' : 'Manual DM',
         status: inbound && inbound > m.createdAt ? 'replied' : 'sent',
         time: m.createdAt,
