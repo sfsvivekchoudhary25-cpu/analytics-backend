@@ -1,4 +1,5 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
+import { encryptedTextTransformer } from '../common/encrypted.transformer';
 
 // Row per account: master switch and safety limits for automatic replies to direct messages.
 @Index('uq_message_auto_setting_owner', ['ownerUsername'], { unique: true })
@@ -98,7 +99,8 @@ export class MessageAutoLog {
   @Column({ type: 'text', nullable: true })
   note: string | null;
 
-  @Column({ name: 'reply_text', type: 'text', nullable: true })
+  // What we sent to a customer. Encrypted at rest.
+  @Column({ name: 'reply_text', type: 'text', nullable: true, transformer: encryptedTextTransformer })
   replyText: string | null;
 
   @Index()

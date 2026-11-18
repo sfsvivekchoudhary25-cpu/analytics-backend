@@ -353,7 +353,7 @@ export class AutoMessageService {
         const who = conv?.username ? `@${conv.username}` : m.igsid;
         if (decision.outcome === 'sent') {
           const label = decision.kind === 'ai' ? ', AI' : decision.kind === 'fallback' ? ', fallback' : '';
-          this.logger.log(`REPLIED (auto${label}) to ${who}: "${preview(decision.replyText ?? '')}"${this.dryRun ? ' [DRY RUN, not sent]' : ''}`);
+          this.logger.log(`REPLIED (auto${label}) to ${who}: (${(decision.replyText ?? '').length} characters)${this.dryRun ? ' [DRY RUN, not sent]' : ''}`);
         }
         else if (decision.outcome === 'failed') this.logger.warn(`Auto-reply to ${who} FAILED (will not retry): ${decision.note}`);
         else this.logger.log(`Auto-reply skipped for ${who}: ${decision.note}`);

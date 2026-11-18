@@ -1,4 +1,5 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
+import { encryptedTextTransformer } from '../common/encrypted.transformer';
 
 // One row per customer we've exchanged DMs with. Keyed by their Instagram-scoped ID.
 @Index('ix_conversation_owner_last', ['ownerUsername', 'lastMessageAt'])
@@ -17,7 +18,8 @@ export class Conversation {
   @Column({ name: 'profile_pic', type: 'text', nullable: true })
   profilePic: string | null;
 
-  @Column({ name: 'last_text', type: 'text', default: '' })
+  // Encrypted at rest (a preview of the latest DM).
+  @Column({ name: 'last_text', type: 'text', default: '', transformer: encryptedTextTransformer })
   lastText: string;
 
   @Index()
@@ -50,14 +52,15 @@ export class Message {
   @Column({ type: 'varchar' })
   direction: 'in' | 'out';
 
-  @Column({ type: 'text', default: '' })
+  // The DM itself. Encrypted at rest.
+  @Column({ type: 'text', default: '', transformer: encryptedTextTransformer })
   text: string;
 
   // e.g. "image", "story_mention"; shown as a label when there is no text.
   @Column({ name: 'attachment_type', type: 'varchar', nullable: true })
   attachmentType: string | null;
 
-  @Column({ name: 'attachment_url', type: 'text', nullable: true })
+  @Column({ name: 'attachment_url', type: 'text', nullable: true, transformer: encryptedTextTransformer })
   attachmentUrl: string | null;
 
   // Who sent an outgoing message: 'app' = typed in the Instagram app, 'dashboard', 'auto' = automation,

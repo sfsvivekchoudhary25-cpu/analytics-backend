@@ -120,11 +120,13 @@ export class MessagingService implements OnModuleInit {
           // so it is not stored (real attachments with their type still arrive through the webhook).
           if (!text) continue;
           // The same message may already be stored via the webhook, possibly under a different id format.
+          // (Message text is encrypted, so it cannot be compared in SQL: fetch the few rows around that moment and compare here.)
+          const sameMoment = await this.messages.find({
+            where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
+          });
           const dup =
             (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) ||
-            (await this.messages.exists({
-              where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', text, createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
-            }));
+            sameMoment.some((r) => r.text === text);
           if (dup) continue;
           await this.messages.save(
             this.messages.create({
@@ -217,12 +219,13 @@ export class MessagingService implements OnModuleInit {
       stored.text = String(ev.message_edit.text ?? '');
       if (ownUsername && !stored.ownerUsername) stored.ownerUsername = ownUsername;
       await this.messages.save(stored);
-      // Refresh the list preview only if this was the conversation's latest message.
-      await this.conversations.update(
-        ownUsername ? { igsid: stored.igsid, lastText: before, ownerUsername: ownUsername } : { igsid: stored.igsid, lastText: before },
-        { lastText: stored.text },
-      );
-      this.logger.log(`Updated message to "${stored.text.slice(0, 60)}" (edit #${ev.message_edit.num_edit ?? '?'})`);
+      // Refresh the list preview only if this was the conversation's latest message (compared here, not in SQL).
+      const conv = await this.conversations.findOne({ where: ownUsername ? { igsid: stored.igsid, ownerUsername: ownUsername } : { igsid: stored.igsid } });
+      if (conv && conv.lastText === before) {
+        conv.lastText = stored.text;
+        await this.conversations.save(conv);
+      }
+      this.logger.log(`A customer edited a message (edit #${ev.message_edit.num_edit ?? '?'})`);
       return;
     }
 

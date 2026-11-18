@@ -4,7 +4,7 @@ import { AccountService } from '../account/account.service';
 
 const NAME = () => process.env.LEGAL_BUSINESS_NAME ?? 'InstaVeyra (Inrō Studio)';
 const EMAIL = () => process.env.LEGAL_CONTACT_EMAIL ?? 'support@fabroniee.store';
-const UPDATED = 'October 12, 2026';
+const UPDATED = 'November 18, 2026';
 
 const esc = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -85,7 +85,8 @@ export class LegalController {
 <ul>
   <li><strong>Basic Profile Information:</strong> Name, email address, profile picture URL, and Instagram handle to create and display your account dashboard.</li>
   <li><strong>Meta Page &amp; Instagram Identifiers:</strong> App-Scoped User IDs (ASIDs), Facebook Page IDs, and Instagram Business Account IDs to link your social assets.</li>
-  <li><strong>Interaction Data:</strong> Temporary access to incoming Instagram comment text strings and unique comment IDs solely to evaluate user-configured keyword triggers.</li>
+  <li><strong>Interaction Data:</strong> Incoming Instagram comment text and unique comment IDs, used to evaluate the keyword triggers you configure.</li>
+  <li><strong>Direct Messages:</strong> The direct messages sent to and from your connected Instagram account (text, attachment links, timestamps, and the sender&rsquo;s Instagram-scoped ID and username), so that we can show them in your inbox and run your automatic replies.</li>
   <li><strong>Encrypted Tokens:</strong> Meta OAuth access tokens required to communicate with the Meta Graph API on your behalf, stored using AES-256-GCM encryption at rest.</li>
 </ul>
 
@@ -95,20 +96,26 @@ export class LegalController {
   <li>To monitor incoming comments on your linked Instagram posts for specific keywords you configure (e.g., &ldquo;LINK&rdquo; or &ldquo;INFO&rdquo;).</li>
   <li>To automatically dispatch a single direct message (DM) response containing your requested resources, download link, or product information directly to the commenter.</li>
   <li>To display analytics regarding your automation performance (e.g., total comments matched, DMs sent, and conversion rates).</li>
-  <li><strong>Zero Message Snooping:</strong> We do not read, store, sell, or monitor your personal private messaging history.</li>
+  <li>To show your inbox, keep conversations in order, and decide whether an automatic reply is needed (for example, not answering a message you already answered yourself).</li>
+  <li><strong>No other use of your messages:</strong> We do not sell them, use them for advertising, or share them with third parties. Your messages are visible in the dashboard only to the account that owns them. The text of automatic replies that use AI is sent to our AI provider to write the reply, and for no other purpose.</li>
 </ul>
 
 <h2>3. Data Storage, Retention &amp; De-duplication</h2>
 <ul>
   <li><strong>No Selling of Data:</strong> We never sell, rent, trade, or share user data or customer identifiers with third-party data brokers or advertisers.</li>
   <li><strong>Ephemeral Processing:</strong> Comment payloads received via webhooks are processed in real-time. We cache unique <code>comment_id</code> identifiers in our database solely to prevent sending duplicate automated messages to the same user or comment.</li>
+  <li><strong>Encrypted Messages:</strong> The text and attachment links of stored direct messages, and message previews, are encrypted at rest with AES-256-GCM. The encryption key is kept in our server configuration, separate from the database, so a copy of the database alone does not reveal message content.</li>
+  <li><strong>Separation Between Accounts:</strong> Each account&rsquo;s data is isolated, and one account can never read another account&rsquo;s messages.</li>
   <li><strong>Security:</strong> All communication occurs over secure HTTPS/TLS 1.3 channels, and access tokens are secured with industry-standard cryptographic practices.</li>
 </ul>
 
 <h2>4. Data Deletion and Revocation</h2>
 <p>You have full sovereignty over your data at all times. Users can disconnect their Meta accounts or completely purge their profile data from our platform:</p>
 <div class="box">
-  <strong>Instant In-App Deletion:</strong> Navigate to your <strong>Account Settings</strong> dashboard panel and click <strong>&ldquo;Delete Account &amp; Wipe Data&rdquo;</strong>. Upon execution, all stored Meta access tokens, linked Page records, and cached identifiers are permanently wiped from our active databases.
+  <strong>Instant In-App Deletion:</strong> Navigate to your <strong>Account Settings</strong> dashboard panel and click <strong>&ldquo;Delete Account &amp; Wipe Data&rdquo;</strong>. Upon execution, your login, all stored Meta access tokens, linked Page records, comments, direct messages, automation rules and logs, and uploaded images are permanently erased from our active databases.
+</div>
+<div class="box">
+  <strong>Delete a single conversation:</strong> In the <strong>Conversations</strong> page you can delete any conversation. Its stored messages are permanently erased from our database (the messages remain in Instagram itself, which we do not control).
 </div>
 <p>You may also review our step-by-step <a href="/data-deletion">Data Deletion Instructions</a> or submit a manual deletion request by emailing <a href="mailto:${e}">${e}</a>.</p>
 
@@ -138,7 +145,7 @@ export class LegalController {
   <li>Click on your profile avatar in the navigation bar to open <strong>Account Settings</strong>.</li>
   <li>Scroll to the <strong>Data &amp; Security / Danger Zone</strong> section.</li>
   <li>Click the button labeled <strong>&ldquo;Delete Account &amp; Wipe Data&rdquo;</strong> and confirm the prompt.</li>
-  <li>Our system will immediately delete your encrypted Meta access tokens, linked Facebook Page IDs, Instagram account connection, and all automation rules from our database.</li>
+  <li>Our system will immediately delete your login, encrypted Meta access tokens, linked Facebook Page IDs, Instagram account connection, comments, direct messages, and all automation rules and logs from our database.</li>
 </ol>
 
 <h3>Method 2: Email Request to Data Protection Officer</h3>
