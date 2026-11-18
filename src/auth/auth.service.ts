@@ -246,6 +246,62 @@ export class AuthService {
     return { ok: true, message: 'Password has been reset successfully. You can now sign in.' };
   }
 
+  /**
+   * Decides which login an Instagram / Facebook connection belongs to, after Meta has verified the Instagram handle.
+   * - Someone is already signed in (`signedInUserId`): the handle is linked to THAT user, so signing up first and
+   *   connecting later gives one account, not two. A password-less "@inro.social" login that an earlier connection
+   *   auto-created for this same handle is folded into the real login (data is keyed by handle, so nothing is lost).
+   * - Nobody is signed in ("log in with Instagram"): find the login for this handle, or create one.
+   */
+  async resolveUserForInstagram(o: { handle: string; displayName?: string; signedInUserId?: string | null }): Promise<User> {
+    const handle = o.handle.trim().replace(/^@/, '');
+    const lower = handle.toLowerCase();
+    const byHandle = await this.userRepo
+      .createQueryBuilder('u')
+      .where('LOWER(u.instagram_handle) = :h', { h: lower })
+      .getOne();
+
+    if (o.signedInUserId) {
+      const me = await this.userRepo.findOne({ where: { id: o.signedInUserId } });
+      if (me) {
+        if (me.instagramHandle && me.instagramHandle.toLowerCase() !== lower) {
+          throw new BadRequestException(
+            `Your account is linked to @${me.instagramHandle.replace(/^@/, '')}, but you logged in to Instagram as @${handle}. Log in with @${me.instagramHandle.replace(/^@/, '')} instead.`,
+          );
+        }
+        if (byHandle && byHandle.id !== me.id) {
+          const autoCreated = !byHandle.passwordHash && byHandle.email.endsWith('@inro.social');
+          if (!autoCreated) {
+            throw new BadRequestException(`@${handle} is already connected to a different login.`);
+          }
+          await this.userRepo.delete({ id: byHandle.id });
+        }
+        if (!me.instagramHandle) {
+          me.instagramHandle = handle;
+          await this.userRepo.save(me);
+        }
+        return me;
+      }
+    }
+
+    let user = byHandle ?? (await this.userRepo.findOne({ where: { email: `${lower}@inro.social` } }));
+    if (!user) {
+      user = await this.userRepo.save(
+        this.userRepo.create({
+          email: `${lower}@inro.social`,
+          name: o.displayName || handle,
+          passwordHash: '',
+          instagramHandle: handle,
+          role: 'user',
+        }),
+      );
+    } else if (!user.instagramHandle) {
+      user.instagramHandle = handle;
+      user = await this.userRepo.save(user);
+    }
+    return user;
+  }
+
   async completeOnboarding(
     userId: string,
     dto: {

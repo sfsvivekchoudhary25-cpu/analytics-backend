@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { GRAPH } from './graph-client.service';
 import { InstagramConnectionService } from './instagram-connection.service';
 import { User } from '../auth/user.entity';
+import { AuthService } from '../auth/auth.service';
 
 // Official Instagram Graph API permissions for Professional (Business / Creator) accounts
 const DEFAULT_SCOPES = [
@@ -33,7 +34,21 @@ export class InstagramOauthController {
     private readonly connection: InstagramConnectionService,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
+    private readonly auth: AuthService,
   ) {}
+
+  // Who is clicking "Connect"? The frontend sends the user's session token; if it checks out, the connection will be
+  // linked to that user when Instagram sends them back. No token = "log in with Instagram".
+  private async signedInUserId(req?: any): Promise<string | undefined> {
+    const [type, token] = String(req?.headers?.authorization ?? '').split(' ');
+    if (type !== 'Bearer' || !token) return undefined;
+    try {
+      const p = await this.jwt.verifyAsync(token);
+      return p?.sub || p?.id || undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   private redirectUri(clientOrigin?: string): string {
     const isLocal =
@@ -74,7 +89,7 @@ export class InstagramOauthController {
 
     // `state` is a signed JWT storing the origin and matched redirectUri so only flows initiated by this system can finish
     const state = await this.jwt.signAsync(
-      { purpose: 'ig-oauth', origin: detectedOrigin, redirectUri },
+      { purpose: 'ig-oauth', origin: detectedOrigin, redirectUri, uid: await this.signedInUserId(req) },
       { expiresIn: '15m' },
     );
 
@@ -100,6 +115,7 @@ export class InstagramOauthController {
   ) {
     let frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
     let matchedRedirectUri = this.redirectUri();
+    let stateUid: string | undefined;
 
     const back = (q: Record<string, string>) =>
       res.redirect(`${frontendBase}/dashboard?${new URLSearchParams(q)}`);
@@ -113,6 +129,7 @@ export class InstagramOauthController {
       if (payload.purpose !== 'ig-oauth') throw new Error('bad state');
       if (payload.origin) frontendBase = payload.origin.replace(/\/$/, '');
       if (payload.redirectUri) matchedRedirectUri = payload.redirectUri;
+      stateUid = payload.uid;
     } catch {
       return back({ error: 'Login session expired or invalid. Please try again.' });
     }
@@ -131,29 +148,8 @@ export class InstagramOauthController {
       );
       await this.subscribeToMessages(longLived.access_token);
 
-      // Multi-account / User provisioning: Find or create User in app_users
-      const handle = (username || 'creator').toLowerCase();
-      let user = await this.userRepo.findOne({
-        where: [
-          { instagramHandle: username },
-          { instagramHandle: handle },
-          { email: `${handle}@inro.social` },
-        ],
-      });
-
-      if (!user) {
-        user = this.userRepo.create({
-          email: `${handle}@inro.social`,
-          name: username,
-          passwordHash: '',
-          instagramHandle: username,
-          role: 'user',
-        });
-        user = await this.userRepo.save(user);
-      } else if (!user.instagramHandle) {
-        user.instagramHandle = username;
-        await this.userRepo.save(user);
-      }
+      // Link the verified Instagram account to the signed-in user (or find / create the login for it).
+      const user = await this.auth.resolveUserForInstagram({ handle: username || '', signedInUserId: stateUid });
 
       // Generate session JWT for the authenticated user
       const sessionToken = await this.jwt.signAsync({

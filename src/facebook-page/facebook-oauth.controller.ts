@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { FacebookPageService } from './facebook-page.service';
 import { User } from '../auth/user.entity';
+import { AuthService } from '../auth/auth.service';
 
 const FB_API = 'https://graph.facebook.com/v21.0';
 
@@ -20,7 +21,20 @@ export class FacebookOauthController {
     private readonly pages: FacebookPageService,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
+    private readonly auth: AuthService,
   ) {}
+
+  // Who is clicking "Connect"? See InstagramOauthController.signedInUserId.
+  private async signedInUserId(req?: any): Promise<string | undefined> {
+    const [type, token] = String(req?.headers?.authorization ?? '').split(' ');
+    if (type !== 'Bearer' || !token) return undefined;
+    try {
+      const p = await this.jwt.verifyAsync(token);
+      return p?.sub || p?.id || undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   private redirectUri(clientOrigin?: string): string {
     // If an explicit HTTPS override is provided in env, use it
@@ -48,7 +62,7 @@ export class FacebookOauthController {
     const redirectUri = this.redirectUri(detectedOrigin);
 
     const state = await this.jwt.signAsync(
-      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri, returnPath },
+      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri, returnPath, uid: await this.signedInUserId(req) },
       { expiresIn: '15m' },
     );
     const appId = process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '';
@@ -87,6 +101,7 @@ export class FacebookOauthController {
     let frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
     let matchedRedirectUri = this.redirectUri();
     let returnPath = '/account';
+    let stateUid: string | undefined;
 
     const back = (q: Record<string, string>) =>
       res.redirect(`${frontendBase}${returnPath}?${new URLSearchParams(q)}`);
@@ -98,6 +113,7 @@ export class FacebookOauthController {
       if (payload.origin) frontendBase = payload.origin.replace(/\/$/, '');
       if (payload.returnPath) returnPath = payload.returnPath;
       if (payload.redirectUri) matchedRedirectUri = payload.redirectUri;
+      stateUid = payload.uid;
     } catch {
       return back({ error: 'Login session expired or invalid. Please try again.' });
     }
@@ -192,20 +208,11 @@ export class FacebookOauthController {
       // Also auto-provision or find the user for this verified Instagram account
       let sessionToken = '';
       if (igUsername) {
-        const handle = igUsername.toLowerCase();
-        let user = await this.userRepo.findOne({
-          where: [{ instagramHandle: igUsername }, { instagramHandle: handle }, { email: `${handle}@inro.social` }],
+        const user = await this.auth.resolveUserForInstagram({
+          handle: igUsername,
+          displayName: chosen.name || igUsername,
+          signedInUserId: stateUid,
         });
-        if (!user) {
-          user = this.userRepo.create({
-            email: `${handle}@inro.social`,
-            name: chosen.name || igUsername,
-            passwordHash: '',
-            instagramHandle: igUsername,
-            role: 'user',
-          });
-          user = await this.userRepo.save(user);
-        }
         sessionToken = await this.jwt.signAsync({
           sub: user.id,
           email: user.email,
