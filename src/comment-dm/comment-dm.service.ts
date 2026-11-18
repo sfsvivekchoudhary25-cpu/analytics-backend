@@ -92,7 +92,9 @@ export class CommentDmService {
       this.rules.create({
         ownerUsername: own,
         name: count ? `Comment-to-DM Automation ${count + 1}` : 'Comment-to-DM Automation',
-        enabled: false,
+        // A new automation starts live. enabledAt is set the same way as when it is switched on by hand.
+        enabled: true,
+        enabledAt: new Date(),
         keywords: '',
         dmText: 'Hey! 👋 Thanks for your comment.',
         requireFollow: false,
