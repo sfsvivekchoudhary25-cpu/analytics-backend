@@ -4,6 +4,7 @@ export type AutoState = 'new' | 'processing' | 'done' | 'skipped' | 'failed';
 export type ReplyKind = 'manual' | 'auto' | 'external';
 
 // A top-level (or reply) comment on one of our posts. Keyed by Instagram's comment id.
+@Index('ix_comment_owner_time', ['ownerUsername', 'commentedAt'])
 @Entity('comment')
 export class Comment {
   @PrimaryColumn({ type: 'varchar' })
@@ -67,6 +68,7 @@ export class Comment {
 }
 
 // Master switch per account for comment automation.
+@Index('uq_auto_reply_setting_owner', ['ownerUsername'], { unique: true })
 @Entity('auto_reply_setting')
 export class AutoReplySetting {
   @PrimaryColumn({ type: 'int' })

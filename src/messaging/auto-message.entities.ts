@@ -1,6 +1,7 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
 
 // Row per account: master switch and safety limits for automatic replies to direct messages.
+@Index('uq_message_auto_setting_owner', ['ownerUsername'], { unique: true })
 @Entity('message_auto_setting')
 export class MessageAutoSetting {
   @PrimaryColumn({ type: 'int' })
@@ -67,6 +68,7 @@ export class MessageAutoRule {
 
 // One row per incoming message we have considered. The unique message id is what guarantees
 // that a single message can never be answered twice, even if two workers pick it up at once.
+@Index('ix_message_auto_log_owner_time', ['ownerUsername', 'createdAt'])
 @Entity('message_auto_log')
 export class MessageAutoLog {
   @PrimaryGeneratedColumn('uuid')

@@ -1,9 +1,11 @@
-import { Entity, PrimaryGeneratedColumn, Column, UpdateDateColumn } from 'typeorm';
+import { Entity, Index, PrimaryGeneratedColumn, Column, UpdateDateColumn } from 'typeorm';
 import { encryptedTransformer } from '../common/encrypted.transformer';
 
 // Single-row table: this business only ever connects one Instagram account.
 // If you later support multiple stores/accounts, add a unique key column
 // instead of treating this as a singleton.
+@Index('uq_instagram_connection_ig_user', ['igUserId'], { unique: true })
+@Index('uq_instagram_connection_name', ['username'], { unique: true })
 @Entity('instagram_connection')
 export class InstagramConnection {
   @PrimaryGeneratedColumn('uuid')

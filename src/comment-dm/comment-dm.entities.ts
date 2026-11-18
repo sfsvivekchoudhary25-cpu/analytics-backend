@@ -88,6 +88,7 @@ export class CommentDmRule {
 
 // One row per comment a rule actually matched (its trigger firing). A comment is attempted at most once
 // (comment_id is unique) — a public "check your DMs" reply is posted once, never retried.
+@Index('ix_comment_dm_log_owner_time', ['ownerUsername', 'createdAt'])
 @Entity('comment_dm_log')
 export class CommentDmLog {
   @PrimaryGeneratedColumn('uuid')

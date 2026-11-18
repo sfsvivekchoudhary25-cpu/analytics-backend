@@ -1,6 +1,7 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
 
 // One row per customer we've exchanged DMs with. Keyed by their Instagram-scoped ID.
+@Index('ix_conversation_owner_last', ['ownerUsername', 'lastMessageAt'])
 @Entity('conversation')
 export class Conversation {
   @PrimaryColumn({ type: 'varchar' })
@@ -31,6 +32,8 @@ export class Conversation {
   unread: number;
 }
 
+@Index('uq_message_owner_mid', ['ownerUsername', 'mid'], { unique: true, where: '"mid" IS NOT NULL' })
+@Index('ix_message_owner_thread_time', ['ownerUsername', 'igsid', 'createdAt'])
 @Entity('message')
 export class Message {
   @PrimaryGeneratedColumn('uuid')

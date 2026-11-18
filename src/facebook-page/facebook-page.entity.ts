@@ -12,10 +12,11 @@ export class FacebookPageConnection {
 
   // The Instagram account (handle) this Page belongs to: one row PER account. Taken from the Page's own linked
   // Instagram account as reported by Meta, never typed by a user, so a new signup cannot inherit someone else's Page.
-  @Index()
+  @Index('uq_facebook_page_owner', { unique: true })
   @Column({ name: 'owner_username', type: 'varchar', nullable: true })
   ownerUsername: string | null;
 
+  @Index('uq_facebook_page_page_id', { unique: true })
   @Column({ name: 'page_id' })
   pageId: string;
 
