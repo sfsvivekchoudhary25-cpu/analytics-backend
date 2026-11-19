@@ -538,7 +538,7 @@ export class MessagingService implements OnModuleInit {
     });
     const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined, noStore, echo ? 'app' : undefined);
     this.logger.log(
-      `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId} (unread: ${c.unread})`,
+      `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId} (unread: ${c.unread}) [account ${ownUsername ?? 'NOT MATCHED to any connected account (id ' + ownId + ')'}, ${noStore ? 'kept in memory only' : 'saved to database'}]`,
     );
   }
 
