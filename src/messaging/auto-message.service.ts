@@ -291,7 +291,13 @@ export class AutoMessageService {
         { outcome: 'failed', note: 'interrupted while processing; not retried, to avoid replying twice' },
       );
       const s = await this.getSettings(ownerUsername);
-      if (!(s.enabled || s.aiEnabled) || !s.enabledAt) return;
+      if (!(s.enabled || s.aiEnabled) || !s.enabledAt) {
+        // Say why nothing is answered, instead of returning silently.
+        this.logger.debug(
+          `Auto-reply idle for ${ownerUsername || 'default'}: rules ${s.enabled ? 'on' : 'off'}, AI ${s.aiEnabled ? 'on' : 'off'}, switched on at ${s.enabledAt ? new Date(s.enabledAt).toISOString() : 'never'} (settings row owner: ${s.ownerUsername ?? 'none'})`,
+        );
+        return;
+      }
       const own = await this.resolveOwner(ownerUsername);
 
       const qb = this.messages
@@ -323,7 +329,10 @@ export class AutoMessageService {
         );
       }
       const pending = [...dbPending, ...queuedMessages].slice(0, 20);
-      if (!pending.length) return;
+      if (!pending.length) {
+        this.logger.debug(`Auto-reply: no unanswered messages for ${own ?? 'default'} since ${new Date(s.enabledAt).toISOString()}`);
+        return;
+      }
       const rules = await this.rulesRepo.find({
         where: own ? { ownerUsername: own } : {},
         order: { sortOrder: 'ASC', createdAt: 'ASC' },
