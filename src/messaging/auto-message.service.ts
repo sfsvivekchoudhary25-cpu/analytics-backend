@@ -281,7 +281,10 @@ export class AutoMessageService {
   }
 
   async processPending(ownerUsername?: string) {
-    if (this.running) return;
+    if (this.running) {
+      this.logger.debug(`Auto-reply: another run is still in progress, skipping this tick (${ownerUsername || 'default'})`);
+      return;
+    }
     this.running = true;
     try {
       // A claim that never finished (for example the backend restarted in the middle of it) must not stay open
@@ -330,7 +333,10 @@ export class AutoMessageService {
       }
       const pending = [...dbPending, ...queuedMessages].slice(0, 20);
       if (!pending.length) {
-        this.logger.debug(`Auto-reply: no unanswered messages for ${own ?? 'default'} since ${new Date(s.enabledAt).toISOString()}`);
+        const noStore = await this.messaging.isNoStore(own).catch(() => null);
+        this.logger.debug(
+          `Auto-reply: no unanswered messages for ${own ?? 'default'} since ${new Date(s.enabledAt).toISOString()} (stored: ${dbPending.length}, in memory: ${queuedMessages.length}, "don't store messages" mode: ${noStore ? 'on' : 'off'})`,
+        );
         return;
       }
       const rules = await this.rulesRepo.find({
