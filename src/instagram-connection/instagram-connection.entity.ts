@@ -14,6 +14,11 @@ export class InstagramConnection {
   @Column({ name: 'ig_user_id' })
   igUserId: string;
 
+  // The professional-account id Instagram puts in webhooks (`user_id`). It differs from ig_user_id, which holds the
+  // app-scoped `id` that /me returns, so webhooks are matched to an account through this column.
+  @Column({ name: 'ig_account_id', type: 'varchar', nullable: true })
+  igAccountId: string | null;
+
   @Column()
   username: string;
 

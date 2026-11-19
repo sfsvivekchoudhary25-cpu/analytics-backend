@@ -273,6 +273,10 @@ export class InstagramConnectionService implements OnModuleInit {
 
     connection.igUserId = me.user_id;
     connection.username = me.username;
+    // Webhooks use the professional-account id (`user_id`), not the `id` stored above. Best effort: if this lookup fails
+    // the account is still matched later, the first time a webhook arrives for it.
+    const proId = await this.fetchProfessionalId(accessToken);
+    if (proId) connection.igAccountId = proId;
 
     let localAvatar: string | null = null;
     if (me.profile_picture_url) {
@@ -469,9 +473,38 @@ export class InstagramConnectionService implements OnModuleInit {
     }
   }
 
+  // Instagram's professional-account id (`user_id`) for a token: the id webhooks use. Null if it cannot be read.
+  private async fetchProfessionalId(accessToken: string): Promise<string | null> {
+    try {
+      const res = await fetch(`${GRAPH_BASE}/me?fields=user_id&access_token=${accessToken}`);
+      const data = await res.json();
+      return res.ok && data?.user_id ? String(data.user_id) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Webhooks name the account by its professional-account id. It is stored in ig_account_id when connecting; accounts
+  // connected before that column existed are filled in here, once, the first time a webhook arrives for them.
+  private readonly webhookIdMisses = new Map<string, number>(); // a miss is remembered briefly to avoid repeated calls
+
   async getConnectionByIgUserId(igUserId?: string): Promise<InstagramConnection | null> {
     if (!igUserId) return null;
-    return this.repo.findOne({ where: { igUserId } });
+    const direct = await this.repo.findOne({ where: [{ igAccountId: igUserId }, { igUserId }] });
+    if (direct) return direct;
+    if (Date.now() - (this.webhookIdMisses.get(igUserId) ?? 0) < 5 * 60_000) return null;
+
+    for (const c of await this.repo.find()) {
+      if (c.igAccountId) continue; // already known
+      const proId = await this.fetchProfessionalId(c.accessToken);
+      if (!proId) continue;
+      c.igAccountId = proId;
+      await this.repo.save(c);
+      this.logger.log(`Saved the webhook account id ${proId} for @${c.username}`);
+      if (proId === igUserId) return c;
+    }
+    this.webhookIdMisses.set(igUserId, Date.now());
+    return null;
   }
 
   async getConnectionRow(account?: string): Promise<InstagramConnection | null> {
