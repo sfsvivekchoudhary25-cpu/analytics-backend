@@ -106,6 +106,12 @@ export class InstagramWebhookController {
       const fields = (Array.isArray(payload) ? payload : [payload]).flatMap((r: any) =>
         (r?.entry ?? []).flatMap((e: any) => [...(e.changes ?? []).map((c: any) => c.field), e.field].filter(Boolean)),
       );
+      const standby = (Array.isArray(payload) ? payload : [payload]).some((r: any) => (r?.entry ?? []).some((e: any) => e.standby?.length));
+      if (standby) {
+        this.logger.warn(
+          'STANDBY message: another app currently controls this chat (Instagram Handover Protocol). Replies will be refused unless this app is the Primary Receiver or takes thread control.',
+        );
+      }
       this.logger.log(`Other payload (fields: ${fields.join(', ') || 'none'}) ${raw.slice(0, 300)}`);
     }
     for (const { ownId, ev } of events) {

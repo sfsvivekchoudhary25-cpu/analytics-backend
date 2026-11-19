@@ -534,8 +534,10 @@ export class AutoMessageService {
   }
 
   // "Try it" in the dashboard: shows what the AI would say, without sending anything.
-  async aiTest(text: string) {
-    const s = await this.getSettings();
+  async aiTest(text: string, ownerUsername?: string) {
+    // Use the signed-in user's own account, as the other endpoints do. Guessing the account from the connection made
+    // the settings row belong to a different account than the one the database policy allows, so creating it failed.
+    const s = await this.getSettings(ownerUsername);
     if (!this.ai.available) throw new BadRequestException('AI is not set up: add OPENROUTER_API_KEY to backend/.env and restart.');
     const t = String(text ?? '').trim();
     if (!t) throw new BadRequestException('Type a customer message to test.');

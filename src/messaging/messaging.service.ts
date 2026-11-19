@@ -749,6 +749,27 @@ export class MessagingService implements OnModuleInit {
     }
   }
 
+  // Instagram's Handover Protocol: when another app (or Meta's inbox routing) controls a chat, we only receive it as
+  // "standby" and a send is refused with "not the thread owner". Ask for control of that one chat, then retry once.
+  // If we are not allowed to take control, explain the real fix instead of the bare Instagram error.
+  private async postWithThreadControl(igUserId: string, igsid: string, payload: any, own?: string) {
+    try {
+      return await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own });
+    } catch (err) {
+      if (!/thread owner/i.test((err as Error).message)) throw err;
+      this.logger.warn(`Another app controls the chat with ${igsid}; asking Instagram to hand control to this app`);
+      try {
+        await this.graph.postJson(`/${igUserId}/take_thread_control`, { recipient: { id: igsid } }, { account: own });
+      } catch (takeErr) {
+        throw new Error(
+          `Another app controls this chat, and Instagram would not hand control to this app (${(takeErr as Error).message}). ` +
+            'In the Meta app dashboard (Instagram messaging > Conversation routing) set THIS app as the Primary Receiver, and disconnect other messaging tools from the Instagram account.',
+        );
+      }
+      return await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own });
+    }
+  }
+
   // Send a DM and record it in the thread. `source` says who sent it, so automation can tell a person from itself.
   async send(
     igsid: string,
@@ -861,7 +882,7 @@ export class MessagingService implements OnModuleInit {
       }
 
       try {
-        res = await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own ?? undefined });
+        res = await this.postWithThreadControl(igUserId, igsid, payload, own ?? undefined);
       } catch (err) {
         // Fallback retry with HUMAN_AGENT tag if standard 24h send was rejected
         if (!payload.tag && source === 'dashboard' && isWithin7Days) {
