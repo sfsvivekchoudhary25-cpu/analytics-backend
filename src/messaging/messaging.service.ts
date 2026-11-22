@@ -1,4 +1,4 @@
-import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Between, IsNull, Repository } from 'typeorm';
 import { GraphClient } from '../instagram-connection/graph-client.service';
@@ -9,27 +9,6 @@ import { MessageButton } from '../facebook-page/facebook-page.service';
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const HUMAN_AGENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // Meta Human Agent feature unlocks 7 days
-
-export function generateLetterAvatar(nameOrId: string | null | undefined): string {
-  const raw = String(nameOrId ?? '').replace(/^@/, '').trim();
-  const isAllDigits = /^\d+$/.test(raw);
-  const letter = (isAllDigits || !raw ? 'U' : raw[0]).toUpperCase();
-
-  const colors = [
-    '#3b82f6', '#6366f1', '#8b5cf6', '#ec4899',
-    '#f43f5e', '#ea580c', '#10b981', '#06b6d4',
-  ];
-  let hash = 0;
-  for (let i = 0; i < raw.length; i++) hash = (hash * 31 + raw.charCodeAt(i)) >>> 0;
-  const bg = colors[hash % colors.length];
-
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">` +
-    `<circle cx="50" cy="50" r="50" fill="${bg}"/>` +
-    `<text x="50" y="55" font-size="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-weight="600" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">${letter}</text>` +
-    `</svg>`;
-
-  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
-}
 
 @Injectable()
 export class MessagingService implements OnModuleInit {
@@ -50,20 +29,8 @@ export class MessagingService implements OnModuleInit {
         ALTER TABLE message DROP CONSTRAINT IF EXISTS message_mid_key;
       `).catch(() => {});
 
-      const rows = await this.conversations.find();
-      let updated = 0;
-      for (const c of rows) {
-        if (!c.profilePic) {
-          c.profilePic = generateLetterAvatar(c.username || c.igsid);
-          await this.conversations.save(c);
-          updated++;
-        }
-      }
-      if (updated > 0) {
-        this.logger.log(`Initialized first-letter avatars for ${updated} conversation(s) without profile pictures`);
-      }
     } catch (e) {
-      this.logger.warn(`Could not backfill avatars: ${(e as Error).message}`);
+      this.logger.warn(`Could not relax message uniqueness constraint: ${(e as Error).message}`);
     }
   }
 
@@ -107,7 +74,6 @@ export class MessagingService implements OnModuleInit {
         const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle });
         const msgs: any[] = [...(detail.messages?.data ?? [])].reverse(); // oldest first
         let added = 0;
-        let addedInbound = 0;
         let lastText = existing?.lastText ?? '';
         let lastAt = existing?.lastMessageAt ?? null;
         let lastInboundAt = existing?.lastInboundAt ?? null;
@@ -131,14 +97,11 @@ export class MessagingService implements OnModuleInit {
               text,
               // An outgoing message we did not send ourselves through this app was typed in the Instagram app.
               source: outgoing ? 'app' : null,
-              attachmentType: text ? null : 'attachment',
-              attachmentUrl: null,
               mid: m.id,
               createdAt: at,
             }),
           );
           added += 1;
-          if (!outgoing) addedInbound += 1;
           if (!lastAt || at >= lastAt) {
             lastAt = at;
             lastText = text || '[attachment]';
@@ -151,28 +114,19 @@ export class MessagingService implements OnModuleInit {
           // Never import a conversation with own self
           if (username && username.toLowerCase() === ownHandle) continue;
 
-          let profilePic = existing?.profilePic ?? null;
-          if (!username || !profilePic) {
-            const p = await this.graph.get(`/${other.id}`, { fields: 'username,profile_pic' }, { account: ownHandle }).catch(() => null);
+          if (!username) {
+            const p = await this.graph.get(`/${other.id}`, { fields: 'username' }, { account: ownHandle }).catch(() => null);
             if (p?.username) username = p.username;
-            if (p?.profile_pic) profilePic = p.profile_pic;
           }
           if (username && username.toLowerCase() === ownHandle) continue;
-
-          if (!profilePic) {
-            profilePic = generateLetterAvatar(username || String(other.id));
-          }
           await this.conversations.save(
             this.conversations.create({
               igsid: String(other.id),
               ownerUsername: ownHandle,
               username,
-              profilePic,
               lastText,
               lastMessageAt: lastAt ?? new Date(conv.updated_time),
               lastInboundAt,
-              // A first-time import of old history is not "unread"; later messages are.
-              unread: existing ? existing.unread + addedInbound : 0,
             }),
           );
           conversations += 1;
@@ -237,8 +191,6 @@ export class MessagingService implements OnModuleInit {
               direction: 'in',
               text,
               source: null,
-              attachmentType: null,
-              attachmentUrl: null,
               mid: ev.postback.mid ?? null,
               createdAt: at,
             }),
@@ -261,8 +213,6 @@ export class MessagingService implements OnModuleInit {
       const stored = await this.messages.findOne({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (stored) {
         stored.text = '[message deleted by sender]';
-        stored.attachmentType = null;
-        stored.attachmentUrl = null;
         await this.messages.save(stored);
         this.logger.log(`Marked a message as deleted (...${String(msg.mid).slice(-8)})`);
       }
@@ -292,15 +242,13 @@ export class MessagingService implements OnModuleInit {
         direction: echo ? 'out' : 'in',
         text,
         source: echo ? 'app' : null,
-        attachmentType: attachment?.type ?? null,
-        attachmentUrl: attachment?.payload?.url ?? null,
         mid: msg.mid ?? null,
         createdAt: at,
       }),
     );
     const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined);
     this.logger.log(
-      `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId} (unread: ${c.unread})`,
+      `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId}`,
     );
   }
 
@@ -310,140 +258,20 @@ export class MessagingService implements OnModuleInit {
       where: cleanOwner ? { igsid, ownerUsername: cleanOwner } : { igsid },
     });
     if (!c) {
-      c = this.conversations.create({ igsid, ownerUsername: cleanOwner, username: null, profilePic: null, unread: 0, lastInboundAt: null });
-      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: cleanOwner ?? undefined }).catch(() => null);
+      c = this.conversations.create({ igsid, ownerUsername: cleanOwner, username: null, lastInboundAt: null });
+      const p = await this.graph.get(`/${igsid}`, { fields: 'username' }, { account: cleanOwner ?? undefined }).catch(() => null);
       if (p?.username) c.username = p.username;
-      if (p?.profile_pic) c.profilePic = p.profile_pic;
-      if (!c.profilePic) {
-        c.profilePic = generateLetterAvatar(c.username || igsid);
-      }
     } else {
       if (cleanOwner && !c.ownerUsername) c.ownerUsername = cleanOwner;
-      if (!c.profilePic || !c.username) {
-        const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: cleanOwner ?? undefined }).catch(() => null);
+      if (!c.username) {
+        const p = await this.graph.get(`/${igsid}`, { fields: 'username' }, { account: cleanOwner ?? undefined }).catch(() => null);
         if (p?.username) c.username = p.username;
-        if (p?.profile_pic) c.profilePic = p.profile_pic;
-        if (!c.profilePic) {
-          c.profilePic = generateLetterAvatar(c.username || igsid);
-        }
       }
     }
     c.lastText = text || (attachmentType ? `[${attachmentType}]` : '');
     c.lastMessageAt = at;
-    if (dir === 'in') {
-      c.lastInboundAt = at;
-      c.unread += 1;
-    }
+    if (dir === 'in') c.lastInboundAt = at;
     return this.conversations.save(c);
-  }
-
-  // ---------- admin ----------
-
-  async listConversations(ownerUsername?: string) {
-    const own = await this.resolveOwner(ownerUsername);
-    if (!own) return [];
-
-    const qb = this.conversations.createQueryBuilder('c')
-      .where('LOWER(c.ownerUsername) = :own', { own })
-      .andWhere('(LOWER(c.username) != :own OR c.username IS NULL)', { own })
-      .orderBy('c.lastMessageAt', 'DESC')
-      .take(100);
-
-    const rows = await qb.getMany();
-    for (const c of rows) {
-      if (!c.profilePic) {
-        this.fetchContactProfile(c, own).catch(() => {});
-      }
-    }
-    return rows.map((c) => this.view(c));
-  }
-
-  async thread(igsid: string, ownerUsername?: string) {
-    const own = await this.resolveOwner(ownerUsername);
-    if (!own) throw new NotFoundException('Conversation not found.');
-
-    const c = await this.conversations.findOne({
-      where: { igsid, ownerUsername: own },
-    });
-    if (!c) throw new NotFoundException('Conversation not found.');
-
-    if (!c.profilePic) {
-      await this.fetchContactProfile(c, own).catch(() => {});
-    }
-    const recent = await this.messages.find({
-      where: { igsid, ownerUsername: own },
-      order: { createdAt: 'DESC' },
-      take: 300,
-    });
-    const messages = recent.reverse();
-    if (c.unread) {
-      c.unread = 0;
-      await this.conversations.save(c);
-    }
-    return { conversation: this.view(c), messages };
-  }
-
-  private async fetchContactProfile(c: Conversation, account?: string) {
-    try {
-      const p = await this.graph.get(`/${c.igsid}`, { fields: 'username,profile_pic' }, { account });
-      let changed = false;
-      if (p?.username && p.username !== c.username) {
-        c.username = p.username;
-        changed = true;
-      }
-      if (p?.profile_pic && p.profile_pic !== c.profilePic) {
-        c.profilePic = p.profile_pic;
-        changed = true;
-      } else if (!c.profilePic) {
-        c.profilePic = generateLetterAvatar(c.username || c.igsid);
-        changed = true;
-      }
-      if (changed) {
-        await this.conversations.save(c);
-      }
-    } catch {
-      // If fetching fails (e.g. code 230 - user consent required), fallback to first letter as profile picture
-      // so we don't query repeatedly on every 3-second poll.
-      if (!c.profilePic) {
-        c.profilePic = generateLetterAvatar(c.username || c.igsid);
-        await this.conversations.save(c).catch(() => {});
-      }
-    }
-  }
-
-  // Removes the conversation and its messages from this dashboard only; nothing is deleted on Instagram.
-  async deleteConversation(igsid: string, ownerUsername?: string) {
-    const own = await this.resolveOwner(ownerUsername);
-    const c = await this.getConversation(igsid, own ?? undefined);
-    if (own) {
-      const { affected } = await this.messages.delete({ igsid, ownerUsername: own });
-      await this.conversations.delete({ igsid, ownerUsername: own });
-      this.logger.log(`Deleted conversation (@${own}) with ${c.username ? '@' + c.username : igsid} (${affected ?? 0} messages)`);
-      return { ok: true, deletedMessages: affected ?? 0 };
-    }
-    const { affected } = await this.messages.delete({ igsid });
-    await this.conversations.delete({ igsid });
-    this.logger.log(`Deleted conversation with ${c.username ? '@' + c.username : igsid} (${affected ?? 0} messages)`);
-    return { ok: true, deletedMessages: affected ?? 0 };
-  }
-
-  async reply(igsid: string, rawText: string, ownerUsername?: string) {
-    const text = String(rawText ?? '').trim();
-    if (!text) throw new BadRequestException('Message is empty.');
-    if (text.length > 1000) throw new BadRequestException('Message is too long (1000 characters max).');
-    const own = await this.resolveOwner(ownerUsername);
-    const c = await this.getConversation(igsid, own ?? undefined);
-    if (!this.canReply(c)) {
-      this.logger.warn(`Reply to ${c.username ? '@' + c.username : igsid} blocked: outside Instagram's 24-hour window`);
-      throw new BadRequestException('More than 24 hours have passed since this customer last messaged you, so Instagram will not deliver a reply.');
-    }
-    try {
-      return await this.send(igsid, text, 'dashboard', undefined, undefined, own ?? undefined);
-    } catch (err) {
-      this.logger.warn(`Reply to ${c.username ? '@' + c.username : igsid} FAILED: ${(err as Error).message}`);
-      // Surface Instagram's own reason instead of a bare 500.
-      throw new BadGatewayException(`Instagram could not send the message: ${(err as Error).message}`);
-    }
   }
 
   // Send a DM and record it in the thread. `source` says who sent it, so automation can tell a person from itself.
@@ -585,8 +413,6 @@ export class MessagingService implements OnModuleInit {
           direction: 'out',
           text,
           source,
-          attachmentType: null,
-          attachmentUrl: null,
           mid: res?.message_id ?? null,
           createdAt: now,
         }),
@@ -598,31 +424,5 @@ export class MessagingService implements OnModuleInit {
     const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined);
     this.logger.log(`[Messaging] DM sent (${sentFormat}) to ${c.username ? '@' + c.username : igsid}: "${text.length > 60 ? text.slice(0, 60) + '…' : text}"`);
     return { ok: true };
-  }
-
-  private async getConversation(igsid: string, ownerUsername?: string) {
-    const c = await this.conversations.findOne({
-      where: ownerUsername ? { igsid, ownerUsername } : { igsid },
-    });
-    if (!c) throw new NotFoundException('Conversation not found.');
-    return c;
-  }
-
-  private canReply(c: Conversation) {
-    // Allows reply within 7 days if Human Agent feature is enabled for dashboard replies
-    return !!c.lastInboundAt && Date.now() - c.lastInboundAt.getTime() < HUMAN_AGENT_WINDOW_MS;
-  }
-
-  private view(c: Conversation) {
-    return {
-      igsid: c.igsid,
-      username: c.username,
-      profilePic: c.profilePic ?? null,
-      lastText: c.lastText,
-      lastMessageAt: c.lastMessageAt,
-      unread: c.unread,
-      canReply: this.canReply(c),
-      replyUntil: c.lastInboundAt ? new Date(c.lastInboundAt.getTime() + WINDOW_MS) : null,
-    };
   }
 }

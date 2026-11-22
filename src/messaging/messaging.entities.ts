@@ -13,9 +13,6 @@ export class Conversation {
   @Column({ type: 'varchar', nullable: true })
   username: string | null;
 
-  @Column({ name: 'profile_pic', type: 'text', nullable: true })
-  profilePic: string | null;
-
   @Column({ name: 'last_text', type: 'text', default: '' })
   lastText: string;
 
@@ -26,9 +23,6 @@ export class Conversation {
   // Instagram only lets us reply within 24h of this.
   @Column({ name: 'last_inbound_at', type: 'timestamptz', nullable: true })
   lastInboundAt: Date | null;
-
-  @Column({ type: 'int', default: 0 })
-  unread: number;
 }
 
 @Entity('message')
@@ -49,13 +43,6 @@ export class Message {
 
   @Column({ type: 'text', default: '' })
   text: string;
-
-  // e.g. "image", "story_mention"; shown as a label when there is no text.
-  @Column({ name: 'attachment_type', type: 'varchar', nullable: true })
-  attachmentType: string | null;
-
-  @Column({ name: 'attachment_url', type: 'text', nullable: true })
-  attachmentUrl: string | null;
 
   // Who sent an outgoing message: 'app' = typed in the Instagram app, 'dashboard', 'auto' = automation,
   // 'system' = e.g. the photo thank-you. Null for incoming messages. Automation stays quiet after 'app'/'dashboard'.

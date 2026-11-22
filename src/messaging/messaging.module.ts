@@ -7,7 +7,6 @@ import { MessageAutoLog, MessageAutoRule, MessageAutoSetting } from './auto-mess
 import { AutoMessageService } from './auto-message.service';
 import { CommentDmLog } from '../comment-dm/comment-dm.entities';
 import { Conversation, Message } from './messaging.entities';
-import { MessagingController } from './messaging.controller';
 import { MessagingService } from './messaging.service';
 
 @Module({
@@ -16,7 +15,7 @@ import { MessagingService } from './messaging.service';
     InstagramConnectionModule,
     AiModule,
   ],
-  controllers: [MessagingController, AutoMessageController],
+  controllers: [AutoMessageController],
   providers: [MessagingService, AutoMessageService],
   exports: [MessagingService, AutoMessageService],
 })
