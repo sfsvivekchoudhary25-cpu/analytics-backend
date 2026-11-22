@@ -948,7 +948,7 @@ export class CommentDmService {
     }
   }
 
-  @Cron('*/5 * * * * *')
+  @Cron('*/15 * * * * *')
   async tick() {
     const accounts = await this.connection.listConnectedAccounts().catch(() => []);
     if (accounts.length === 0) {

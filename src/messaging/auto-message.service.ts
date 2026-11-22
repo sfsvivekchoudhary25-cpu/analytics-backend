@@ -260,7 +260,7 @@ export class AutoMessageService {
   // The webhook calls processPending() right after storing a message. This timer is the safety net for when
   // the webhook misses one: it pulls from Instagram AND processes replies in the same pass, back to back, so a
   // message caught by the fallback sync isn't left waiting for a separately-timed tick on top of that.
-  @Cron('*/10 * * * * *')
+  @Cron('*/30 * * * * *')
   async tick() {
     const accounts = await this.connection.listConnectedAccounts().catch(() => []);
     if (accounts.length === 0) {

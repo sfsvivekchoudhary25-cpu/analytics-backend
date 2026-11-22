@@ -474,7 +474,7 @@ export class CommentsService {
   // ---------- polling fallback ----------
 
   // Webhooks for comments can be missed (e.g. a dead tunnel URL), so also look regularly as a safety net.
-  @Cron('*/30 * * * * *')
+  @Cron('0 */2 * * * *')
   async scheduledSync() {
     const accounts = await this.connection.listConnectedAccounts();
     if (!accounts.length) {
