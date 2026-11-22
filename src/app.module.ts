@@ -24,7 +24,6 @@ import { InstagramConnection } from './instagram-connection/instagram-connection
 import { User } from './auth/user.entity';
 import { CloudinaryModule } from './cloudinary/cloudinary.module';
 import { AiModule } from './ai/ai.module';
-import { HashtagsModule } from './hashtags/hashtags.module';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { AuditModule } from './common/audit/audit.module';
@@ -101,7 +100,6 @@ import { AccountModule } from './account/account.module';
     CommentDmModule,
     DashboardModule,
     FacebookPageModule,
-    HashtagsModule,
     VoiceNotesModule,
     HealthModule,
     SavedReelsModule,

@@ -4,7 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, MoreThan, Repository } from 'typeorm';
 import { AiService } from '../ai/ai.service';
 import { commentEvents, commentId } from '../instagram-webhook/events';
-import { GraphClient, isGoneOnInstagram } from '../instagram-connection/graph-client.service';
+import { GraphClient } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { AutoReplyRule, AutoReplySetting, Comment, ReplyKind } from './comment.entities';
 import { CommentDmLog, CommentDmRule } from '../comment-dm/comment-dm.entities';
@@ -71,130 +71,7 @@ export class CommentsService {
     });
   }
 
-  // One page of top-level comments for the inbox, newest first, filtered on the server so the browser never has to
-  // download them all. `cursor` is "<commentedAt ISO>|<id>" of the last comment of the previous page.
-  async page(
-    params: { tab?: string; post?: string; q?: string; limit?: number | string; cursor?: string },
-    ownerUsername?: string,
-  ) {
-    const own = await this.resolveOwner(ownerUsername);
-    const empty = { items: [] as Comment[], nextCursor: null as string | null, counts: { all: 0, unreplied: 0, replied: 0 } };
-    if (!own) return empty;
-    const limit = Math.min(Math.max(Number(params.limit) || 20, 1), 50);
-    const mine = () =>
-      this.comments
-        .createQueryBuilder('c')
-        .where('c.parentId IS NULL')
-        .andWhere('c.isOwn = false')
-        .andWhere('LOWER(c.ownerUsername) = :own', { own });
-
-    // Tab badges count everything (not narrowed by post or search).
-    const raw = await mine()
-      .select('COUNT(*)', 'all')
-      .addSelect('COUNT(*) FILTER (WHERE c.repliedAt IS NULL)', 'unreplied')
-      .addSelect('COUNT(*) FILTER (WHERE c.repliedAt IS NOT NULL)', 'replied')
-      .getRawOne();
-    const counts = { all: Number(raw?.all ?? 0), unreplied: Number(raw?.unreplied ?? 0), replied: Number(raw?.replied ?? 0) };
-
-    const qb = mine();
-    if (params.tab === 'unreplied') qb.andWhere('c.repliedAt IS NULL');
-    else if (params.tab === 'replied') qb.andWhere('c.repliedAt IS NOT NULL');
-    const post = String(params.post ?? '').trim();
-    // % and _ typed by the user are matched literally (post codes contain underscores).
-    const esc = (v: string) => v.replace(/[\\%_]/g, (m) => '\\' + m);
-    if (post) qb.andWhere('LOWER(c.mediaPermalink) LIKE :post', { post: `%${esc(post.toLowerCase())}%` });
-    const q = String(params.q ?? '').trim().toLowerCase();
-    if (q) {
-      const like = `%${esc(q)}%`;
-      qb.andWhere('(LOWER(c.username) LIKE :q OR LOWER(c.text) LIKE :q)', { q: like });
-    }
-    const [ts, id] = String(params.cursor ?? '').split('|');
-    const when = ts ? new Date(ts) : null;
-    if (when && !Number.isNaN(+when) && id) {
-      qb.andWhere('(c.commentedAt < :ts OR (c.commentedAt = :ts AND c.id < :id))', { ts: when, id });
-    }
-    const rows = await qb.orderBy('c.commentedAt', 'DESC').addOrderBy('c.id', 'DESC').take(limit + 1).getMany();
-    const items = rows.slice(0, limit);
-    const last = items[items.length - 1];
-    return {
-      items,
-      nextCursor: rows.length > limit && last ? `${last.commentedAt.toISOString()}|${last.id}` : null,
-      counts,
-    };
-  }
-
-  // The same posts, a slice at a time (the Instagram call behind it is remembered for a minute, so "load more" is instant).
-  async postsPage(offset: number | string | undefined, limit: number | string | undefined, ownerUsername?: string) {
-    const all = await this.postsWithComments(ownerUsername);
-    const from = Math.max(Number(offset) || 0, 0);
-    const size = Math.min(Math.max(Number(limit) || 6, 1), 30);
-    const items = all.slice(from, from + size);
-    return { items, total: all.length, nextOffset: from + size < all.length ? from + size : null };
-  }
-
-  private readonly postsMediaCache = new Map<string, { at: number; data: any[] }>();
-
-  // Posts that Instagram says have comments, with how many of them the API has actually shared with us.
-  async postsWithComments(ownerUsername?: string) {
-    const own = await this.resolveOwner(ownerUsername);
-    if (!own) return [];
-    let mediaData: any[] = [];
-    const cached = this.postsMediaCache.get(own);
-    if (cached && Date.now() - cached.at < 60_000) {
-      mediaData = cached.data;
-    } else {
-      try {
-        const media = await this.graph.get('/me/media', {
-          fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
-          limit: '30',
-        }, { account: own });
-        mediaData = media?.data ?? [];
-        this.postsMediaCache.set(own, { at: Date.now(), data: mediaData });
-      } catch (err) {
-        this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
-        mediaData = cached?.data ?? [];
-      }
-    }
-    const qb = this.comments
-      .createQueryBuilder('c')
-      .select('c.media_id', 'mid')
-      .addSelect('COUNT(*)', 'n')
-      .where('c.parent_id IS NULL');
-    if (own) {
-      qb.andWhere('LOWER(c.ownerUsername) = :own', { own });
-    }
-    const rows: { mid: string; n: string }[] = await qb.groupBy('c.media_id').getRawMany();
-    const visible = new Map(rows.map((r) => [r.mid, Number(r.n)]));
-    return mediaData
-      .filter((m: any) => m.comments_count > 0)
-      .map((m: any) => ({
-        mediaId: m.id as string,
-        permalink: (m.permalink ?? null) as string | null,
-        thumb: (m.thumbnail_url ?? m.media_url ?? null) as string | null,
-        caption: preview(String(m.caption ?? ''), 90),
-        postedAt: m.timestamp as string,
-        reported: m.comments_count as number,
-        visible: visible.get(m.id) ?? 0,
-      }));
-  }
-
   // ---------- replying / moderating ----------
-
-  async reply(id: string, rawText: string) {
-    const text = String(rawText ?? '').trim();
-    if (!text) throw new BadRequestException('Reply is empty.');
-    if (text.length > 2200) throw new BadRequestException('Reply is too long (2200 characters max).');
-    const c = await this.getOrThrow(id);
-    try {
-      return await this.sendReply(c, text, 'manual');
-    } catch (err) {
-      this.logger.warn(`Reply to @${c.username || c.id} FAILED: ${(err as Error).message}`);
-      if (isGoneOnInstagram(err)) {
-        throw new BadRequestException('This comment no longer exists on Instagram (likely deleted by the commenter) — it can\'t be replied to. You can hide it instead to clear it from the list.');
-      }
-      throw new BadGatewayException(`Instagram could not post the reply: ${(err as Error).message}`);
-    }
-  }
 
   // Post a top-level comment (e.g. hashtags, creator announcement) directly on an Instagram post/media
   async postMediaComment(mediaId: string, rawText: string, account?: string) {
@@ -212,51 +89,6 @@ export class CommentsService {
     } catch (err) {
       this.logger.warn(`Post comment on media ${mediaId} FAILED: ${(err as Error).message}`);
       throw new BadGatewayException(`Instagram could not post the comment: ${(err as Error).message}`);
-    }
-  }
-
-  async setHidden(id: string, hidden: boolean) {
-    const c = await this.getOrThrow(id);
-    try {
-      await this.graph.post(`/${id}`, { hide: hidden ? 'true' : 'false' }, { account: this.accountOf(c) });
-    } catch (err) {
-      // A comment Instagram has already dropped can't be told to hide/unhide either — but there's nothing
-      // left to show or hide at that point, so just reflect that locally instead of blocking the user on it.
-      if (isGoneOnInstagram(err)) {
-        this.logger.log(`Comment by @${c.username} is gone on Instagram — marking ${hidden ? 'hidden' : 'unhidden'} locally.`);
-      } else {
-        this.logger.warn(`${hidden ? 'Hide' : 'Unhide'} comment by @${c.username} FAILED: ${(err as Error).message}`);
-        throw new BadGatewayException(`Instagram could not ${hidden ? 'hide' : 'unhide'} the comment: ${(err as Error).message}`);
-      }
-    }
-    c.hidden = hidden;
-    this.logger.log(`${hidden ? 'Hid' : 'Unhid'} comment by @${c.username}: "${preview(c.text, 50)}"`);
-    return this.comments.save(c);
-  }
-
-  // Uses instagram_manage_engagement permission to like a comment
-  async like(id: string) {
-    const c = await this.getOrThrow(id);
-    try {
-      await this.graph.post(`/${id}/likes`, {}, { account: this.accountOf(c) });
-      this.logger.log(`LIKED comment by @${c.username || c.id}: "${preview(c.text, 50)}"`);
-      return { success: true, id };
-    } catch (err) {
-      this.logger.warn(`Like comment by @${c.username || c.id} FAILED: ${(err as Error).message}`);
-      throw new BadGatewayException(`Instagram could not like the comment: ${(err as Error).message}`);
-    }
-  }
-
-  // Uses instagram_manage_engagement permission to unlike a comment
-  async unlike(id: string) {
-    const c = await this.getOrThrow(id);
-    try {
-      await this.graph.delete(`/${id}/likes`, {}, { account: this.accountOf(c) });
-      this.logger.log(`UNLIKED comment by @${c.username || c.id}`);
-      return { success: true, id };
-    } catch (err) {
-      this.logger.warn(`Unlike comment by @${c.username || c.id} FAILED: ${(err as Error).message}`);
-      throw new BadGatewayException(`Instagram could not unlike the comment: ${(err as Error).message}`);
     }
   }
 
@@ -851,11 +683,5 @@ export class CommentsService {
         this.logger.warn(`Auto-reply to @${c.username} FAILED (will not retry): ${(err as Error).message}`);
       }
     }
-  }
-
-  private async getOrThrow(id: string) {
-    const c = await this.comments.findOne({ where: { id } });
-    if (!c) throw new NotFoundException('Comment not found.');
-    return c;
   }
 }

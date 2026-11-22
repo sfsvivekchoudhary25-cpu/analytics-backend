@@ -13,32 +13,6 @@ export class CommentsController {
     return this.service.list(filter === 'unreplied' ? 'unreplied' : 'all', account);
   }
 
-  // The inbox, one page at a time: ?tab=unreplied|replied|all &post=<shortcode> &q=<search> &limit=20 &cursor=<from the last page>
-  @Get('page')
-  page(
-    @Query('tab') tab?: string,
-    @Query('post') post?: string,
-    @Query('q') q?: string,
-    @Query('limit') limit?: string,
-    @Query('cursor') cursor?: string,
-    @CurrentAccount() account?: string,
-  ) {
-    return this.service.page({ tab, post, q, limit, cursor }, account);
-  }
-
-  // With ?limit= (and ?offset=) the posts come a slice at a time; without it, the whole list as before.
-  @Get('posts')
-  posts(@Query('limit') limit?: string, @Query('offset') offset?: string, @CurrentAccount() account?: string) {
-    if (limit === undefined) return this.service.postsWithComments(account);
-    return this.service.postsPage(offset, limit, account);
-  }
-
-  // "Refresh" button: fetch from Instagram right now instead of waiting for the 2-minute poll.
-  @Post('sync')
-  sync(@CurrentAccount() account?: string) {
-    return this.service.sync(account);
-  }
-
   @Get('auto-reply')
   getAutoReply(@CurrentAccount() account?: string) {
     return this.service.getAutoReply(account);
@@ -77,11 +51,6 @@ export class CommentsController {
     return this.service.deleteRule(ruleId, account);
   }
 
-  @Post(':id/reply')
-  reply(@Param('id') id: string, @Body('text') text: string) {
-    return this.service.reply(id, text);
-  }
-
   @Post('media-comment')
   postMediaCommentBody(@Body('mediaId') mediaId: string, @Body('message') message: string, @CurrentAccount() account?: string) {
     return this.service.postMediaComment(mediaId, message, account);
@@ -92,18 +61,4 @@ export class CommentsController {
     return this.service.postMediaComment(mediaId, message, account);
   }
 
-  @Post(':id/hide')
-  hide(@Param('id') id: string, @Body('hidden') hidden: boolean) {
-    return this.service.setHidden(id, hidden !== false);
-  }
-
-  @Post(':id/like')
-  like(@Param('id') id: string) {
-    return this.service.like(id);
-  }
-
-  @Delete(':id/like')
-  unlike(@Param('id') id: string) {
-    return this.service.unlike(id);
-  }
 }
