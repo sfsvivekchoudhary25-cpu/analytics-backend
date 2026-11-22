@@ -250,17 +250,6 @@ export class AutoMessageService {
     return { ok: true };
   }
 
-  async recent(ownerUsername?: string) {
-    const own = await this.resolveOwner(ownerUsername);
-    if (!own) return [];
-    return this.logs
-      .createQueryBuilder('l')
-      .where('LOWER(l.ownerUsername) = :own', { own })
-      .orderBy('l.createdAt', 'DESC')
-      .take(50)
-      .getMany();
-  }
-
   // ---------- doing the work ----------
 
   // The webhook calls processPending() right after storing a message. This timer is the safety net for when

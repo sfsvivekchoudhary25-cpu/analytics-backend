@@ -35,12 +35,6 @@ export class AutoMessageController {
     return this.service.aiTest(text, account);
   }
 
-  // What automation did recently, including what it deliberately skipped and why.
-  @Get('log')
-  log(@CurrentAccount() account?: string) {
-    return this.service.recent(account);
-  }
-
   @Post('rules')
   addRule(@Body() body: { keywords?: string; replyText?: string }, @CurrentAccount() account?: string) {
     return this.service.addRule(body, account);
