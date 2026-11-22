@@ -168,9 +168,9 @@ export class HashtagsService {
   // Helper to resolve the best token (Facebook Page token for graph.facebook.com or IG user token)
   private async getGraphCredentials(account?: string): Promise<{ token: string; igUserId: string } | null> {
     try {
-      const fbStatus = await this.fbPage.getStatus();
+      const fbStatus = await this.fbPage.getStatus(account);
       if (fbStatus.connected && fbStatus.igUserId) {
-        const token = await this.fbPage.getPageAccessToken();
+        const token = await this.fbPage.getPageAccessToken(account);
         if (token) return { token, igUserId: fbStatus.igUserId };
       }
     } catch {}

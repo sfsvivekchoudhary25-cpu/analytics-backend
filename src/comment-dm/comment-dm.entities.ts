@@ -74,7 +74,11 @@ export class CommentDmRule {
   @Column({ name: 'card_buttons', type: 'jsonb', nullable: true })
   cardButtons: { type: 'web_url' | 'postback'; title: string; url?: string; payload?: string }[] | null;
 
-  // Only comments made after this moment trigger a reply, so turning it on never messages people about old comments.
+  // One automatic "just checking in" DM about 20 hours after ours, if the customer has not replied. Off unless the owner turns it on.
+  @Column({ name: 'recovery_enabled', type: 'boolean', default: false })
+  recoveryEnabled: boolean;
+
+  // Comments made after this moment (minus a 10-minute grace window for test comments) trigger a reply, so turning it on never messages people about old comments.
   @Column({ name: 'enabled_at', type: 'timestamptz', nullable: true })
   enabledAt: Date | null;
 
@@ -84,6 +88,7 @@ export class CommentDmRule {
 
 // One row per comment a rule actually matched (its trigger firing). A comment is attempted at most once
 // (comment_id is unique) — a public "check your DMs" reply is posted once, never retried.
+@Index('ix_comment_dm_log_owner_time', ['ownerUsername', 'createdAt'])
 @Entity('comment_dm_log')
 export class CommentDmLog {
   @PrimaryGeneratedColumn('uuid')

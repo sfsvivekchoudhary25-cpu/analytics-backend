@@ -1,5 +1,6 @@
-import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
+import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
 
+@Index('uq_app_users_instagram_handle', ['instagramHandle'], { unique: true, where: '"instagram_handle" IS NOT NULL' })
 @Entity('app_users')
 export class User {
   @PrimaryGeneratedColumn('uuid')
@@ -17,7 +18,7 @@ export class User {
   @Column({ type: 'varchar', length: 255, name: 'instagram_handle', nullable: true })
   instagramHandle: string | null;
 
-  @Column({ type: 'varchar', length: 50, default: 'admin', nullable: true })
+  @Column({ type: 'varchar', length: 50, default: 'user', nullable: true })
   role: string;
 
   @Column({ type: 'varchar', length: 10, name: 'reset_code', nullable: true })
@@ -58,6 +59,10 @@ export class User {
 
   @Column({ type: 'varchar', length: 120, name: 'openrouter_model', nullable: true, default: 'nvidia/nemotron-3-ultra' })
   openrouterModel: string | null;
+
+  // The model the user picked in the dashboard. Null = use the server default (OPENROUTER_MODEL).
+  @Column({ type: 'varchar', length: 120, name: 'ai_model', nullable: true })
+  aiModel: string | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz', nullable: true })
   createdAt: Date;

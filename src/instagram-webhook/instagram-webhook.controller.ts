@@ -51,9 +51,9 @@ export class InstagramWebhookController {
     @Query('hub.verify_token') token: string,
     @Query('hub.challenge') challenge: string,
   ) {
-    const expected =
-      process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN ||
-      (process.env.NODE_ENV !== 'production' ? 'dfed4dff43bfe4c623eaee3cd7aafd9e493448ca3e877a3f' : '');
+    // Only the configured secret is accepted. (A fallback token used to be written in this file; anyone who could
+    // read the repository could pass the handshake in non-production mode.)
+    const expected = process.env.INSTAGRAM_WEBHOOK_VERIFY_TOKEN || '';
     if (mode !== 'subscribe' || !expected || !safeEqual(String(token ?? ''), expected)) {
       this.logger.warn('Verification handshake REJECTED (wrong verify token or mode)');
       throw new ForbiddenException();
@@ -106,6 +106,12 @@ export class InstagramWebhookController {
       const fields = (Array.isArray(payload) ? payload : [payload]).flatMap((r: any) =>
         (r?.entry ?? []).flatMap((e: any) => [...(e.changes ?? []).map((c: any) => c.field), e.field].filter(Boolean)),
       );
+      const standby = (Array.isArray(payload) ? payload : [payload]).some((r: any) => (r?.entry ?? []).some((e: any) => e.standby?.length));
+      if (standby) {
+        this.logger.warn(
+          'STANDBY message: another app currently controls this chat (Instagram Handover Protocol). Replies will be refused unless this app is the Primary Receiver or takes thread control.',
+        );
+      }
       this.logger.log(`Other payload (fields: ${fields.join(', ') || 'none'}) ${raw.slice(0, 300)}`);
     }
     for (const { ownId, ev } of events) {

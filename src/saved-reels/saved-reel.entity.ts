@@ -7,6 +7,7 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 
+@Index('uq_saved_reels_owner_shortcode', ['ownerUsername', 'shortcode'], { unique: true })
 @Entity('saved_reels')
 export class SavedReel {
   @PrimaryGeneratedColumn('uuid')

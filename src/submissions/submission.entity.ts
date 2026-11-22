@@ -4,6 +4,7 @@ export type SubmissionStatus = 'pending' | 'publishing' | 'published' | 'failed'
 export type DmStatus = 'waiting' | 'sent' | 'failed';
 
 // One customer photo submitted from the website, waiting for (or past) publishing.
+@Index('ix_submission_owner_time', ['ownerUsername', 'createdAt'])
 @Entity('submission')
 export class Submission {
   @PrimaryGeneratedColumn('uuid')

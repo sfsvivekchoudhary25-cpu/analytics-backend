@@ -88,8 +88,11 @@ export class SubmissionsPublicController {
     if (!expected.length || expected.length !== given.length || !timingSafeEqual(expected, given)) {
       throw new UnauthorizedException();
     }
-    const view = await this.service.create(file, username, caption);
-    const list = await this.service.list();
+    // The website belongs to ONE Instagram account. Without this it fell back to "the latest connected account",
+    // so a newly connected user could receive the store's customer photos.
+    const owner = (process.env.SUBMISSIONS_OWNER || 'fabroniee').trim().replace(/^@/, '').toLowerCase();
+    const view = await this.service.create(file, username, caption, owner);
+    const list = await this.service.list(owner);
     const chatUrl = list.find((s) => s.id === view.id)?.chatUrl ?? null;
     return { id: view.id, chatUrl };
   }

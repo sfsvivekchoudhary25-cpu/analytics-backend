@@ -1,9 +1,11 @@
-import { Entity, PrimaryGeneratedColumn, Column, UpdateDateColumn } from 'typeorm';
+import { Entity, Index, PrimaryGeneratedColumn, Column, UpdateDateColumn } from 'typeorm';
 import { encryptedTransformer } from '../common/encrypted.transformer';
 
 // Single-row table: this business only ever connects one Instagram account.
 // If you later support multiple stores/accounts, add a unique key column
 // instead of treating this as a singleton.
+@Index('uq_instagram_connection_ig_user', ['igUserId'], { unique: true })
+@Index('uq_instagram_connection_name', ['username'], { unique: true })
 @Entity('instagram_connection')
 export class InstagramConnection {
   @PrimaryGeneratedColumn('uuid')
@@ -11,6 +13,11 @@ export class InstagramConnection {
 
   @Column({ name: 'ig_user_id' })
   igUserId: string;
+
+  // The professional-account id Instagram puts in webhooks (`user_id`). It differs from ig_user_id, which holds the
+  // app-scoped `id` that /me returns, so webhooks are matched to an account through this column.
+  @Column({ name: 'ig_account_id', type: 'varchar', nullable: true })
+  igAccountId: string | null;
 
   @Column()
   username: string;
@@ -29,6 +36,12 @@ export class InstagramConnection {
 
   @Column({ name: 'profile_picture_url', type: 'text', nullable: true })
   profilePictureUrl: string | null;
+
+  // Privacy switch. When false (the default for new accounts) the text of customer DMs is never written to the
+  // database: chats are read live from Instagram and automation works from a short in-memory copy.
+  // The account owner can turn storing on in Account > Data Privacy (then it is encrypted at rest).
+  @Column({ name: 'store_messages', type: 'boolean', default: false })
+  storeMessages: boolean;
 
   @UpdateDateColumn({ name: 'updated_at' })
   updatedAt: Date;

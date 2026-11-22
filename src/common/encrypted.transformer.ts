@@ -26,3 +26,25 @@ export const encryptedTransformer: ValueTransformer = {
     return Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
   },
 };
+
+// ── Customer message text ──────────────────────────────────────────────────────────────────────────────────────
+// Same AES-256-GCM as the tokens above, but values carry a visible marker so rows written BEFORE encryption was
+// switched on (plain text) are still read correctly until the one-time backfill has encrypted them.
+// NOTE: each encryption uses a fresh random IV, so the same text encrypts differently every time. Never compare or
+// search these columns in SQL (WHERE text = ...); read the row and compare in code.
+export const ENC_PREFIX = 'enc1:';
+
+export function encryptText(value: string): string {
+  if (value === '' || value.startsWith(ENC_PREFIX)) return value;
+  return ENC_PREFIX + (encryptedTransformer.to(value) as string);
+}
+
+export function decryptText(value: string): string {
+  if (!value.startsWith(ENC_PREFIX)) return value; // legacy plain text
+  return encryptedTransformer.from(value.slice(ENC_PREFIX.length)) as string;
+}
+
+export const encryptedTextTransformer: ValueTransformer = {
+  to: (value?: string | null) => (value == null ? value : encryptText(value)),
+  from: (value?: string | null) => (value == null ? value : decryptText(value)),
+};

@@ -54,7 +54,6 @@ export class AuthService {
     const email = (dto.email || '').trim().toLowerCase();
     const name = (dto.name || '').trim();
     const password = dto.password || '';
-    const instagramHandle = (dto.instagramHandle || '').trim().replace(/^@/, '');
 
     if (!email || !email.includes('@')) {
       throw new BadRequestException('Please provide a valid email address.');
@@ -77,8 +76,9 @@ export class AuthService {
         email,
         name,
         passwordHash,
-        instagramHandle: instagramHandle || null,
-        role: 'admin',
+        // Never trust a typed handle: it is set only after a verified Instagram connection (OAuth / token).
+        instagramHandle: null,
+        role: 'user',
       }),
     );
 
@@ -124,7 +124,8 @@ export class AuthService {
     if (email) {
       const user = await this.userRepo.findOne({ where: { email } });
       if (user) {
-        const matches = (await this.verifyPassword(password, user.passwordHash)) || (adminPassword && password === adminPassword);
+        // The master ADMIN_PASSWORD only works for admin accounts, never to sign in as a regular user.
+        const matches = (await this.verifyPassword(password, user.passwordHash)) || (user.role === 'admin' && adminPassword && password === adminPassword);
         if (!matches) {
           await this.audit.log({
             actorEmail: email,
@@ -167,25 +168,7 @@ export class AuthService {
         };
       }
 
-      if (adminPassword && password === adminPassword) {
-        const hash = await this.hashPassword(password);
-        const newUser = await this.userRepo.save(
-          this.userRepo.create({
-            email,
-            name: email.split('@')[0],
-            passwordHash: hash,
-            role: 'admin',
-          }),
-        );
-        const token = await this.jwt.signAsync({
-          sub: newUser.id,
-          email: newUser.email,
-          name: newUser.name,
-          role: newUser.role,
-        });
-        return { ok: true, token, user: newUser };
-      }
-
+      // An unknown email is never auto-created (it used to become an admin when given the master password).
       await this.audit.log({
         actorEmail: email,
         action: 'LOGIN_FAILED_USER_NOT_FOUND',
@@ -263,6 +246,62 @@ export class AuthService {
     return { ok: true, message: 'Password has been reset successfully. You can now sign in.' };
   }
 
+  /**
+   * Decides which login an Instagram / Facebook connection belongs to, after Meta has verified the Instagram handle.
+   * - Someone is already signed in (`signedInUserId`): the handle is linked to THAT user, so signing up first and
+   *   connecting later gives one account, not two. A password-less "@inro.social" login that an earlier connection
+   *   auto-created for this same handle is folded into the real login (data is keyed by handle, so nothing is lost).
+   * - Nobody is signed in ("log in with Instagram"): find the login for this handle, or create one.
+   */
+  async resolveUserForInstagram(o: { handle: string; displayName?: string; signedInUserId?: string | null }): Promise<User> {
+    const handle = o.handle.trim().replace(/^@/, '');
+    const lower = handle.toLowerCase();
+    const byHandle = await this.userRepo
+      .createQueryBuilder('u')
+      .where('LOWER(u.instagram_handle) = :h', { h: lower })
+      .getOne();
+
+    if (o.signedInUserId) {
+      const me = await this.userRepo.findOne({ where: { id: o.signedInUserId } });
+      if (me) {
+        if (me.instagramHandle && me.instagramHandle.toLowerCase() !== lower) {
+          throw new BadRequestException(
+            `Your account is linked to @${me.instagramHandle.replace(/^@/, '')}, but you logged in to Instagram as @${handle}. Log in with @${me.instagramHandle.replace(/^@/, '')} instead.`,
+          );
+        }
+        if (byHandle && byHandle.id !== me.id) {
+          const autoCreated = !byHandle.passwordHash && byHandle.email.endsWith('@inro.social');
+          if (!autoCreated) {
+            throw new BadRequestException(`@${handle} is already connected to a different login.`);
+          }
+          await this.userRepo.delete({ id: byHandle.id });
+        }
+        if (!me.instagramHandle) {
+          me.instagramHandle = handle;
+          await this.userRepo.save(me);
+        }
+        return me;
+      }
+    }
+
+    let user = byHandle ?? (await this.userRepo.findOne({ where: { email: `${lower}@inro.social` } }));
+    if (!user) {
+      user = await this.userRepo.save(
+        this.userRepo.create({
+          email: `${lower}@inro.social`,
+          name: o.displayName || handle,
+          passwordHash: '',
+          instagramHandle: handle,
+          role: 'user',
+        }),
+      );
+    } else if (!user.instagramHandle) {
+      user.instagramHandle = handle;
+      user = await this.userRepo.save(user);
+    }
+    return user;
+  }
+
   async completeOnboarding(
     userId: string,
     dto: {
@@ -285,7 +324,7 @@ export class AuthService {
     if (dto.creatorNiche) user.creatorNiche = dto.creatorNiche;
     if (dto.monthlyVolume) user.monthlyVolume = dto.monthlyVolume;
     if (dto.facebookPageName) user.facebookPageName = dto.facebookPageName;
-    if (dto.instagramHandle) user.instagramHandle = dto.instagramHandle;
+    // dto.instagramHandle is deliberately ignored: the handle is linked only by a verified Instagram connection.
     if (dto.tiktokHandle) user.tiktokHandle = dto.tiktokHandle;
     if (dto.youtubeChannel) user.youtubeChannel = dto.youtubeChannel;
     user.onboardingCompleted = true;

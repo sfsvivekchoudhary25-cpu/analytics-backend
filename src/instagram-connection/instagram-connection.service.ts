@@ -19,10 +19,21 @@ export class InstagramConnectionService implements OnModuleInit {
     private readonly repo: Repository<InstagramConnection>,
   ) {}
 
-  async onModuleInit() {
+  onModuleInit() {
+    // Run legacy reconciliation in background after server is up and listening
+    setTimeout(() => {
+      this.reconcileLegacyData().catch((e) => this.logger.debug?.(`Legacy reconciliation note: ${e.message}`));
+    }, 15000);
+  }
+
+  private async reconcileLegacyData() {
     try {
-      // Reconcile legacy logs: All rows created before sfs.vivekchoudhary25 was connected (Oct 8, 2026 ~11:50 UTC)
-      // or containing Swedish error notes / fabroniee references belong to fabroniee.
+      // Check if there are any unassigned legacy rows before running updates
+      const check = await this.repo.query(`SELECT 1 FROM "conversation" WHERE "owner_username" IS NULL LIMIT 1`).catch(() => []);
+      if (!check || check.length === 0) {
+        return;
+      }
+
       await this.repo.query(`
         UPDATE "message_auto_log"
         SET "owner_username" = 'fabroniee'
@@ -65,6 +76,7 @@ export class InstagramConnectionService implements OnModuleInit {
         'comment',
         'submission',
         'story',
+        'facebook_page_connection',
       ];
       for (const table of legacyTables) {
         await this.repo.query(`UPDATE "${table}" SET "owner_username" = 'fabroniee' WHERE "owner_username" IS NULL`).catch(() => {});
@@ -118,7 +130,12 @@ export class InstagramConnectionService implements OnModuleInit {
     if (!profileUrl || !username) {
       try {
         const FB_API = 'https://graph.facebook.com/v21.0';
-        const [fbConn] = (await this.repo.manager.getRepository('FacebookPageConnection').find({ take: 1 })) as any;
+        // Only THIS account's Page, never "the first Page in the table".
+        const fbConn = (await this.repo.manager
+          .getRepository('FacebookPageConnection')
+          .createQueryBuilder('f')
+          .where('LOWER(f.owner_username) = :o', { o: String(connection.username || '').toLowerCase() })
+          .getOne()) as any;
         if (fbConn?.pageAccessToken && connection.igUserId) {
           const fbRes = await fetch(`${FB_API}/${connection.igUserId}?fields=id,username,name,profile_picture_url&access_token=${encodeURIComponent(fbConn.pageAccessToken)}`);
           const fbData = await fbRes.json();
@@ -223,17 +240,20 @@ export class InstagramConnectionService implements OnModuleInit {
       } catch {}
     }
 
-    // 3. Fallback: if identity could not be retrieved from Graph API, use OAuth identity
-    if (!me && (fallbackIdentity?.userId || fallbackIdentity?.username)) {
+    // 3. Fallback: only when the login flow already gave us a REAL username. We never invent one: an account we cannot
+    //    identify used to be saved as "creator", which made unrelated people share one account and a 1-hour token.
+    if (!me && fallbackIdentity?.username && fallbackIdentity?.userId) {
       me = {
-        user_id: String(fallbackIdentity.userId || 'ig_' + Date.now()),
-        username: fallbackIdentity.username || 'creator',
+        user_id: String(fallbackIdentity.userId),
+        username: fallbackIdentity.username,
       };
       this.logger.log(`Using OAuth fallback identity: @${me.username} (id: ${me.user_id})`);
     }
 
     if (!me) {
-      throw new BadRequestException('Could not verify that token with Instagram. Double-check it and try again.');
+      throw new BadRequestException(
+        "We couldn't verify your Instagram account. Please use a Professional account (Business or Creator) and try again. If it still doesn't work, contact support.",
+      );
     }
 
     const cleanNew = me.username ? me.username.trim().toLowerCase() : null;
@@ -253,6 +273,10 @@ export class InstagramConnectionService implements OnModuleInit {
 
     connection.igUserId = me.user_id;
     connection.username = me.username;
+    // Webhooks use the professional-account id (`user_id`), not the `id` stored above. Best effort: if this lookup fails
+    // the account is still matched later, the first time a webhook arrives for it.
+    const proId = await this.fetchProfessionalId(accessToken);
+    if (proId) connection.igAccountId = proId;
 
     let localAvatar: string | null = null;
     if (me.profile_picture_url) {
@@ -323,7 +347,10 @@ export class InstagramConnectionService implements OnModuleInit {
     // 2. Also inspect Facebook Page access token if available
     try {
       const fbRepo = this.repo.manager.getRepository('FacebookPageConnection');
-      const [fbConn] = (await fbRepo.find({ take: 1 })) as any;
+      const fbConn = (await fbRepo
+        .createQueryBuilder('f')
+        .where('LOWER(f.owner_username) = :o', { o: String(connection.username || '').toLowerCase() })
+        .getOne()) as any;
       if (fbConn?.pageAccessToken) {
         await inspectToken(fbConn.pageAccessToken);
         await checkMePerms(fbConn.pageAccessToken, FB_API);
@@ -446,9 +473,38 @@ export class InstagramConnectionService implements OnModuleInit {
     }
   }
 
+  // Instagram's professional-account id (`user_id`) for a token: the id webhooks use. Null if it cannot be read.
+  private async fetchProfessionalId(accessToken: string): Promise<string | null> {
+    try {
+      const res = await fetch(`${GRAPH_BASE}/me?fields=user_id&access_token=${accessToken}`);
+      const data = await res.json();
+      return res.ok && data?.user_id ? String(data.user_id) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Webhooks name the account by its professional-account id. It is stored in ig_account_id when connecting; accounts
+  // connected before that column existed are filled in here, once, the first time a webhook arrives for them.
+  private readonly webhookIdMisses = new Map<string, number>(); // a miss is remembered briefly to avoid repeated calls
+
   async getConnectionByIgUserId(igUserId?: string): Promise<InstagramConnection | null> {
     if (!igUserId) return null;
-    return this.repo.findOne({ where: { igUserId } });
+    const direct = await this.repo.findOne({ where: [{ igAccountId: igUserId }, { igUserId }] });
+    if (direct) return direct;
+    if (Date.now() - (this.webhookIdMisses.get(igUserId) ?? 0) < 5 * 60_000) return null;
+
+    for (const c of await this.repo.find()) {
+      if (c.igAccountId) continue; // already known
+      const proId = await this.fetchProfessionalId(c.accessToken);
+      if (!proId) continue;
+      c.igAccountId = proId;
+      await this.repo.save(c);
+      this.logger.log(`Saved the webhook account id ${proId} for @${c.username}`);
+      if (proId === igUserId) return c;
+    }
+    this.webhookIdMisses.set(igUserId, Date.now());
+    return null;
   }
 
   async getConnectionRow(account?: string): Promise<InstagramConnection | null> {
@@ -458,8 +514,10 @@ export class InstagramConnectionService implements OnModuleInit {
         .createQueryBuilder('c')
         .where('LOWER(c.username) = :u OR LOWER(c.username) = :atU', { u: clean, atU: `@${clean}` })
         .getOne();
-      if (conn) return conn;
+      // A specific account was asked for: never answer with a DIFFERENT account's connection.
+      return conn ?? null;
     }
+    // No account given (background jobs only; request handlers always pass one): legacy "latest connection".
     const [connection] = await this.repo.find({ order: { updatedAt: 'DESC' }, take: 1 });
     if (connection) return connection;
 
@@ -482,20 +540,9 @@ export class InstagramConnectionService implements OnModuleInit {
     return connection;
   }
 
-  async linkUserInstagramHandle(userId?: string, username?: string) {
-    if (!userId || !username) return;
-    try {
-      await this.repo.manager.getRepository('User').update(
-        { id: userId },
-        { instagramHandle: username },
-      );
-    } catch (err) {
-      this.logger.warn(`Could not link instagram handle to user ${userId}: ${err}`);
-    }
-  }
-
   async disconnect(account?: string) {
-    const conn = await this.getConnectionRow(account);
+    // Destructive: never "the latest connection" when no account is named.
+    const conn = account ? await this.getConnectionRow(account) : null;
     if (conn) {
       const username = conn.username;
       await this.repo.remove(conn);
@@ -505,7 +552,8 @@ export class InstagramConnectionService implements OnModuleInit {
   }
 
   async wipeAccountData(account?: string) {
-    const conn = await this.getConnectionRow(account);
+    // Destructive: never "the latest connection" when no account is named.
+    const conn = account ? await this.getConnectionRow(account) : null;
     if (conn) {
       const username = conn.username;
       await this.repo.remove(conn);

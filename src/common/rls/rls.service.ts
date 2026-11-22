@@ -22,12 +22,15 @@ export class RlsService implements OnModuleInit {
 
   constructor(private readonly dataSource: DataSource) {}
 
-  async onModuleInit() {
-    try {
-      await this.ensureRlsPolicies();
-    } catch (err) {
-      this.logger.warn(`RLS policy verification note: ${(err as Error).message}`);
-    }
+  onModuleInit() {
+    // Check and verify RLS asynchronously so app.listen(port) binds immediately
+    setImmediate(async () => {
+      try {
+        await this.ensureRlsPolicies();
+      } catch (err) {
+        this.logger.warn(`RLS policy verification note: ${(err as Error).message}`);
+      }
+    });
   }
 
   async ensureRlsPolicies() {
@@ -35,6 +38,14 @@ export class RlsService implements OnModuleInit {
     await qr.connect();
 
     try {
+      // Fast path: if policies are already created in the database, skip executing redundant DDL statements
+      const existing = await qr.query(
+        `SELECT count(*)::int as count FROM pg_policies WHERE policyname LIKE 'rls_%'`
+      ).catch(() => [{ count: 0 }]);
+      if (Number(existing[0]?.count) >= 15) {
+        this.logger.log(`RLS policies verified active (${existing[0].count} policies in place).`);
+        return;
+      }
       // 1. Verify and enforce RLS on all 12 tenant tables
       for (const table of TENANT_TABLES) {
         await qr.query(`ALTER TABLE "${table}" ENABLE ROW LEVEL SECURITY;`).catch(() => {});

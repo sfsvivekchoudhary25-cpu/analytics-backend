@@ -20,10 +20,13 @@ export class AuthGuard implements CanActivate {
       const payload = await this.jwt.verifyAsync(token);
       req.user = payload;
       const userId = req.user.sub || req.user.id;
-      if (!req.user.instagramHandle && userId) {
-        const u = await this.dataSource.getRepository(User).findOne({ where: { id: userId }, select: { id: true, instagramHandle: true } });
-        if (u?.instagramHandle) {
-          req.user.instagramHandle = u.instagramHandle;
+      if (userId) {
+        // The database is the source of truth for role and linked account, not the (30-day) token, so a role
+        // change or account link takes effect immediately.
+        const u = await this.dataSource.getRepository(User).findOne({ where: { id: userId }, select: { id: true, instagramHandle: true, role: true } });
+        if (u) {
+          req.user.role = u.role;
+          req.user.instagramHandle = u.instagramHandle || undefined;
         }
       }
       resolveAccount(req);

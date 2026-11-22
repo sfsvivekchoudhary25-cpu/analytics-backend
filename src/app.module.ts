@@ -35,10 +35,13 @@ import { VoiceNote } from './voice-notes/voice-note.entity';
 import { HealthModule } from './health/health.module';
 import { SavedReelsModule } from './saved-reels/saved-reels.module';
 import { SavedReel } from './saved-reels/saved-reel.entity';
+import { AccountModule } from './account/account.module';
 
 @Module({
   imports: [
-    ScheduleModule.forRoot(),
+    // DISABLE_SCHEDULER=1 turns every @Cron job off (the @Cron decorators then do nothing). Used by a local
+    // backend that shares the production database, so only ONE backend runs the automations.
+    ...(process.env.DISABLE_SCHEDULER === '1' ? [] : [ScheduleModule.forRoot()]),
     RlsModule,
     ThrottlerModule.forRoot([
       {
@@ -77,7 +80,12 @@ import { SavedReel } from './saved-reels/saved-reel.entity';
         VoiceNote,
         SavedReel,
       ],
-      synchronize: true, // MVP only: switch to migrations before production
+      // MVP only: switch to migrations before production.
+      // DB_SYNCHRONIZE=0 stops this process from altering the schema. A local backend sharing the production
+      // database must set it, or its (possibly different) entities could add/drop production columns.
+      synchronize: process.env.DB_SYNCHRONIZE !== '0',
+      // Keep the pooler's limited connection slots for the live backend: a local process sets DB_POOL_MAX=2.
+      extra: { max: Number(process.env.DB_POOL_MAX) || 10 },
     }),
     AuditModule,
     CloudinaryModule,
@@ -97,6 +105,7 @@ import { SavedReel } from './saved-reels/saved-reel.entity';
     VoiceNotesModule,
     HealthModule,
     SavedReelsModule,
+    AccountModule,
   ],
   providers: [
     {

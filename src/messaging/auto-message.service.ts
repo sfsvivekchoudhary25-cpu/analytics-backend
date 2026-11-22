@@ -52,13 +52,19 @@ export class AutoMessageService {
 
   private async getSettings(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
-    let existing: MessageAutoSetting | null = null;
-    if (own) {
-      existing = await this.settingsRepo
-        .createQueryBuilder('s')
-        .where('LOWER(s.ownerUsername) = :own', { own })
-        .getOne();
-    }
+    // Always look for the existing row (the owner-less one when the account is unknown) and in a fixed order,
+    // otherwise every call without a resolved account inserts a new row and reads pick an arbitrary duplicate.
+    // shortcut: older deployments left many duplicate rows per account; preferring the switched-on row keeps a
+    // live setting live until those rows are cleaned up, after which the order is just by id.
+    const lookup = this.settingsRepo.createQueryBuilder('s');
+    const existing: MessageAutoSetting | null = await (own
+      ? lookup.where('LOWER(s.ownerUsername) = :own', { own })
+      : lookup.where('s.ownerUsername IS NULL')
+    )
+      .orderBy('s.aiEnabled', 'DESC')
+      .addOrderBy('s.enabled', 'DESC')
+      .addOrderBy('s.id', 'ASC')
+      .getOne();
 
     if (existing) {
       if (own && !existing.ownerUsername) {
@@ -275,7 +281,10 @@ export class AutoMessageService {
   }
 
   async processPending(ownerUsername?: string) {
-    if (this.running) return;
+    if (this.running) {
+      this.logger.debug(`Auto-reply: another run is still in progress, skipping this tick (${ownerUsername || 'default'})`);
+      return;
+    }
     this.running = true;
     try {
       // A claim that never finished (for example the backend restarted in the middle of it) must not stay open
@@ -285,7 +294,13 @@ export class AutoMessageService {
         { outcome: 'failed', note: 'interrupted while processing; not retried, to avoid replying twice' },
       );
       const s = await this.getSettings(ownerUsername);
-      if (!(s.enabled || s.aiEnabled) || !s.enabledAt) return;
+      if (!(s.enabled || s.aiEnabled) || !s.enabledAt) {
+        // Say why nothing is answered, instead of returning silently.
+        this.logger.debug(
+          `Auto-reply idle for ${ownerUsername || 'default'}: rules ${s.enabled ? 'on' : 'off'}, AI ${s.aiEnabled ? 'on' : 'off'}, switched on at ${s.enabledAt ? new Date(s.enabledAt).toISOString() : 'never'} (settings row owner: ${s.ownerUsername ?? 'none'})`,
+        );
+        return;
+      }
       const own = await this.resolveOwner(ownerUsername);
 
       const qb = this.messages
@@ -298,11 +313,32 @@ export class AutoMessageService {
         qb.andWhere('LOWER(m.ownerUsername) = :own', { own });
       }
 
-      const pending = await qb
+      const dbPending = await qb
         .orderBy('m.createdAt', 'ASC')
         .limit(20)
         .getMany();
-      if (!pending.length) return;
+      // Accounts that chose "Don't store my messages" have no message rows. Their customer messages wait in a
+      // short-lived in-memory queue instead (never saved); the automation log is keyed on Instagram's message id.
+      const queuedIds = new Set<string>();
+      const queuedMessages: Message[] = [];
+      for (const q of this.messaging.queuedInbound(own)) {
+        if (s.enabledAt && q.at < new Date(s.enabledAt).getTime()) {
+          this.messaging.dequeueInbound(q.id);
+          continue;
+        }
+        queuedIds.add(q.id);
+        queuedMessages.push(
+          Object.assign(new Message(), { id: q.id, mid: q.mid, igsid: q.igsid, ownerUsername: q.owner, direction: 'in' as const, text: q.text, attachmentType: null, attachmentUrl: null, source: null, createdAt: new Date(q.at) }),
+        );
+      }
+      const pending = [...dbPending, ...queuedMessages].slice(0, 20);
+      if (!pending.length) {
+        const noStore = await this.messaging.isNoStore(own).catch(() => null);
+        this.logger.debug(
+          `Auto-reply: no unanswered messages for ${own ?? 'default'} since ${new Date(s.enabledAt).toISOString()} (stored: ${dbPending.length}, in memory: ${queuedMessages.length}, "don't store messages" mode: ${noStore ? 'on' : 'off'})`,
+        );
+        return;
+      }
       const rules = await this.rulesRepo.find({
         where: own ? { ownerUsername: own } : {},
         order: { sortOrder: 'ASC', createdAt: 'ASC' },
@@ -315,6 +351,7 @@ export class AutoMessageService {
         try {
           await this.logs.insert({ messageId: m.id, igsid: m.igsid, ownerUsername: own, outcome: 'processing' });
         } catch {
+          if (queuedIds.has(m.id)) this.messaging.dequeueInbound(m.id); // already handled by someone else
           continue;
         }
         const conv = await this.conversations.findOne({
@@ -334,12 +371,14 @@ export class AutoMessageService {
           await this.logs.delete({ messageId: m.id }); // nothing was sent, so it is safe to try again later
           continue;
         }
+        if (queuedIds.has(m.id)) this.messaging.dequeueInbound(m.id);
         await this.logs.update(
           { messageId: m.id },
           {
             outcome: decision.outcome,
             note: decision.note,
-            replyText: decision.replyText ?? null,
+            // Accounts that chose not to store message text also keep no copy of what was sent.
+            replyText: (await this.messaging.isNoStore(m.ownerUsername ?? own)) ? null : decision.replyText ?? null,
             username: conv?.username ?? null,
             kind: decision.kind ?? 'rule',
           },
@@ -347,7 +386,7 @@ export class AutoMessageService {
         const who = conv?.username ? `@${conv.username}` : m.igsid;
         if (decision.outcome === 'sent') {
           const label = decision.kind === 'ai' ? ', AI' : decision.kind === 'fallback' ? ', fallback' : '';
-          this.logger.log(`REPLIED (auto${label}) to ${who}: "${preview(decision.replyText ?? '')}"${this.dryRun ? ' [DRY RUN, not sent]' : ''}`);
+          this.logger.log(`REPLIED (auto${label}) to ${who}: (${(decision.replyText ?? '').length} characters)${this.dryRun ? ' [DRY RUN, not sent]' : ''}`);
         }
         else if (decision.outcome === 'failed') this.logger.warn(`Auto-reply to ${who} FAILED (will not retry): ${decision.note}`);
         else this.logger.log(`Auto-reply skipped for ${who}: ${decision.note}`);
@@ -377,7 +416,8 @@ export class AutoMessageService {
       .filter(Boolean);
     if (username && ignored.includes(username)) return skip('account is on the ignore list');
 
-    const text = m.text.trim();
+    // For accounts that don't store message text, this comes from short-lived memory (or one live read from Instagram).
+    const text = (await this.messaging.textForAutomation(m)).trim();
     if (!text || /^\[.*\]$/.test(text)) return skip('no text to answer (attachment or system message)');
     if (Date.now() - m.createdAt.getTime() > WINDOW_GUARD_MS) return skip("outside Instagram's 24-hour window");
 
@@ -392,10 +432,16 @@ export class AutoMessageService {
     }
 
     // Someone already answered after this message: nothing left for automation to do.
-    const answeredWhere: any = { igsid: m.igsid, direction: 'out', createdAt: MoreThan(m.createdAt) };
-    if (own) answeredWhere.ownerUsername = own;
-    if (await this.messages.exists({ where: answeredWhere })) {
-      return skip('already answered');
+    // (Accounts that keep no message rows track this on the conversation: when something was last sent.)
+    const ownerForCheck = own ?? m.ownerUsername;
+    if (await this.messaging.isNoStore(ownerForCheck)) {
+      if (conv?.lastOutboundAt && conv.lastOutboundAt > m.createdAt) return skip('already answered');
+    } else {
+      const answeredWhere: any = { igsid: m.igsid, direction: 'out', createdAt: MoreThan(m.createdAt) };
+      if (own) answeredWhere.ownerUsername = own;
+      if (await this.messages.exists({ where: answeredWhere })) {
+        return skip('already answered');
+      }
     }
     // Global hourly cap per tenant account (rules and AI together).
     const capWhere: any = { outcome: 'sent', createdAt: MoreThan(new Date(Date.now() - HOUR)) };
@@ -489,17 +535,24 @@ export class AutoMessageService {
       order: { createdAt: 'DESC' },
       take: 6,
     });
-    if (!prior.length) return '';
-    const lines = prior
-      .reverse()
+    // Accounts that keep no message rows: the recent messages come from short-lived memory instead.
+    const rows: { direction: 'in' | 'out'; text: string }[] = prior.length
+      ? prior.reverse().map((x) => ({ direction: x.direction, text: x.text || this.messaging.cachedText(x.id) || '' }))
+      : m.ownerUsername
+        ? this.messaging.recentChat(m.ownerUsername, m.igsid, m.createdAt.getTime()).map((x) => ({ direction: x.direction, text: x.text }))
+        : [];
+    if (!rows.length) return '';
+    const lines = rows
       .filter((x) => x.text.trim() && !/^\[.*\]$/.test(x.text.trim()))
       .map((x) => `${x.direction === 'in' ? 'Customer' : 'Business'}: ${x.text.replace(/\s+/g, ' ').slice(0, 300)}`);
     return lines.length ? `Recent conversation (oldest first):\n${lines.join('\n')}` : '';
   }
 
   // "Try it" in the dashboard: shows what the AI would say, without sending anything.
-  async aiTest(text: string) {
-    const s = await this.getSettings();
+  async aiTest(text: string, ownerUsername?: string) {
+    // Use the signed-in user's own account, as the other endpoints do. Guessing the account from the connection made
+    // the settings row belong to a different account than the one the database policy allows, so creating it failed.
+    const s = await this.getSettings(ownerUsername);
     if (!this.ai.available) throw new BadRequestException('AI is not set up: add OPENROUTER_API_KEY to backend/.env and restart.');
     const t = String(text ?? '').trim();
     if (!t) throw new BadRequestException('Type a customer message to test.');

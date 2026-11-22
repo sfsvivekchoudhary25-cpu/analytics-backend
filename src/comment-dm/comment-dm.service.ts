@@ -1,15 +1,16 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, ILike, IsNull, MoreThan, Not, Repository } from 'typeorm';
-import { GraphClient } from '../instagram-connection/graph-client.service';
+import { Between, ILike, In, IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
+import { GraphClient, isConsentRequired } from '../instagram-connection/graph-client.service';
 import { FacebookPageService, MessageButton } from '../facebook-page/facebook-page.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { Comment } from '../comments/comment.entities';
 import { messagingEvents } from '../instagram-webhook/events';
 import { Conversation, Message } from '../messaging/messaging.entities';
-import { MessagingService } from '../messaging/messaging.service';
+import { MessagingService, isCommentLevelError } from '../messaging/messaging.service';
 import { CommentDmLog, CommentDmRule, DEFAULT_FOLLOW_GATE_TEXT } from './comment-dm.entities';
+import { pickRule } from './comment-dm.match';
 import { AutoReplyRule, AutoReplySetting } from '../comments/comment.entities';
 import { Submission } from '../submissions/submission.entity';
 
@@ -19,9 +20,19 @@ const preview = (t: string, n = 80) => {
 };
 const DAY = 24 * 3600_000;
 
+// How soon the follow check asks Instagram about the same person again. After an unknown answer the wait doubles up
+// to 15 minutes. When Instagram says it may not answer yet (code 230: the person has not messaged us) the first wait
+// is 2 minutes, because only a message from the person can change that, and that message reaches us by webhook.
+const FOLLOW_CHECK_FIRST_WAIT_MS = 10_000;
+const FOLLOW_CHECK_CONSENT_WAIT_MS = 2 * 60_000;
+const FOLLOW_CHECK_MAX_WAIT_MS = 15 * 60_000;
+
 @Injectable()
 export class CommentDmService {
   private readonly logger = new Logger('Comment→DM');
+  // Per person (Instagram-scoped id): when the follow check may look again, and what it saw last. Memory only; a
+  // restart simply starts the waits over.
+  private readonly followChecks = new Map<string, { nextAt: number; misses: number; lastResult: boolean | null; needsConsent: boolean }>();
 
   constructor(
     @InjectRepository(CommentDmRule) private readonly rules: Repository<CommentDmRule>,
@@ -91,7 +102,9 @@ export class CommentDmService {
       this.rules.create({
         ownerUsername: own,
         name: count ? `Comment-to-DM Automation ${count + 1}` : 'Comment-to-DM Automation',
-        enabled: false,
+        // A new automation starts live. enabledAt is set the same way as when it is switched on by hand.
+        enabled: true,
+        enabledAt: new Date(),
         keywords: '',
         dmText: 'Hey! 👋 Thanks for your comment.',
         requireFollow: false,
@@ -254,6 +267,7 @@ export class CommentDmService {
       mediaId?: string | null;
       mediaPermalink?: string | null;
       mediaThumb?: string | null;
+      recoveryEnabled?: boolean;
     },
     ownerUsername?: string,
   ) {
@@ -301,6 +315,7 @@ export class CommentDmService {
     if (typeof body.requireFollow === 'boolean') {
       rule.requireFollow = body.requireFollow;
     }
+    if (typeof body.recoveryEnabled === 'boolean') rule.recoveryEnabled = body.recoveryEnabled;
     if (body.followGateText !== undefined) {
       const gateText = String(body.followGateText).trim();
       if (gateText.length > 1000) throw new BadRequestException('Follow gate message is too long (1000 characters max).');
@@ -349,7 +364,7 @@ export class CommentDmService {
     if (typeof body.enabled === 'boolean') rule.enabled = body.enabled;
     if (!wasEnabled && rule.enabled) {
       rule.enabledAt = new Date();
-      this.logger.log(`"${rule.name}" ACTIVE. Only comments made after ${rule.enabledAt.toLocaleTimeString()} will be invited.`);
+      this.logger.log(`"${rule.name}" ACTIVE. Comments from 10 minutes before ${rule.enabledAt.toLocaleTimeString()} onwards will be answered (the grace window catches test comments).`);
     } else if (wasEnabled && !rule.enabled) {
       this.logger.log(`"${rule.name}" turned off.`);
     }
@@ -386,22 +401,55 @@ export class CommentDmService {
 
 
 
-  // Check whether the given IGSID follows us using the Facebook Messaging User Profile API.
-  // Returns true/false/null (null = could not determine, treat as not following).
-  private async checkIsFollowing(igsid: string): Promise<boolean | null> {
+  // Sends the first message to a commenter. The account's own Instagram login is used (no Facebook Page needed). A
+  // connected Page is only a fallback, for when Instagram's login route is refused for a reason that is not about
+  // the comment itself (for example a permission that was never granted).
+  private async sendPrivateReply(
+    commentId: string,
+    text: string,
+    buttons?: MessageButton[],
+    card?: { title?: string; subtitle?: string; imageUrl?: string; buttons?: MessageButton[] },
+    account?: string,
+  ): Promise<{ recipientId: string; messageId: string }> {
     try {
-      const pageToken = await this.facebookPage.getPageAccessToken();
+      return await this.messaging.sendPrivateReplyViaInstagram(commentId, text, buttons, card, account);
+    } catch (err) {
+      if (isCommentLevelError(err) || !(await this.facebookPage.isConnected(account).catch(() => false))) throw err;
+      this.logger.warn(`Instagram login route failed (${(err as Error).message}); trying the connected Facebook Page instead`);
+      return this.facebookPage.sendPrivateReply(commentId, text, buttons, card, account);
+    }
+  }
+
+  // Check whether the given IGSID follows us (User Profile API). Uses the account's Instagram login; the Facebook
+  // Page is only a fallback. Instagram only answers once the person has messaged us or tapped a button (code 230
+  // otherwise), so null means "cannot tell yet", never "not following".
+  // Returns true/false/null (null = could not determine, treat as not following).
+  private async checkIsFollowing(igsid: string, account?: string): Promise<boolean | null> {
+    return (await this.followStatus(igsid, account)).following;
+  }
+
+  // Same check, but also says WHY the answer is unknown: needsConsent means Instagram will not tell us until the
+  // person messages us, so asking again soon is pointless.
+  private async followStatus(igsid: string, account?: string): Promise<{ following: boolean | null; needsConsent: boolean }> {
+    try {
+      const p = await this.graph.get(`/${igsid}`, { fields: 'is_user_follow_business' }, { silent: true, account });
+      if (typeof p?.is_user_follow_business === 'boolean') return { following: p.is_user_follow_business, needsConsent: false };
+    } catch (err) {
+      if (isConsentRequired(err)) return { following: null, needsConsent: true }; // a Page cannot change that
+    }
+    try {
+      const pageToken = await this.facebookPage.getPageAccessToken(account);
       const FB_API = 'https://graph.facebook.com/v21.0';
       const res = await fetch(`${FB_API}/${igsid}?fields=is_user_follow_business&access_token=${encodeURIComponent(pageToken)}`);
       const body = await res.json();
       if (!res.ok) {
         this.logger.debug(`[follow-gate] is_user_follow_business check failed for ${igsid}: ${body?.error?.message}`);
-        return null;
+        return { following: null, needsConsent: false };
       }
-      return body?.is_user_follow_business === true;
+      return { following: body?.is_user_follow_business === true, needsConsent: false };
     } catch (err) {
       this.logger.debug(`[follow-gate] follow check error for ${igsid}: ${(err as Error).message}`);
-      return null;
+      return { following: null, needsConsent: false };
     }
   }
 
@@ -420,21 +468,13 @@ export class CommentDmService {
       if (prevLog?.igsid) return prevLog.igsid;
     }
     try {
-      const data = await this.graph.get(`/${c.id}`, { fields: 'from{id,username}' }, { silent: true });
+      const data = await this.graph.get(`/${c.id}`, { fields: 'from{id,username}' }, { silent: true, account: c.ownerUsername ?? undefined });
       if (data?.from?.id) return String(data.from.id);
     } catch {}
     return null;
   }
 
   // ---------- matching + inviting ----------
-
-  private matches(rule: CommentDmRule, c: Comment) {
-    if (rule.mediaId && c.mediaId !== rule.mediaId) return false;
-    const kws = rule.keywords.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
-    if (kws.length === 0) return true; // any comment on the chosen post
-    const t = c.text.toLowerCase();
-    return kws.some((k) => t.includes(k));
-  }
 
   // Looks at recent, not-yet-attempted comments and, for whichever match any active automation, sends the
   // rule's message straight to the commenter as a real private reply (via the Facebook Page's /messages
@@ -472,7 +512,8 @@ export class CommentDmService {
       .createQueryBuilder('c')
       .where('c.is_own = false AND c.parent_id IS NULL AND c.commented_at > :earliest', {
         earliest: earliestEnabledAt,
-      });
+      })
+      .andWhere('NOT EXISTS (SELECT 1 FROM comment_dm_log l WHERE l.comment_id = c.id)');
 
     if (targetMediaIds.length > 0) {
       candidateQuery.andWhere(
@@ -486,15 +527,10 @@ export class CommentDmService {
     const candidates = await candidateQuery.orderBy('c.commented_at', 'ASC').take(25).getMany();
     if (!candidates.length) return;
 
-    const already = new Set((await this.logs.find({ select: { commentId: true } })).map((l) => l.commentId));
     const claims = candidates
-      .filter((c) => !already.has(c.id))
       .map((c) => ({
         c,
-        rule: active.find((r) => {
-          const threshold = new Date(r.enabledAt!.getTime() - 10 * 60 * 1000);
-          return c.commentedAt > threshold && this.matches(r, c);
-        }),
+        rule: pickRule(active, c),
       }))
       .filter((x): x is { c: Comment; rule: CommentDmRule } => !!x.rule);
     if (!claims.length) return;
@@ -504,35 +540,35 @@ export class CommentDmService {
         c.ownerUsername = own;
         await this.comments.save(c).catch(() => {});
       }
+      // Claim the comment before sending (comment_id is unique), so two overlapping runs can never both send.
+      try {
+        await this.logs.insert({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, status: 'processing', pendingFollowGate: false });
+      } catch {
+        continue;
+      }
+      const finish = (patch: Parameters<typeof this.logs.update>[1]) => this.logs.update({ commentId: c.id }, patch);
       try {
         if (rule.requireFollow) {
           // Step 1: Check if commenter is ALREADY following BEFORE sending any message
           const igsid = await this.getIgsidForComment(c);
           let isFollowing: boolean | null = null;
           if (igsid) {
-            isFollowing = await this.checkIsFollowing(igsid);
+            isFollowing = await this.checkIsFollowing(igsid, own ?? undefined);
           }
 
           if (isFollowing === true) {
             // Already following! Send real DM directly.
             // Do NOT send the follow-gate "Oh no! It seems you're not following me" message!
             const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-            const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
-            await this.logs.save(
-              this.logs.create({
-                ruleId: rule.id,
-                commentId: c.id,
-                username: c.username,
-                ownerUsername: own,
-                ref: null,
+            const { recipientId } = await this.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
+            await finish({
                 igsid: recipientId || igsid,
                 status: 'sent',
                 note: 'follow_gate: user was already following',
                 dmSentAt: new Date(),
                 followGateSentAt: null,
                 pendingFollowGate: false,
-              }),
-            );
+              });
             this.logger.log(`[follow-gate] @${c.username} already follows — DM sent directly via "${rule.name}"`);
             continue;
           }
@@ -540,7 +576,8 @@ export class CommentDmService {
           // Step 2: User is NOT following (or status unknown without sending a message)
           let profileUrl = 'https://www.instagram.com/';
           try {
-            const status = await this.connection.getStatus();
+            // The profile link must be the account that owns the comment, not "the latest connected account".
+            const status = await this.connection.getStatus(own ?? undefined);
             if (status.username) {
               profileUrl = `https://www.instagram.com/${status.username}/`;
             }
@@ -553,63 +590,47 @@ export class CommentDmService {
 
           // Send the follow-gate message as a private reply to the comment with buttons
           const gateText = (rule.followGateText || DEFAULT_FOLLOW_GATE_TEXT).replaceAll('{username}', c.username || 'there');
-          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, gateText, buttons);
+          const { recipientId } = await this.sendPrivateReply(c.id, gateText, buttons, undefined, own ?? undefined);
 
           // If follow status was unknown initially, check again with recipientId from Meta
           if (isFollowing === null) {
-            isFollowing = await this.checkIsFollowing(recipientId);
+            isFollowing = await this.checkIsFollowing(recipientId, own ?? undefined);
             if (isFollowing === true) {
               const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-              await this.messaging.send(recipientId, dmText, 'system', dmButtons, dmCard);
-              await this.logs.save(
-                this.logs.create({
-                  ruleId: rule.id,
-                  commentId: c.id,
-                  username: c.username,
-                  ownerUsername: own,
-                  ref: null,
+              await this.messaging.send(recipientId, dmText, 'system', dmButtons, dmCard, own ?? undefined);
+              await finish({
                   igsid: recipientId,
                   status: 'sent',
                   note: 'follow_gate: user was already following',
                   dmSentAt: new Date(),
                   followGateSentAt: new Date(),
                   pendingFollowGate: false,
-                }),
-              );
+                });
               this.logger.log(`[follow-gate] @${c.username} already follows — DM sent directly via "${rule.name}"`);
               continue;
             }
           }
 
           // Confirmed not following — leave as pending follow gate
-          await this.logs.save(
-            this.logs.create({
-              ruleId: rule.id,
-              commentId: c.id,
-              username: c.username,
-              ownerUsername: own,
-              ref: null,
-              igsid: recipientId || igsid,
+          await finish({
+                igsid: recipientId || igsid,
               status: 'follow_gate',
               note: isFollowing === null ? 'follow_gate: follow status unknown, waiting for reply' : 'follow_gate: user not following yet',
               dmSentAt: null,
               followGateSentAt: new Date(),
               pendingFollowGate: true,
-            }),
-          );
+            });
           this.logger.log(`[follow-gate] @${c.username} not following — follow-gate sent via "${rule.name}"`);
         } else {
           // No follow gate — send DM directly (supports text, buttons, and card templates).
           const { text: dmText, buttons: dmButtons, card: dmCard } = this.getDmPayload(rule, c.username || 'there');
-          const { recipientId } = await this.facebookPage.sendPrivateReply(c.id, dmText, dmButtons, dmCard);
-          await this.logs.save(
-            this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false }),
-          );
+          const { recipientId } = await this.sendPrivateReply(c.id, dmText, dmButtons, dmCard, own ?? undefined);
+          await finish({ igsid: recipientId, status: 'sent', note: null, dmSentAt: new Date(), followGateSentAt: null, pendingFollowGate: false });
           this.logger.log(`DM sent to @${c.username || c.id} via "${rule.name}" (reply to comment: "${preview(c.text, 50)}")`);
         }
       } catch (err) {
         const note = (err as Error).message;
-        await this.logs.save(this.logs.create({ ruleId: rule.id, commentId: c.id, username: c.username, ownerUsername: own, ref: null, status: 'failed', note, followGateSentAt: null, pendingFollowGate: false }));
+        await finish({ status: 'failed', note, followGateSentAt: null, pendingFollowGate: false });
         this.logger.warn(`Private reply FAILED for @${c.username || c.id}: ${note}`);
       }
     }
@@ -674,7 +695,7 @@ export class CommentDmService {
           continue;
         }
 
-        const isFollowing = await this.checkIsFollowing(senderId);
+        const isFollowing = await this.checkIsFollowing(senderId, followGateLog.ownerUsername ?? undefined);
         this.logger.log(`[follow-gate webhook] @${followGateLog.username} messaged in — is_following=${isFollowing}`);
 
         const postbackTitle = String(ev.postback?.title ?? '').toLowerCase();
@@ -813,8 +834,7 @@ export class CommentDmService {
     });
     if (!pendingLogs.length) return;
 
-    // Fast-sync messages from Instagram Graph API so we catch taps/messages even if webhook didn't arrive
-    await this.messaging.syncFromInstagram().catch(() => {});
+    // No inbox sync here: the auto-reply tick already syncs every 10s, so taps are in the messages table.
 
     // Group pending logs by IGSID
     const byIgsid = new Map<string, CommentDmLog[]>();
@@ -825,29 +845,30 @@ export class CommentDmService {
       byIgsid.set(log.igsid, list);
     }
 
+    // Forget people who are no longer waiting (confirmed, expired or removed).
+    for (const known of this.followChecks.keys()) if (!byIgsid.has(known)) this.followChecks.delete(known);
+
     for (const [igsid, logs] of byIgsid.entries()) {
       const targetLog = logs[0];
       const username = targetLog.username || igsid;
+
+      // Not due yet: skip before doing any database work for this person. A message from them reaches us by webhook
+      // (handleMessageWebhook) and is handled straight away, so this loop is only the safety net.
+      const wait = this.followChecks.get(igsid);
+      if (wait && Date.now() < wait.nextAt) continue;
+
       const latestGateSentAt = logs.reduce(
         (max, l) => (l.followGateSentAt && l.followGateSentAt > max ? l.followGateSentAt : max),
         new Date(0),
       );
 
-      // Check the latest message overall in the conversation
-      const lastMessage = await this.messages.findOne({
-        where: targetLog.ownerUsername ? { igsid, ownerUsername: targetLog.ownerUsername } : { igsid },
-        order: { createdAt: 'DESC' },
-      });
+      // What the chat looks like: who wrote last, and whether the customer wrote since our prompt. (Accounts that
+      // keep no message rows answer this from the conversation and short-lived memory.)
+      const state = await this.messaging.chatState(targetLog.ownerUsername, igsid);
 
-      // Check if the customer sent any inbound message
-      const lastInbound = await this.messages.findOne({
-        where: targetLog.ownerUsername ? { igsid, direction: 'in', ownerUsername: targetLog.ownerUsername } : { igsid, direction: 'in' },
-        order: { createdAt: 'DESC' },
-      });
-
-      const isWaitingForReply = Boolean(lastMessage?.direction === 'in');
-      const newInboundSincePrompt = Boolean(lastInbound && lastInbound.createdAt > latestGateSentAt);
-      const msgText = String(lastInbound?.text ?? '').trim().toLowerCase();
+      const isWaitingForReply = Boolean(state.lastDirection === 'in');
+      const newInboundSincePrompt = Boolean(state.lastInboundAt && state.lastInboundAt > latestGateSentAt);
+      const msgText = String(state.lastInboundText ?? '').trim().toLowerCase();
       const explicitText =
         /\b(i'?m following|following|followed|confirm follow)\b/i.test(msgText) ||
         /^(yes|done|confirm|followed|following)$/i.test(msgText);
@@ -861,8 +882,23 @@ export class CommentDmService {
       const shouldCheck = newInboundSincePrompt || isWaitingForReply || msSinceLastPrompt > 60_000;
       if (!shouldCheck) continue;
 
-      const isFollowing = await this.checkIsFollowing(igsid);
-      this.logger.log(`[follow-gate fallback] @${username} (igsid: ${igsid}) is_following=${isFollowing}`);
+      const { following: isFollowing, needsConsent } = await this.followStatus(igsid, targetLog.ownerUsername ?? undefined);
+      if (isFollowing === true) {
+        this.followChecks.delete(igsid);
+      } else {
+        const misses = (wait?.misses ?? 0) + 1;
+        const first = needsConsent ? FOLLOW_CHECK_CONSENT_WAIT_MS : FOLLOW_CHECK_FIRST_WAIT_MS;
+        this.followChecks.set(igsid, {
+          misses,
+          needsConsent,
+          lastResult: isFollowing,
+          nextAt: Date.now() + Math.min(FOLLOW_CHECK_MAX_WAIT_MS, first * 2 ** (misses - 1)),
+        });
+      }
+      // Say it once, and again only when the answer changes (it used to be logged on every pass).
+      if (!wait || wait.lastResult !== isFollowing) {
+        this.logger.log(`[follow-gate fallback] @${username} (igsid: ${igsid}) is_following=${isFollowing}`);
+      }
 
       const rule = await this.rules.findOne({ where: { id: targetLog.ruleId } });
       if (!rule || !rule.enabled) {
@@ -937,12 +973,9 @@ export class CommentDmService {
   async reconcile() {
     const pending = await this.logs.find({ where: { dmSentAt: Not(IsNull()), igsid: Not(IsNull()), repliedAt: IsNull() }, take: 100 });
     for (const log of pending) {
-      const reply = await this.messages.findOne({
-        where: { igsid: log.igsid!, direction: 'in', createdAt: MoreThan(log.dmSentAt!) },
-        order: { createdAt: 'ASC' },
-      });
-      if (reply) {
-        await this.logs.update(log.id, { repliedAt: reply.createdAt });
+      const repliedAt = await this.messaging.firstInboundAfter(log.ownerUsername, log.igsid!, log.dmSentAt!);
+      if (repliedAt) {
+        await this.logs.update(log.id, { repliedAt });
         this.logger.log(`@${log.username} replied to the automated DM.`);
       }
     }
@@ -970,6 +1003,17 @@ export class CommentDmService {
    */
   @Cron('*/15 * * * *')
   async recoverExpiringLeads() {
+    // A claim that never finished (for example the backend restarted mid-send) is closed, not retried: we cannot
+    // know whether the DM went out, and a second one would be worse than none.
+    await this.logs.update(
+      { status: 'processing', createdAt: LessThan(new Date(Date.now() - 10 * 60_000)) },
+      { status: 'failed', pendingFollowGate: false, note: 'interrupted while sending; not retried, to avoid messaging twice' },
+    );
+
+    // The check-in message is opt-in per automation.
+    const optedIn = (await this.rules.find({ where: { recoveryEnabled: true } })).map((r) => r.id);
+    if (!optedIn.length) return;
+
     const now = Date.now();
     // Meta messaging window is 24 hours. We target leads between 18 hours and 22.5 hours ago.
     const windowStart = new Date(now - 22.5 * 3600_000);
@@ -978,6 +1022,7 @@ export class CommentDmService {
     const candidates = await this.logs.find({
       where: {
         status: 'sent',
+        ruleId: In(optedIn),
         igsid: Not(IsNull()),
         repliedAt: IsNull(),
         dmSentAt: Between(windowStart, windowEnd),
@@ -994,11 +1039,9 @@ export class CommentDmService {
       }
 
       // 2. Check if a reply was received in the messages table
-      const reply = await this.messages.findOne({
-        where: { igsid: log.igsid!, direction: 'in', createdAt: MoreThan(log.dmSentAt!) },
-      });
-      if (reply) {
-        await this.logs.update(log.id, { repliedAt: reply.createdAt });
+      const repliedAt = await this.messaging.firstInboundAfter(log.ownerUsername, log.igsid!, log.dmSentAt!);
+      if (repliedAt) {
+        await this.logs.update(log.id, { repliedAt });
         continue;
       }
 

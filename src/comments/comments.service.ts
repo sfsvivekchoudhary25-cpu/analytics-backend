@@ -7,7 +7,8 @@ import { commentEvents, commentId } from '../instagram-webhook/events';
 import { GraphClient, isGoneOnInstagram } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { AutoReplyRule, AutoReplySetting, Comment, ReplyKind } from './comment.entities';
-import { CommentDmRule } from '../comment-dm/comment-dm.entities';
+import { CommentDmLog, CommentDmRule } from '../comment-dm/comment-dm.entities';
+import { dmGate, pickRule } from '../comment-dm/comment-dm.match';
 
 type Incoming = {
   id: string;
@@ -45,6 +46,7 @@ export class CommentsService {
     @InjectRepository(AutoReplySetting) private readonly settingsRepo: Repository<AutoReplySetting>,
     @InjectRepository(AutoReplyRule) private readonly rulesRepo: Repository<AutoReplyRule>,
     @InjectRepository(CommentDmRule) private readonly commentDmRules: Repository<CommentDmRule>,
+    @InjectRepository(CommentDmLog) private readonly commentDmLogs: Repository<CommentDmLog>,
     private readonly graph: GraphClient,
     private readonly connection: InstagramConnectionService,
     private readonly ai: AiService,
@@ -69,19 +71,89 @@ export class CommentsService {
     });
   }
 
+  // One page of top-level comments for the inbox, newest first, filtered on the server so the browser never has to
+  // download them all. `cursor` is "<commentedAt ISO>|<id>" of the last comment of the previous page.
+  async page(
+    params: { tab?: string; post?: string; q?: string; limit?: number | string; cursor?: string },
+    ownerUsername?: string,
+  ) {
+    const own = await this.resolveOwner(ownerUsername);
+    const empty = { items: [] as Comment[], nextCursor: null as string | null, counts: { all: 0, unreplied: 0, replied: 0 } };
+    if (!own) return empty;
+    const limit = Math.min(Math.max(Number(params.limit) || 20, 1), 50);
+    const mine = () =>
+      this.comments
+        .createQueryBuilder('c')
+        .where('c.parentId IS NULL')
+        .andWhere('c.isOwn = false')
+        .andWhere('LOWER(c.ownerUsername) = :own', { own });
+
+    // Tab badges count everything (not narrowed by post or search).
+    const raw = await mine()
+      .select('COUNT(*)', 'all')
+      .addSelect('COUNT(*) FILTER (WHERE c.repliedAt IS NULL)', 'unreplied')
+      .addSelect('COUNT(*) FILTER (WHERE c.repliedAt IS NOT NULL)', 'replied')
+      .getRawOne();
+    const counts = { all: Number(raw?.all ?? 0), unreplied: Number(raw?.unreplied ?? 0), replied: Number(raw?.replied ?? 0) };
+
+    const qb = mine();
+    if (params.tab === 'unreplied') qb.andWhere('c.repliedAt IS NULL');
+    else if (params.tab === 'replied') qb.andWhere('c.repliedAt IS NOT NULL');
+    const post = String(params.post ?? '').trim();
+    // % and _ typed by the user are matched literally (post codes contain underscores).
+    const esc = (v: string) => v.replace(/[\\%_]/g, (m) => '\\' + m);
+    if (post) qb.andWhere('LOWER(c.mediaPermalink) LIKE :post', { post: `%${esc(post.toLowerCase())}%` });
+    const q = String(params.q ?? '').trim().toLowerCase();
+    if (q) {
+      const like = `%${esc(q)}%`;
+      qb.andWhere('(LOWER(c.username) LIKE :q OR LOWER(c.text) LIKE :q)', { q: like });
+    }
+    const [ts, id] = String(params.cursor ?? '').split('|');
+    const when = ts ? new Date(ts) : null;
+    if (when && !Number.isNaN(+when) && id) {
+      qb.andWhere('(c.commentedAt < :ts OR (c.commentedAt = :ts AND c.id < :id))', { ts: when, id });
+    }
+    const rows = await qb.orderBy('c.commentedAt', 'DESC').addOrderBy('c.id', 'DESC').take(limit + 1).getMany();
+    const items = rows.slice(0, limit);
+    const last = items[items.length - 1];
+    return {
+      items,
+      nextCursor: rows.length > limit && last ? `${last.commentedAt.toISOString()}|${last.id}` : null,
+      counts,
+    };
+  }
+
+  // The same posts, a slice at a time (the Instagram call behind it is remembered for a minute, so "load more" is instant).
+  async postsPage(offset: number | string | undefined, limit: number | string | undefined, ownerUsername?: string) {
+    const all = await this.postsWithComments(ownerUsername);
+    const from = Math.max(Number(offset) || 0, 0);
+    const size = Math.min(Math.max(Number(limit) || 6, 1), 30);
+    const items = all.slice(from, from + size);
+    return { items, total: all.length, nextOffset: from + size < all.length ? from + size : null };
+  }
+
+  private readonly postsMediaCache = new Map<string, { at: number; data: any[] }>();
+
   // Posts that Instagram says have comments, with how many of them the API has actually shared with us.
   async postsWithComments(ownerUsername?: string) {
     const own = await this.resolveOwner(ownerUsername);
     if (!own) return [];
     let mediaData: any[] = [];
-    try {
-      const media = await this.graph.get('/me/media', {
-        fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
-        limit: '30',
-      });
-      mediaData = media?.data ?? [];
-    } catch (err) {
-      this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
+    const cached = this.postsMediaCache.get(own);
+    if (cached && Date.now() - cached.at < 60_000) {
+      mediaData = cached.data;
+    } else {
+      try {
+        const media = await this.graph.get('/me/media', {
+          fields: 'id,permalink,thumbnail_url,media_url,caption,timestamp,comments_count',
+          limit: '30',
+        }, { account: own });
+        mediaData = media?.data ?? [];
+        this.postsMediaCache.set(own, { at: Date.now(), data: mediaData });
+      } catch (err) {
+        this.logger.warn(`Failed to fetch media from Instagram for comments: ${(err as Error).message}`);
+        mediaData = cached?.data ?? [];
+      }
     }
     const qb = this.comments
       .createQueryBuilder('c')
@@ -125,14 +197,17 @@ export class CommentsService {
   }
 
   // Post a top-level comment (e.g. hashtags, creator announcement) directly on an Instagram post/media
-  async postMediaComment(mediaId: string, rawText: string) {
+  async postMediaComment(mediaId: string, rawText: string, account?: string) {
     const text = String(rawText ?? '').trim();
     if (!text) throw new BadRequestException('Comment is empty.');
     if (text.length > 2200) throw new BadRequestException('Comment is too long (2200 characters max).');
+    // Must post AS the caller's own account. With no account of their own, the call is refused (it used to post
+    // as whichever account was connected most recently).
+    if (!account) throw new BadRequestException('No Instagram account connected.');
     try {
-      const res = await this.graph.post(`/${mediaId}/comments`, { message: text });
+      const res = await this.graph.post(`/${mediaId}/comments`, { message: text }, { account });
       this.logger.log(`POSTED comment on media ${mediaId}: "${preview(text)}"`);
-      this.sync().catch(() => {});
+      this.sync(account).catch(() => {});
       return { success: true, id: res?.id };
     } catch (err) {
       this.logger.warn(`Post comment on media ${mediaId} FAILED: ${(err as Error).message}`);
@@ -143,7 +218,7 @@ export class CommentsService {
   async setHidden(id: string, hidden: boolean) {
     const c = await this.getOrThrow(id);
     try {
-      await this.graph.post(`/${id}`, { hide: hidden ? 'true' : 'false' });
+      await this.graph.post(`/${id}`, { hide: hidden ? 'true' : 'false' }, { account: this.accountOf(c) });
     } catch (err) {
       // A comment Instagram has already dropped can't be told to hide/unhide either — but there's nothing
       // left to show or hide at that point, so just reflect that locally instead of blocking the user on it.
@@ -163,7 +238,7 @@ export class CommentsService {
   async like(id: string) {
     const c = await this.getOrThrow(id);
     try {
-      await this.graph.post(`/${id}/likes`, {});
+      await this.graph.post(`/${id}/likes`, {}, { account: this.accountOf(c) });
       this.logger.log(`LIKED comment by @${c.username || c.id}: "${preview(c.text, 50)}"`);
       return { success: true, id };
     } catch (err) {
@@ -176,7 +251,7 @@ export class CommentsService {
   async unlike(id: string) {
     const c = await this.getOrThrow(id);
     try {
-      await this.graph.delete(`/${id}/likes`);
+      await this.graph.delete(`/${id}/likes`, {}, { account: this.accountOf(c) });
       this.logger.log(`UNLIKED comment by @${c.username || c.id}`);
       return { success: true, id };
     } catch (err) {
@@ -185,8 +260,16 @@ export class CommentsService {
     }
   }
 
+  // The Instagram account that owns this comment: every action on a comment uses THAT account's token.
+  // If the comment has no owner recorded, refuse rather than guess "the latest connected account".
+  private accountOf(c: Comment): string {
+    const own = String(c.ownerUsername ?? '').trim();
+    if (!own) throw new BadRequestException('This comment is not linked to an Instagram account.');
+    return own;
+  }
+
   private async sendReply(c: Comment, text: string, kind: ReplyKind) {
-    await this.graph.post(`/${c.id}/replies`, { message: text });
+    await this.graph.post(`/${c.id}/replies`, { message: text }, { account: this.accountOf(c) });
     c.myReply = text;
     c.repliedAt = new Date();
     c.replyKind = kind;
@@ -566,18 +649,14 @@ export class CommentsService {
     return mediaId ? (await this.mediaInfo(mediaId)).caption : '';
   }
 
+  // Same rule, picked the same way, as the one that sends the DM (see comment-dm.match.ts).
   private async findMatchingDmRule(c: Comment): Promise<CommentDmRule | null> {
     try {
-      const active = await this.commentDmRules.find({ where: { enabled: true } });
-      for (const r of active) {
-        if (r.mediaId && c.mediaId !== r.mediaId) continue;
-        const kws = r.keywords.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
-        if (kws.length === 0 || kws.some((k) => c.text.toLowerCase().includes(k))) return r;
-      }
+      const where = c.ownerUsername ? { enabled: true, ownerUsername: c.ownerUsername.toLowerCase() } : { enabled: true };
+      return pickRule(await this.commentDmRules.find({ where }), c) ?? null;
     } catch {
-      // ignore
+      return null; // no rule found means no DM is promised, which is the safe side
     }
-    return null;
   }
 
   // "Try it" in the dashboard: what would the AI say to this comment? Nothing is posted.
@@ -636,7 +715,15 @@ export class CommentsService {
       const fill = (t: string) => t.replaceAll('{username}', c.username || 'there');
       const keywordRule = s.enabled ? this.matchKeywordRule(rules, c.text) : null;
       const catchAll = s.enabled ? rules.find((r) => r.enabled && !r.keywords.trim()) ?? null : null;
-      const matchingDmRule = await this.findMatchingDmRule(c);
+      // Only promise "check your DMs" once the DM has really gone out (or the follow-gate message is in their inbox).
+      const dmRule = await this.findMatchingDmRule(c);
+      const dmLog = dmRule ? await this.commentDmLogs.findOne({ where: { commentId: c.id } }) : null;
+      const gate = dmGate(dmRule, dmLog, Date.now() - c.commentedAt.getTime());
+      if (gate === 'wait') {
+        await this.comments.update({ id: c.id }, { autoState: 'new' }); // the DM is still being sent: look again on the next pass
+        continue;
+      }
+      const matchingDmRule = gate === 'promise' ? dmRule : null;
       const age = Date.now() - c.commentedAt.getTime();
       let text: string;
       let note: string;

@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { FacebookPageService } from './facebook-page.service';
 import { User } from '../auth/user.entity';
+import { AuthService } from '../auth/auth.service';
 
 const FB_API = 'https://graph.facebook.com/v21.0';
 
@@ -20,7 +21,20 @@ export class FacebookOauthController {
     private readonly pages: FacebookPageService,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
+    private readonly auth: AuthService,
   ) {}
+
+  // Who is clicking "Connect"? See InstagramOauthController.signedInUserId.
+  private async signedInUserId(req?: any): Promise<string | undefined> {
+    const [type, token] = String(req?.headers?.authorization ?? '').split(' ');
+    if (type !== 'Bearer' || !token) return undefined;
+    try {
+      const p = await this.jwt.verifyAsync(token);
+      return p?.sub || p?.id || undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   private redirectUri(clientOrigin?: string): string {
     // If an explicit HTTPS override is provided in env, use it
@@ -48,7 +62,7 @@ export class FacebookOauthController {
     const redirectUri = this.redirectUri(detectedOrigin);
 
     const state = await this.jwt.signAsync(
-      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri, returnPath },
+      { purpose: 'fb-page-oauth', origin: detectedOrigin, redirectUri, returnPath, uid: await this.signedInUserId(req) },
       { expiresIn: '15m' },
     );
     const appId = process.env.FACEBOOK_APP_ID ?? process.env.INSTAGRAM_APP_ID ?? '';
@@ -87,6 +101,7 @@ export class FacebookOauthController {
     let frontendBase = process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000';
     let matchedRedirectUri = this.redirectUri();
     let returnPath = '/account';
+    let stateUid: string | undefined;
 
     const back = (q: Record<string, string>) =>
       res.redirect(`${frontendBase}${returnPath}?${new URLSearchParams(q)}`);
@@ -98,6 +113,7 @@ export class FacebookOauthController {
       if (payload.origin) frontendBase = payload.origin.replace(/\/$/, '');
       if (payload.returnPath) returnPath = payload.returnPath;
       if (payload.redirectUri) matchedRedirectUri = payload.redirectUri;
+      stateUid = payload.uid;
     } catch {
       return back({ error: 'Login session expired or invalid. Please try again.' });
     }
@@ -110,22 +126,20 @@ export class FacebookOauthController {
         return back({ error: 'That Facebook login has no Pages you manage. Create/link a Page to your Instagram account first.' });
       }
 
-      // Prefer the Page whose linked Instagram account matches the one already connected via Instagram Login.
-      const myIgUserId = await this.connection.getIgUserId().catch(() => null);
-      const matched = myIgUserId ? pages.find((p) => p.instagram_business_account?.id === myIgUserId) : null;
-      // Fallback: pick any page that has a linked Instagram account, then just the first page
-      const withIg = pages.find((p) => p.instagram_business_account?.id);
-      const chosen = matched ?? (pages.length === 1 ? pages[0] : withIg ?? pages[0]);
-
+      // Use the Page that has an Instagram professional account linked. Meta itself tells us which Instagram
+      // account that is, and THAT account becomes the owner of the connection (nothing here is typed by a user).
+      const withIg = pages.find((p) => p.instagram_business_account?.id && p.instagram_business_account?.username);
+      const chosen = withIg ?? null;
       if (!chosen) {
         const names = pages.map((p) => p.name).join(', ');
         return back({
-          error: `Found ${pages.length} Pages (${names}) but none match your connected Instagram account. Make sure the right Page is linked to your Instagram account in Meta Business Suite.`,
+          error: `Found ${pages.length} Page(s) (${names}) but none has an Instagram professional account linked. Link one in Meta Business Suite and try again.`,
         });
       }
+      const igUsername = String(chosen.instagram_business_account!.username);
 
-      await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null);
-      this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id})${matched ? ', matches your Instagram account' : ''}.`);
+      await this.pages.connect(chosen.id, chosen.name, chosen.access_token, chosen.instagram_business_account?.id ?? null, igUsername);
+      this.logger.log(`Facebook Page connected: "${chosen.name}" (id ${chosen.id}) for @${igUsername}.`);
 
       // Subscribe Page to feed and messaging webhooks
       try {
@@ -153,10 +167,17 @@ export class FacebookOauthController {
         }
       }
 
-      // Dynamically auto-connect Instagram connection using Page access token if not already connected
+      // Auto-connect the Instagram account from the Page token ONLY if this account has no Instagram connection
+      // yet (never overwrite an existing Instagram Login token with a Page token).
       try {
-        await this.connection.connect(chosen.access_token);
-        this.logger.log(`Auto-connected Instagram account via Facebook Page token for page "${chosen.name}"`);
+        const existingIg = await this.connection.getConnectionRow(igUsername);
+        if (!existingIg) {
+          await this.connection.connect(chosen.access_token, undefined, null, {
+            userId: chosen.instagram_business_account?.id,
+            username: igUsername,
+          });
+          this.logger.log(`Auto-connected Instagram account @${igUsername} via Facebook Page token for page "${chosen.name}"`);
+        }
       } catch (igErr) {
         this.logger.warn(`Could not auto-connect Instagram from Facebook Page token: ${igErr}`);
       }
@@ -170,45 +191,28 @@ export class FacebookOauthController {
             .filter((p: any) => p.status === 'granted')
             .map((p: any) => p.permission);
           if (granted.length > 0) {
-            await this.pages.syncPermissionsToInstagramConnection(granted);
+            await this.pages.syncPermissionsToInstagramConnection(granted, igUsername);
           }
         }
       } catch (err) {
         this.logger.warn(`Could not sync permissions after Facebook OAuth: ${err}`);
       }
 
-      // Live-sync all permissions from Meta
+      // Live-sync all permissions from Meta (for this account only)
       try {
-        await this.connection.syncLivePermissions();
+        await this.connection.syncLivePermissions(igUsername);
       } catch (syncErr) {
         this.logger.warn(`Could not live-sync permissions: ${syncErr}`);
       }
 
-      // Also auto-provision or find user in app_users
-      let igUsername = (await this.connection.getStatus()).username || null;
-      if (!igUsername && chosen.instagram_business_account?.id) {
-        try {
-          const igInfo = await fetch(`https://graph.facebook.com/v21.0/${chosen.instagram_business_account.id}?fields=username&access_token=${chosen.access_token}`).then(r => r.json());
-          if (igInfo?.username) igUsername = igInfo.username;
-        } catch {}
-      }
-
+      // Also auto-provision or find the user for this verified Instagram account
       let sessionToken = '';
       if (igUsername) {
-        const handle = igUsername.toLowerCase();
-        let user = await this.userRepo.findOne({
-          where: [{ instagramHandle: igUsername }, { instagramHandle: handle }, { email: `${handle}@inro.social` }],
+        const user = await this.auth.resolveUserForInstagram({
+          handle: igUsername,
+          displayName: chosen.name || igUsername,
+          signedInUserId: stateUid,
         });
-        if (!user) {
-          user = this.userRepo.create({
-            email: `${handle}@inro.social`,
-            name: chosen.name || igUsername,
-            passwordHash: '',
-            instagramHandle: igUsername,
-            role: 'admin',
-          });
-          user = await this.userRepo.save(user);
-        }
         sessionToken = await this.jwt.signAsync({
           sub: user.id,
           email: user.email,
@@ -258,8 +262,8 @@ export class FacebookOauthController {
 
   private async listPages(
     userToken: string,
-  ): Promise<{ id: string; name: string; access_token: string; instagram_business_account?: { id: string } }[]> {
-    const params = new URLSearchParams({ fields: 'id,name,access_token,instagram_business_account', access_token: userToken });
+  ): Promise<{ id: string; name: string; access_token: string; instagram_business_account?: { id: string; username?: string } }[]> {
+    const params = new URLSearchParams({ fields: 'id,name,access_token,instagram_business_account{id,username}', access_token: userToken });
     const res = await fetch(`${FB_API}/me/accounts?${params}`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.error?.message ?? 'Could not list your Facebook Pages.');

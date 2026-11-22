@@ -1,6 +1,8 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
+import { encryptedTextTransformer } from '../common/encrypted.transformer';
 
 // Row per account: master switch and safety limits for automatic replies to direct messages.
+@Index('uq_message_auto_setting_owner', ['ownerUsername'], { unique: true })
 @Entity('message_auto_setting')
 export class MessageAutoSetting {
   @PrimaryColumn({ type: 'int' })
@@ -67,6 +69,7 @@ export class MessageAutoRule {
 
 // One row per incoming message we have considered. The unique message id is what guarantees
 // that a single message can never be answered twice, even if two workers pick it up at once.
+@Index('ix_message_auto_log_owner_time', ['ownerUsername', 'createdAt'])
 @Entity('message_auto_log')
 export class MessageAutoLog {
   @PrimaryGeneratedColumn('uuid')
@@ -96,7 +99,8 @@ export class MessageAutoLog {
   @Column({ type: 'text', nullable: true })
   note: string | null;
 
-  @Column({ name: 'reply_text', type: 'text', nullable: true })
+  // What we sent to a customer. Encrypted at rest.
+  @Column({ name: 'reply_text', type: 'text', nullable: true, transformer: encryptedTextTransformer })
   replyText: string | null;
 
   @Index()

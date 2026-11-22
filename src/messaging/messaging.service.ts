@@ -1,14 +1,64 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, IsNull, Repository } from 'typeorm';
-import { GraphClient } from '../instagram-connection/graph-client.service';
+import { Between, IsNull, MoreThan, Repository } from 'typeorm';
+import { GraphApiError, GraphClient } from '../instagram-connection/graph-client.service';
 import { InstagramConnectionService } from '../instagram-connection/instagram-connection.service';
 import { eventDate, messagingEvents } from '../instagram-webhook/events';
 import { Conversation, Message } from './messaging.entities';
 import { MessageButton } from '../facebook-page/facebook-page.service';
+import { MessagePrivacyService } from './message-privacy.service';
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const HUMAN_AGENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // Meta Human Agent feature unlocks 7 days
+
+export function generateLetterAvatar(nameOrId: string | null | undefined): string {
+  const raw = String(nameOrId ?? '').replace(/^@/, '').trim();
+  const isAllDigits = /^\d+$/.test(raw);
+  const letter = (isAllDigits || !raw ? 'U' : raw[0]).toUpperCase();
+
+  const colors = [
+    '#3b82f6', '#6366f1', '#8b5cf6', '#ec4899',
+    '#f43f5e', '#ea580c', '#10b981', '#06b6d4',
+  ];
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) hash = (hash * 31 + raw.charCodeAt(i)) >>> 0;
+  const bg = colors[hash % colors.length];
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">` +
+    `<circle cx="50" cy="50" r="50" fill="${bg}"/>` +
+    `<text x="50" y="55" font-size="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-weight="600" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">${letter}</text>` +
+    `</svg>`;
+
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+// Buttons in the shape Instagram expects (title up to 20 characters, valid links only).
+function formatButtons(buttons?: MessageButton[]) {
+  if (!buttons?.length) return undefined;
+  const safeUrl = (raw?: string | null): string => {
+    let u = (raw || '').trim();
+    if (!u || u === 'https://' || u === 'http://') return 'https://www.instagram.com';
+    if (!u.startsWith('http://') && !u.startsWith('https://')) u = 'https://' + u;
+    try {
+      const parsed = new URL(u);
+      return parsed.hostname && parsed.hostname.includes('.') ? parsed.toString() : 'https://www.instagram.com';
+    } catch {
+      return 'https://www.instagram.com';
+    }
+  };
+  return buttons.map((b) => ({
+    type: b.type,
+    title: (b.title || 'Click Here').slice(0, 20),
+    ...(b.type === 'web_url' ? { url: safeUrl(b.url) } : { payload: b.payload || 'ACTION' }),
+  }));
+}
+
+// Problems with the comment itself (not with the message format): trying a simpler format cannot help.
+// 100/2534014 comment or user not found or already replied to, 100/2534025 older than 7 days, 4/17/32/613 rate limits.
+export function isCommentLevelError(err: unknown): boolean {
+  if (!(err instanceof GraphApiError)) return false;
+  return (err.code === 100 && (err.subcode === 2534014 || err.subcode === 2534025)) || [4, 17, 32, 613].includes(Number(err.code));
+}
 
 @Injectable()
 export class MessagingService implements OnModuleInit {
@@ -19,9 +69,17 @@ export class MessagingService implements OnModuleInit {
     @InjectRepository(Message) private readonly messages: Repository<Message>,
     private readonly graph: GraphClient,
     private readonly connection: InstagramConnectionService,
+    private readonly privacy: MessagePrivacyService,
   ) {}
 
-  async onModuleInit() {
+  onModuleInit() {
+    // Run constraint and avatar maintenance in background so server listens immediately
+    setTimeout(() => {
+      this.maintainAvatarsAndConstraints().catch((e) => this.logger.warn(`Avatar maintenance note: ${e.message}`));
+    }, 10000);
+  }
+
+  private async maintainAvatarsAndConstraints() {
     try {
       // Drop global unique constraint on mid so multiple tenants can store the same message mid without collision
       await this.messages.query(`
@@ -29,8 +87,20 @@ export class MessagingService implements OnModuleInit {
         ALTER TABLE message DROP CONSTRAINT IF EXISTS message_mid_key;
       `).catch(() => {});
 
+      const rows = await this.conversations.find({ where: { profilePic: IsNull() }, take: 100 });
+      let updated = 0;
+      for (const c of rows) {
+        if (!c.profilePic) {
+          c.profilePic = generateLetterAvatar(c.username || c.igsid);
+          await this.conversations.save(c);
+          updated++;
+        }
+      }
+      if (updated > 0) {
+        this.logger.log(`Initialized first-letter avatars for ${updated} conversation(s) without profile pictures`);
+      }
     } catch (e) {
-      this.logger.warn(`Could not relax message uniqueness constraint: ${(e as Error).message}`);
+      this.logger.warn(`Could not backfill avatars: ${(e as Error).message}`);
     }
   }
 
@@ -40,6 +110,166 @@ export class MessagingService implements OnModuleInit {
   // right before processing replies, so a message caught by polling is answered in the same pass, with no
   // separate timer to wait for. This class does not schedule its own sync.
   private syncing = false;
+  // Instagram chat ids that could not be read, and until when we skip them.
+  private readonly unreadableChats = new Map<string, number>();
+
+  // Saves one message row. For an account that chose "Don't store my messages" only the metadata (who / when /
+  // direction / id) is written; the text is kept in short-lived memory so automation can still answer it.
+  // Private reply to a comment, sent with the account's own Instagram login (no Facebook Page needed):
+  // POST /<IG_ID>/messages with recipient.comment_id. Tries the richest format first (card, buttons) and falls back
+  // to simpler ones if Instagram rejects the format; stops at once for problems with the comment itself
+  // (already replied to, older than 7 days, gone), because a simpler format cannot fix those.
+  async sendPrivateReplyViaInstagram(
+    commentId: string,
+    text: string,
+    buttons?: MessageButton[],
+    card?: { title?: string; subtitle?: string; imageUrl?: string; buttons?: MessageButton[] },
+    account?: string,
+  ): Promise<{ recipientId: string; messageId: string }> {
+    const own = (await this.resolveOwner(account)) ?? undefined;
+    const igUserId = await this.connection.getIgUserId(own);
+    const formatted = formatButtons(card?.buttons || buttons);
+    const attempts: { label: string; message: any }[] = [];
+    if (card && (card.imageUrl || card.title)) {
+      const element: any = { title: (card.title || text).slice(0, 80), subtitle: (card.subtitle || text).slice(0, 80) };
+      if (card.imageUrl) element.image_url = card.imageUrl;
+      if (formatted?.length) element.buttons = formatted;
+      attempts.push({ label: 'card', message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [element] } } } });
+    }
+    if (formatted?.length) {
+      attempts.push({ label: 'buttons', message: { attachment: { type: 'template', payload: { template_type: 'button', text: text.slice(0, 640), buttons: formatted } } } });
+      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+      const title = (lines[0] || 'Hello').slice(0, 80);
+      const subtitle = (lines.slice(1).join(' ') || title).slice(0, 80);
+      attempts.push({ label: 'card-from-text', message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [{ title, subtitle, buttons: formatted }] } } } });
+      attempts.push({
+        label: 'quick-replies',
+        message: { text, quick_replies: formatted.map((b: any) => ({ content_type: 'text', title: b.title.slice(0, 20), payload: b.type === 'postback' ? b.payload : b.url })) },
+      });
+    }
+    attempts.push({ label: 'text', message: { text } });
+
+    let lastError: unknown;
+    for (const a of attempts) {
+      try {
+        const res = await this.graph.postJson(`/${igUserId}/messages`, { recipient: { comment_id: commentId }, message: a.message }, { account: own });
+        if (res?.recipient_id) {
+          this.logger.log(`Private reply sent through the Instagram login (${a.label}) for comment ${commentId}`);
+          return { recipientId: String(res.recipient_id), messageId: String(res.message_id ?? '') };
+        }
+        lastError = new Error('Instagram accepted the request but returned no recipient.');
+      } catch (err) {
+        lastError = err;
+        if (isCommentLevelError(err)) throw err; // a different format cannot fix this
+        this.logger.warn(`Private reply format "${a.label}" was not accepted: ${(err as Error).message}`);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Private reply failed.');
+  }
+
+  // Saves one message. For an account that chose "Don't store my messages" NO row is written at all: the text goes to
+  // short-lived memory only (so automation can answer it and the inbox preview works) and the few facts we need
+  // (last inbound / outbound time and sender) are kept on the conversation row by touchConversation().
+  private async saveMessage(
+    noStore: boolean,
+    data: Partial<Message> & { igsid: string; direction: 'in' | 'out' },
+    opts: { enqueue?: boolean } = {},
+  ): Promise<Message | null> {
+    if (!noStore) return this.messages.save(this.messages.create(data));
+    if (!data.ownerUsername) return null;
+    const at = (data.createdAt ?? new Date()).getTime();
+    const mid = data.mid ?? null;
+    const text = String(data.text ?? '');
+    this.privacy.remember(data.ownerUsername, data.igsid, { id: mid ?? `${data.direction}-${at}-${data.igsid}`, mid, direction: data.direction, text, at });
+    if (data.direction === 'in' && mid && text && opts.enqueue !== false) {
+      this.privacy.enqueueInbound({ id: mid, mid, owner: data.ownerUsername, igsid: data.igsid, text, at });
+    }
+    return null;
+  }
+
+  // Customer messages waiting for automation (accounts that don't store messages only).
+  queuedInbound(owner?: string | null) {
+    return this.privacy.queued(owner);
+  }
+
+  dequeueInbound(id: string) {
+    this.privacy.dequeue(id);
+  }
+
+  // The last few remembered messages before a moment (the AI uses these as context when nothing is stored).
+  recentChat(owner: string, igsid: string, beforeMs: number, n = 6) {
+    return this.privacy.recent(owner, igsid).filter((m) => m.at < beforeMs).slice(-n);
+  }
+
+  // What automations need to know about a chat, without reading message rows when none are kept.
+  async chatState(owner: string | null | undefined, igsid: string): Promise<{ lastDirection: 'in' | 'out' | null; lastInboundAt: Date | null; lastInboundText: string }> {
+    const own = owner ? owner.trim().replace(/^@/, '').toLowerCase() : undefined;
+    if (own && (await this.privacy.isNoStore(own))) {
+      const c = await this.conversations.findOne({ where: { igsid, ownerUsername: own } });
+      const inAt = c?.lastInboundAt ?? null;
+      const outAt = c?.lastOutboundAt ?? null;
+      const lastDirection = inAt && (!outAt || inAt >= outAt) ? 'in' : outAt ? 'out' : null;
+      const lastIn = this.privacy.recent(own, igsid).filter((m) => m.direction === 'in').pop();
+      return { lastDirection, lastInboundAt: inAt, lastInboundText: lastIn?.text ?? '' };
+    }
+    const where = (extra: object) => (own ? { igsid, ownerUsername: own, ...extra } : { igsid, ...extra });
+    const last = await this.messages.findOne({ where: where({}), order: { createdAt: 'DESC' } });
+    const lastIn = await this.messages.findOne({ where: where({ direction: 'in' as const }), order: { createdAt: 'DESC' } });
+    return { lastDirection: last?.direction ?? null, lastInboundAt: lastIn?.createdAt ?? null, lastInboundText: lastIn?.text ?? '' };
+  }
+
+  // The first customer message after a moment (used to tell whether they replied to an automated DM).
+  async firstInboundAfter(owner: string | null | undefined, igsid: string, after: Date): Promise<Date | null> {
+    const own = owner ? owner.trim().replace(/^@/, '').toLowerCase() : undefined;
+    if (own && (await this.privacy.isNoStore(own))) {
+      const c = await this.conversations.findOne({ where: { igsid, ownerUsername: own } });
+      return c?.lastInboundAt && c.lastInboundAt > after ? c.lastInboundAt : null;
+    }
+    const row = await this.messages.findOne({
+      where: { ...(own ? { ownerUsername: own } : {}), igsid, direction: 'in', createdAt: MoreThan(after) },
+      order: { createdAt: 'ASC' },
+    });
+    return row?.createdAt ?? null;
+  }
+
+  isNoStore(owner?: string | null) {
+    return this.privacy.isNoStore(owner);
+  }
+
+  cachedText(id: string) {
+    return this.privacy.textOf(id);
+  }
+
+  // The text an automation needs for a message whose text is not in the database.
+  async textForAutomation(m: Message): Promise<string> {
+    if (m.text) return m.text;
+    const own = m.ownerUsername ?? undefined;
+    if (!(await this.privacy.isNoStore(own))) return '';
+    const cached = this.privacy.textOf(m.id);
+    if (cached !== null) return cached;
+    if (!m.mid) return '';
+    // Not in memory (for example the server restarted): ask Instagram for just this one message.
+    try {
+      const d = await this.graph.get(`/${m.mid}`, { fields: 'message' }, { account: own });
+      const text = String(d?.message ?? '');
+      if (text && own) this.privacy.remember(own, m.igsid, { id: m.id, mid: m.mid, direction: 'in', text, at: m.createdAt.getTime() });
+      return text;
+    } catch {
+      return '';
+    }
+  }
+
+  async getPrivacy(account?: string) {
+    const own = await this.resolveOwner(account);
+    if (!own) return { connected: false, storeMessages: true };
+    return { connected: true, storeMessages: !(await this.privacy.isNoStore(own)) };
+  }
+
+  async setPrivacy(account: string | undefined, storeMessages: boolean) {
+    const own = await this.resolveOwner(account);
+    if (!own) throw new BadRequestException('Connect your Instagram account first.');
+    return { connected: true, ...(await this.privacy.setStoreMessages(own, !!storeMessages)) };
+  }
 
   private async resolveOwner(ownerUsername?: string): Promise<string | null> {
     if (ownerUsername) return ownerUsername.trim().replace(/^@/, '').toLowerCase();
@@ -57,6 +287,7 @@ export class MessagingService implements OnModuleInit {
     this.syncing = true;
     try {
       const ownHandle = String(status.username).toLowerCase();
+      const noStore = await this.privacy.isNoStore(ownHandle);
       const list = await this.graph.get(
         '/me/conversations',
         { platform: 'instagram', fields: 'id,updated_time,participants', limit: '50' },
@@ -71,42 +302,74 @@ export class MessagingService implements OnModuleInit {
         const isRecent = new Date(conv.updated_time).getTime() > Date.now() - 2 * 24 * 3600_000;
         if (!isRecent && existing && existing.lastMessageAt >= new Date(conv.updated_time)) continue; // nothing new here
 
-        const detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle });
+        // One chat Instagram will not let us read (deleted, blocked, or no permission: code 100/33) must not stop the
+        // sync of every other chat. It is skipped, and not asked about again for an hour.
+        const badUntil = this.unreadableChats.get(conv.id);
+        if (badUntil && badUntil > Date.now()) continue;
+        let detail: any;
+        try {
+          detail = await this.graph.get(`/${conv.id}`, { fields: 'messages.limit(50){id,created_time,from,message}' }, { account: ownHandle, silent: true });
+        } catch (err) {
+          if (err instanceof GraphApiError && err.code === 100) {
+            this.unreadableChats.set(conv.id, Date.now() + 3600_000);
+            this.logger.debug?.(`Skipping a chat Instagram will not let us read (@${ownHandle}): ${err.message}`);
+            continue;
+          }
+          throw err;
+        }
         const msgs: any[] = [...(detail.messages?.data ?? [])].reverse(); // oldest first
         let added = 0;
+        let addedInbound = 0;
         let lastText = existing?.lastText ?? '';
         let lastAt = existing?.lastMessageAt ?? null;
         let lastInboundAt = existing?.lastInboundAt ?? null;
+        let lastOutboundAt = existing?.lastOutboundAt ?? null;
+        let lastOutboundSource = existing?.lastOutboundSource ?? null;
 
         for (const m of msgs) {
           const at = new Date(m.created_time);
           const outgoing = String(m.from?.username ?? '').toLowerCase() === ownHandle;
           const text = String(m.message ?? '');
-          // The same message may already be stored via the webhook, possibly under a different id format.
-          const dup =
-            (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) ||
-            (await this.messages.exists({
-              where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', text, createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
-            }));
-          if (dup) continue;
-          await this.messages.save(
-            this.messages.create({
-              igsid: String(other.id),
-              ownerUsername: ownHandle,
-              direction: outgoing ? 'out' : 'in',
-              text,
-              // An outgoing message we did not send ourselves through this app was typed in the Instagram app.
-              source: outgoing ? 'app' : null,
-              mid: m.id,
-              createdAt: at,
-            }),
-          );
+          // History sync only returns the text. A message with no text is an attachment whose type we cannot know,
+          // so it is not stored (real attachments with their type still arrive through the webhook).
+          if (!text) continue;
+          if (noStore) {
+            // No message rows exist in this mode, so "already seen" means: handled by the webhook (the conversation's
+            // last-message time is already at or past it) or remembered in memory.
+            if (existing && at.getTime() <= existing.lastMessageAt.getTime() + 3000) continue;
+            if (this.privacy.seenMid(ownHandle, m.id)) continue;
+          } else {
+            // The same message may already be stored via the webhook, possibly under a different id format.
+            // (Message text is encrypted, so it cannot be compared in SQL: fetch the few rows around that moment and compare here.)
+            const sameMoment = await this.messages.find({
+              where: { igsid: String(other.id), ownerUsername: ownHandle, direction: outgoing ? 'out' : 'in', createdAt: Between(new Date(+at - 5000), new Date(+at + 5000)) },
+            });
+            const dup = (await this.messages.exists({ where: { mid: m.id, ownerUsername: ownHandle } })) || sameMoment.some((r) => r.text === text);
+            if (dup) continue;
+          }
+          await this.saveMessage(noStore, {
+            igsid: String(other.id),
+            ownerUsername: ownHandle,
+            direction: outgoing ? 'out' : 'in',
+            text,
+            // An outgoing message we did not send ourselves through this app was typed in the Instagram app.
+            source: outgoing ? 'app' : null,
+            attachmentType: null,
+            attachmentUrl: null,
+            mid: m.id,
+            createdAt: at,
+          }, { enqueue: !!existing }); // a first-time import of old history is never queued for automation
           added += 1;
+          if (!outgoing) addedInbound += 1;
           if (!lastAt || at >= lastAt) {
             lastAt = at;
-            lastText = text || '[attachment]';
+            lastText = noStore ? '' : text;
           }
           if (!outgoing && (!lastInboundAt || at > lastInboundAt)) lastInboundAt = at;
+          if (outgoing && (!lastOutboundAt || at > lastOutboundAt)) {
+            lastOutboundAt = at;
+            lastOutboundSource = 'app';
+          }
         }
 
         if (!existing || added) {
@@ -114,19 +377,30 @@ export class MessagingService implements OnModuleInit {
           // Never import a conversation with own self
           if (username && username.toLowerCase() === ownHandle) continue;
 
-          if (!username) {
-            const p = await this.graph.get(`/${other.id}`, { fields: 'username' }, { account: ownHandle }).catch(() => null);
+          let profilePic = existing?.profilePic ?? null;
+          if (!username || !profilePic) {
+            const p = await this.graph.get(`/${other.id}`, { fields: 'username,profile_pic' }, { account: ownHandle }).catch(() => null);
             if (p?.username) username = p.username;
+            if (p?.profile_pic) profilePic = p.profile_pic;
           }
           if (username && username.toLowerCase() === ownHandle) continue;
+
+          if (!profilePic) {
+            profilePic = generateLetterAvatar(username || String(other.id));
+          }
           await this.conversations.save(
             this.conversations.create({
               igsid: String(other.id),
               ownerUsername: ownHandle,
               username,
+              profilePic,
               lastText,
               lastMessageAt: lastAt ?? new Date(conv.updated_time),
               lastInboundAt,
+              lastOutboundAt,
+              lastOutboundSource,
+              // A first-time import of old history is not "unread"; later messages are.
+              unread: existing ? existing.unread + addedInbound : 0,
             }),
           );
           conversations += 1;
@@ -156,24 +430,33 @@ export class MessagingService implements OnModuleInit {
   async recordEvent(ownId: string, ev: any) {
     const conn = await this.connection.getConnectionByIgUserId(ownId).catch(() => null);
     const ownUsername = conn?.username?.toLowerCase() ?? null;
+    const noStore = await this.privacy.isNoStore(ownUsername);
 
     // A customer edited a message we already stored.
     if (ev.message_edit?.mid) {
+      if (noStore) {
+        // No rows exist in this mode; only the short-lived in-memory copy is refreshed.
+        if (ownUsername) this.privacy.updateTextByMid(ownUsername, ev.message_edit.mid, String(ev.message_edit.text ?? ''));
+        this.logger.log(`A customer edited a message (edit #${ev.message_edit.num_edit ?? '?'})`);
+        return;
+      }
       const stored = await this.messages.findOne({ where: { mid: ev.message_edit.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (!stored) {
         this.logger.log(`Edit of a message we never stored (...${String(ev.message_edit.mid).slice(-8)}); ignored`);
         return;
       }
+      const newText = String(ev.message_edit.text ?? '');
       const before = stored.text;
-      stored.text = String(ev.message_edit.text ?? '');
+      stored.text = newText;
       if (ownUsername && !stored.ownerUsername) stored.ownerUsername = ownUsername;
       await this.messages.save(stored);
-      // Refresh the list preview only if this was the conversation's latest message.
-      await this.conversations.update(
-        ownUsername ? { igsid: stored.igsid, lastText: before, ownerUsername: ownUsername } : { igsid: stored.igsid, lastText: before },
-        { lastText: stored.text },
-      );
-      this.logger.log(`Updated message to "${stored.text.slice(0, 60)}" (edit #${ev.message_edit.num_edit ?? '?'})`);
+      // Refresh the list preview only if this was the conversation's latest message (compared here, not in SQL).
+      const conv = await this.conversations.findOne({ where: ownUsername ? { igsid: stored.igsid, ownerUsername: ownUsername } : { igsid: stored.igsid } });
+      if (conv && conv.lastText === before) {
+        conv.lastText = stored.text;
+        await this.conversations.save(conv);
+      }
+      this.logger.log(`A customer edited a message (edit #${ev.message_edit.num_edit ?? '?'})`);
       return;
     }
 
@@ -184,18 +467,19 @@ export class MessagingService implements OnModuleInit {
         const customerId = ev.sender?.id;
         if (customerId && customerId !== ownId) {
           const at = eventDate(ev.timestamp);
-          await this.messages.save(
-            this.messages.create({
-              igsid: customerId,
-              ownerUsername: ownUsername,
-              direction: 'in',
-              text,
-              source: null,
-              mid: ev.postback.mid ?? null,
-              createdAt: at,
-            }),
-          );
-          await this.touchConversation(customerId, text, undefined, 'in', at, ownUsername ?? undefined);
+          if (noStore && ownUsername && this.privacy.seenMid(ownUsername, ev.postback.mid)) return; // duplicate delivery
+          await this.saveMessage(noStore, {
+            igsid: customerId,
+            ownerUsername: ownUsername,
+            direction: 'in',
+            text,
+            source: null,
+            attachmentType: null,
+            attachmentUrl: null,
+            mid: ev.postback.mid ?? null,
+            createdAt: at,
+          });
+          await this.touchConversation(customerId, text, undefined, 'in', at, ownUsername ?? undefined, noStore);
         }
       }
       return; // reads, reactions, etc. are only logged, not stored
@@ -210,9 +494,12 @@ export class MessagingService implements OnModuleInit {
 
     // The customer deleted a message: keep the thread, replace its content.
     if (msg.is_deleted && msg.mid) {
+      if (noStore) return; // nothing is stored, so there is nothing to mark
       const stored = await this.messages.findOne({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } });
       if (stored) {
         stored.text = '[message deleted by sender]';
+        stored.attachmentType = null;
+        stored.attachmentUrl = null;
         await this.messages.save(stored);
         this.logger.log(`Marked a message as deleted (...${String(msg.mid).slice(-8)})`);
       }
@@ -221,7 +508,10 @@ export class MessagingService implements OnModuleInit {
 
     const customerId: string | undefined = echo ? ev.recipient?.id : ev.sender?.id;
     if (!customerId || customerId === ownId) return;
-    if (msg.mid && (await this.messages.exists({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } }))) {
+    const duplicate = noStore
+      ? !!ownUsername && this.privacy.seenMid(ownUsername, msg.mid) // no rows in this mode: remembered ids instead
+      : !!msg.mid && (await this.messages.exists({ where: { mid: msg.mid, ...(ownUsername ? { ownerUsername: ownUsername } : {}) } }));
+    if (duplicate) {
       this.logger.log(`Ignored duplicate delivery of message ...${String(msg.mid).slice(-8)}`);
       return;
     }
@@ -235,43 +525,80 @@ export class MessagingService implements OnModuleInit {
         ? '[replied to your story]'
         : '';
     const text = [label, msg.text ?? ''].filter(Boolean).join(' ');
-    await this.messages.save(
-      this.messages.create({
-        igsid: customerId,
-        ownerUsername: ownUsername,
-        direction: echo ? 'out' : 'in',
-        text,
-        source: echo ? 'app' : null,
-        mid: msg.mid ?? null,
-        createdAt: at,
-      }),
-    );
-    const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined);
+    await this.saveMessage(noStore, {
+      igsid: customerId,
+      ownerUsername: ownUsername,
+      direction: echo ? 'out' : 'in',
+      text,
+      source: echo ? 'app' : null,
+      attachmentType: attachment?.type ?? null,
+      attachmentUrl: attachment?.payload?.url ?? null,
+      mid: msg.mid ?? null,
+      createdAt: at,
+    });
+    const c = await this.touchConversation(customerId, text, attachment?.type, echo ? 'out' : 'in', at, ownUsername ?? undefined, noStore, echo ? 'app' : undefined);
     this.logger.log(
-      `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId}`,
+      `Stored ${echo ? 'outgoing (from app)' : 'incoming'} message ${echo ? 'to' : 'from'} ${c.username ? '@' + c.username : customerId} (unread: ${c.unread}) [account ${ownUsername ?? 'NOT MATCHED to any connected account (id ' + ownId + ')'}, ${noStore ? 'kept in memory only' : 'saved to database'}]`,
     );
   }
 
-  private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date, ownerUsername?: string) {
+  private async touchConversation(igsid: string, text: string, attachmentType: string | undefined, dir: 'in' | 'out', at: Date, ownerUsername?: string, noStore = false, source?: string) {
     const cleanOwner = ownerUsername ? ownerUsername.trim().replace(/^@/, '').toLowerCase() : null;
     let c = await this.conversations.findOne({
       where: cleanOwner ? { igsid, ownerUsername: cleanOwner } : { igsid },
     });
     if (!c) {
-      c = this.conversations.create({ igsid, ownerUsername: cleanOwner, username: null, lastInboundAt: null });
-      const p = await this.graph.get(`/${igsid}`, { fields: 'username' }, { account: cleanOwner ?? undefined }).catch(() => null);
+      c = this.conversations.create({ igsid, ownerUsername: cleanOwner, username: null, profilePic: null, unread: 0, lastInboundAt: null });
+      const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: cleanOwner ?? undefined }).catch(() => null);
       if (p?.username) c.username = p.username;
+      if (p?.profile_pic) c.profilePic = p.profile_pic;
+      if (!c.profilePic) {
+        c.profilePic = generateLetterAvatar(c.username || igsid);
+      }
     } else {
       if (cleanOwner && !c.ownerUsername) c.ownerUsername = cleanOwner;
-      if (!c.username) {
-        const p = await this.graph.get(`/${igsid}`, { fields: 'username' }, { account: cleanOwner ?? undefined }).catch(() => null);
+      if (!c.profilePic || !c.username) {
+        const p = await this.graph.get(`/${igsid}`, { fields: 'username,profile_pic' }, { account: cleanOwner ?? undefined }).catch(() => null);
         if (p?.username) c.username = p.username;
+        if (p?.profile_pic) c.profilePic = p.profile_pic;
+        if (!c.profilePic) {
+          c.profilePic = generateLetterAvatar(c.username || igsid);
+        }
       }
     }
-    c.lastText = text || (attachmentType ? `[${attachmentType}]` : '');
+    // "Don't store" mode keeps no preview text in the database (an attachment label is not message content).
+    c.lastText = noStore ? (attachmentType ? `[${attachmentType}]` : '') : text || (attachmentType ? `[${attachmentType}]` : '');
     c.lastMessageAt = at;
-    if (dir === 'in') c.lastInboundAt = at;
+    if (dir === 'in') {
+      c.lastInboundAt = at;
+      c.unread += 1;
+    } else {
+      // Who last sent something here, and when: automation stays quiet after a person, even with no message rows.
+      c.lastOutboundAt = at;
+      c.lastOutboundSource = source ?? null;
+    }
     return this.conversations.save(c);
+  }
+
+  // Instagram's Handover Protocol: when another app (or Meta's inbox routing) controls a chat, we only receive it as
+  // "standby" and a send is refused with "not the thread owner". Ask for control of that one chat, then retry once.
+  // If we are not allowed to take control, explain the real fix instead of the bare Instagram error.
+  private async postWithThreadControl(igUserId: string, igsid: string, payload: any, own?: string) {
+    try {
+      return await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own });
+    } catch (err) {
+      if (!/thread owner/i.test((err as Error).message)) throw err;
+      this.logger.warn(`Another app controls the chat with ${igsid}; asking Instagram to hand control to this app`);
+      try {
+        await this.graph.postJson(`/${igUserId}/take_thread_control`, { recipient: { id: igsid } }, { account: own });
+      } catch (takeErr) {
+        throw new Error(
+          `Another app controls this chat, and Instagram would not hand control to this app (${(takeErr as Error).message}). ` +
+            'In the Meta app dashboard (Instagram messaging > Conversation routing) set THIS app as the Primary Receiver, and disconnect other messaging tools from the Instagram account.',
+        );
+      }
+      return await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own });
+    }
   }
 
   // Send a DM and record it in the thread. `source` says who sent it, so automation can tell a person from itself.
@@ -386,7 +713,7 @@ export class MessagingService implements OnModuleInit {
       }
 
       try {
-        res = await this.graph.postJson(`/${igUserId}/messages`, payload, { account: own ?? undefined });
+        res = await this.postWithThreadControl(igUserId, igsid, payload, own ?? undefined);
       } catch (err) {
         // Fallback retry with HUMAN_AGENT tag if standard 24h send was rejected
         if (!payload.tag && source === 'dashboard' && isWithin7Days) {
@@ -403,26 +730,30 @@ export class MessagingService implements OnModuleInit {
       }
     }
     const now = new Date();
-    // Instagram echoes our own DMs back through the webhook; if that already stored this mid, don't insert twice.
-    const alreadyStored = res?.message_id && (await this.messages.exists({ where: { mid: res.message_id, ...(own ? { ownerUsername: own } : {}) } }));
+    const noStore = await this.privacy.isNoStore(own);
+    // Instagram echoes our own DMs back through the webhook. Remember this id as ours so the echo is not mistaken for
+    // a message typed in the Instagram app (in "don't store" mode there are no rows to check instead).
+    if (noStore && own) this.privacy.markSent(own, res?.message_id, source);
+    // If the echo already stored this mid, don't insert twice.
+    const alreadyStored = !noStore && res?.message_id && (await this.messages.exists({ where: { mid: res.message_id, ...(own ? { ownerUsername: own } : {}) } }));
     if (!alreadyStored) {
-      await this.messages.save(
-        this.messages.create({
-          igsid,
-          ownerUsername: own ?? null,
-          direction: 'out',
-          text,
-          source,
-          mid: res?.message_id ?? null,
-          createdAt: now,
-        }),
-      );
+      await this.saveMessage(noStore, {
+        igsid,
+        ownerUsername: own ?? null,
+        direction: 'out',
+        text,
+        source,
+        attachmentType: null,
+        attachmentUrl: null,
+        mid: res?.message_id ?? null,
+        createdAt: now,
+      });
     } else {
       // The webhook echo won the race and labelled it as typed in the app; set the true sender.
       await this.messages.update({ mid: res.message_id, ...(own ? { ownerUsername: own } : {}) }, { source, ...(own ? { ownerUsername: own } : {}) });
     }
-    const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined);
-    this.logger.log(`[Messaging] DM sent (${sentFormat}) to ${c.username ? '@' + c.username : igsid}: "${text.length > 60 ? text.slice(0, 60) + '…' : text}"`);
+    const c = await this.touchConversation(igsid, text, undefined, 'out', now, own ?? undefined, noStore, source);
+    this.logger.log(`[Messaging] DM sent (${sentFormat}) to ${c.username ? '@' + c.username : igsid} (${text.length} characters)`);
     return { ok: true };
   }
 }

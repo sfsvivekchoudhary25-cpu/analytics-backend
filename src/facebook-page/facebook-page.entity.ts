@@ -1,7 +1,7 @@
-import { Column, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
+import { Column, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
 import { encryptedTransformer } from '../common/encrypted.transformer';
 
-// Single-row table, same convention as instagram_connection. This is a SEPARATE connection from the main
+// One row per Instagram account (owner_username). This is a SEPARATE connection from the main
 // Instagram Login one: it exists only because Meta's "send a private reply to a comment" endpoint is not
 // part of the Instagram API with Instagram Login product — it requires a Facebook Page access token instead.
 // Everything else in this app keeps using the Instagram Login connection; only comment-dm.service.ts reads this.
@@ -10,6 +10,13 @@ export class FacebookPageConnection {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  // The Instagram account (handle) this Page belongs to: one row PER account. Taken from the Page's own linked
+  // Instagram account as reported by Meta, never typed by a user, so a new signup cannot inherit someone else's Page.
+  @Index('uq_facebook_page_owner', { unique: true })
+  @Column({ name: 'owner_username', type: 'varchar', nullable: true })
+  ownerUsername: string | null;
+
+  @Index('uq_facebook_page_page_id', { unique: true })
   @Column({ name: 'page_id' })
   pageId: string;
 

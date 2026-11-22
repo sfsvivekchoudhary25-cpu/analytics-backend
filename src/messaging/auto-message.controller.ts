@@ -31,8 +31,8 @@ export class AutoMessageController {
 
   // Dashboard "Try it": what would the AI say to this message? Nothing is sent.
   @Post('ai-test')
-  aiTest(@Body('text') text: string) {
-    return this.service.aiTest(text);
+  aiTest(@Body('text') text: string, @CurrentAccount() account?: string) {
+    return this.service.aiTest(text, account);
   }
 
   // What automation did recently, including what it deliberately skipped and why.
